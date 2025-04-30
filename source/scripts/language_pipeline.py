@@ -7,6 +7,10 @@ import numpy as np
 from pathlib import Path
 from pydub import AudioSegment
 
+import time
+
+import warnings
+warnings.simplefilter("once", DeprecationWarning)
 
 '''This is the class that enables the full pipeline needed for the language preprocessing, being first speaker diarization and inference of which speaker is the client, second german ASR on the client and third annotations according to PACS with some LLM
 It takes as input only the source original file in either mp3 or wav format and outputs an excel file for the corresponding file with the timesteps for the pyannote chunks, the text and the PACS LLM classification'''
@@ -30,7 +34,7 @@ class preprocess:
             "automatic-speech-recognition",
             model=asr,
             tokenizer=processor.tokenizer,
-            return_timestamps="word",
+            return_timestamps=True,
             feature_extractor=processor.feature_extractor,
             device=self.device,
         )
@@ -64,12 +68,22 @@ class preprocess:
 
 
         #extract the chunks belonging to dominant speaker
+        export_path = self.output_dir / f"{self.source_file.stem}_client.wav"
         audio_pydumb = AudioSegment.from_file(self.source_file)
         chunks = []
         for segment in client_speech_turns.itersegments():
             start_ms = int(segment.start * 1000) #convert to milliseconds as expected by pydub
             end_ms = int(segment.end * 1000)
-            chunks.append(audio_pydumb[start_ms:end_ms])
+            chunk = audio_pydumb[start_ms:end_ms]
+            chunks.append(chunk)
+
+            #execute asr here on each chunk
+            chunk.export(export_path, format="wav")
+            results = preprocess.asr()
+            text = results["text"]
+            print(f"From {start_ms} to {end_ms}: {text}")
+            
+
 
         #write the chunks out to rttm format so we can use them again when making the final excel
         output_rttm = self.output_dir / f"{self.source_file.stem}_client.rttm"
@@ -78,8 +92,8 @@ class preprocess:
 
         #export the chunked audio file
         client_audio = sum(chunks)
-        export_path = self.output_dir / f"{self.source_file.stem}_client.wav"
         client_audio.export(export_path, format="wav")
+       
         return None
     
 
@@ -87,14 +101,13 @@ class preprocess:
         '''Executes on the chunked, client audio file'''
         client_audio_file = self.output_dir / f"{self.source_file.stem}_client.wav"
         result = self.asr_pipe(str(client_audio_file))
-        print(result["text"])
-        return None
+        return result
     
     
 if __name__=="__main__":
     preprocess = preprocess(source_file="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/test.wav", output_dir="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/")
     #preprocess.diarize()
-    #preprocess.chunk_client()
-    preprocess.asr()
+    preprocess.chunk_client()
+    
     
 
