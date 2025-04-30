@@ -1,4 +1,7 @@
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+from faster_whisper import WhisperModel
+
 import torch
 from pyannote.core import Annotation
 from pyannote.core.annotation import Segment
@@ -7,13 +10,15 @@ import numpy as np
 from pathlib import Path
 from pydub import AudioSegment
 
+from IPython import embed
 import time
+import json
 
 import warnings
 warnings.simplefilter("once", DeprecationWarning)
 
-'''This is the class that enables the full pipeline needed for the language preprocessing, being first speaker diarization and inference of which speaker is the client, second german ASR on the client and third annotations according to PACS with some LLM
-It takes as input only the source original file in either mp3 or wav format and outputs an excel file for the corresponding file with the timesteps for the pyannote chunks, the text and the PACS LLM classification'''
+'''This is the class that enables the full pipeline needed for the language preprocessing, being first speaker diarization and inference of which speaker is the client, second german ASR on the client
+It takes as input only the source original file in either mp3 or wav format and outputs a json for the corresponding file with the timesteps for the pyannote chunks'''
 
 
 class preprocess:
@@ -26,30 +31,27 @@ class preprocess:
         #init diarization
         self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 
-        #init ASR
-        model_id = "openai/whisper-large-v3"
-        asr = AutoModelForSpeechSeq2Seq.from_pretrained(model_id, low_cpu_mem_usage=True, use_safetensors=True).to(self.device)
-        processor = AutoProcessor.from_pretrained(model_id)
-        self.asr_pipe = pipeline(
-            "automatic-speech-recognition",
-            model=asr,
-            tokenizer=processor.tokenizer,
-            return_timestamps=True,
-            feature_extractor=processor.feature_extractor,
-            device=self.device,
-        )
+        #init faster-distill whisper
+        model_size = "turbo" #tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3, large, distil-large-v2, distil-medium.en, distil-small.en, distil-large-v3, large-v3-turbo, turbo
+        self.model_faster_whisper = WhisperModel(model_size, device=self.device, compute_type="float32")
 
     def diarize(self):
         '''Diarizes the full source file'''
-        diarization = self.diarization_pipeline(self.source_file)
+        diarization = self.diarization_pipeline(self.source_file, num_speakers=2)
         output = self.output_dir / f"{self.source_file.stem}.rttm"
         with open(output, "w") as rttm:
             diarization.write_rttm(rttm)
         return None
     
-    def chunk_client(self):
+    def asr_faster(self):
+        '''Executes on the chunked, saved audio file'''
+        client_audio_file = self.output_dir / f"{self.source_file.stem}_client.wav"
+        segments, info = self.model_faster_whisper.transcribe(client_audio_file, beam_size=5, language="de", condition_on_previous_text="False")
+        return segments
+    
+    
+    def chunk_asr(self):
         '''Requires the full, diarized source file'''
-
         #first, open the full diarized source file and read it into memory in a nice useful format
         full_rttm = self.output_dir / f"{self.source_file.stem}.rttm"
         annotation = Annotation()
@@ -63,51 +65,35 @@ class preprocess:
                     segment = Segment(start, start + duration)
                     annotation[segment] = speaker
 
-        #get annotations of dominant speaker, which we will assume is client for most of the time                    
+        #get annotations of dominant speaker, which we will assume is client                 
         client_speech_turns = annotation.subset(set([annotation.argmax()])) 
 
-
-        #extract the chunks belonging to dominant speaker
+        #extract the chunks belonging to dominant speaker, save this chunk and and run the ASR model 
         export_path = self.output_dir / f"{self.source_file.stem}_client.wav"
         audio_pydumb = AudioSegment.from_file(self.source_file)
-        chunks = []
+        results = {}
         for segment in client_speech_turns.itersegments():
             start_ms = int(segment.start * 1000) #convert to milliseconds as expected by pydub
             end_ms = int(segment.end * 1000)
+            if end_ms - start_ms < 1000: #many chunks are small, we do not need to transcribe those which lasts less than 1 second, i.e, 1000 ms
+                continue
             chunk = audio_pydumb[start_ms:end_ms]
-            chunks.append(chunk)
-
-            #execute asr here on each chunk
-            chunk.export(export_path, format="wav")
-            results = preprocess.asr()
-            text = results["text"]
-            print(f"From {start_ms} to {end_ms}: {text}")
-            
-
-
-        #write the chunks out to rttm format so we can use them again when making the final excel
-        output_rttm = self.output_dir / f"{self.source_file.stem}_client.rttm"
-        with open(output_rttm, "w") as f:
-            client_speech_turns.write_rttm(f)
-
-        #export the chunked audio file
-        client_audio = sum(chunks)
-        client_audio.export(export_path, format="wav")
-       
-        return None
+            chunk.export(export_path, format="wav")        
+            segments = preprocess.asr_faster()
+            for segment in segments:
+                results[segment.text] = [start_ms, end_ms] 
+        return results
     
+   
 
-    def asr(self):
-        '''Executes on the chunked, client audio file'''
-        client_audio_file = self.output_dir / f"{self.source_file.stem}_client.wav"
-        result = self.asr_pipe(str(client_audio_file))
-        return result
-    
     
 if __name__=="__main__":
     preprocess = preprocess(source_file="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/test.wav", output_dir="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/")
-    #preprocess.diarize()
-    preprocess.chunk_client()
+    preprocess.diarize()
+    results = preprocess.chunk_asr()
+    with open('/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/results.json', "w") as file:
+        json.dump(results, file, indent=4, ensure_ascii=False)
+
     
     
 
