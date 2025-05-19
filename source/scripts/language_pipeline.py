@@ -90,7 +90,7 @@ class preprocess:
                     results.append({
                         "word" : word.word,
                         "start" : start_ms + int(word.start * 1000),
-                        "end": end_ms + int(word.end * 1000),
+                        "end": start_ms + int(word.end * 1000),
                         "speaker_id": mapping[next(iter(annotation.get_labels(segment)))]
                     })
         return results
