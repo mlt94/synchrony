@@ -100,7 +100,6 @@ if __name__=="__main__":
     preprocess = preprocess(source_file="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/test.wav", output_dir="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/")
     #preprocess.diarize()
     results = preprocess.chunk_asr()
-    print(results)
     with open('/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/results.json', "w") as file:
         json.dump(results, file, indent=4, ensure_ascii=False)
 
