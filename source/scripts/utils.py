@@ -29,7 +29,7 @@ def extract_speech_turns_from_file(json_path):
     # Step 3: Iterate through each word entry
     for w in results:
         speaker = w["speaker_id"]
-        word = w["word"].strip()
+        word = w["text"].strip()
         start = w["start"]
         end = w["end"]
 

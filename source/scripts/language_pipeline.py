@@ -1,6 +1,6 @@
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 import torch
 from pyannote.core import Annotation
@@ -13,7 +13,7 @@ from pydub import AudioSegment
 from IPython import embed
 import time
 import json
-
+import time
 import warnings
 warnings.simplefilter("once", DeprecationWarning)
 
@@ -32,8 +32,8 @@ class preprocess:
         self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
 
         #init faster-distill whisper
-        model_size = "turbo" #tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3, large, distil-large-v2, distil-medium.en, distil-small.en, distil-large-v3, large-v3-turbo, turbo
-        self.model_faster_whisper = WhisperModel(model_size, device=self.device, compute_type="float32")
+        model_size = "small" #tiny.en, tiny, base.en, base, small.en, small, medium.en, medium, large-v1, large-v2, large-v3, large, distil-large-v2, distil-medium.en, distil-small.en, distil-large-v3, large-v3-turbo, turbo
+        self.model_faster_whisper = WhisperModel(model_size, device=self.device, compute_type="int8")
 
     def diarize(self):
         '''Diarizes the full source file'''
@@ -46,11 +46,12 @@ class preprocess:
     def asr_faster(self):
         '''Executes on the chunked, saved audio file'''
         client_audio_file = self.output_dir / f"{self.source_file.stem}.wav"
-        segments, info = self.model_faster_whisper.transcribe(client_audio_file, beam_size=5, language="de", condition_on_previous_text="False", word_timestamps=True)
+        batched_model = BatchedInferencePipeline(model=self.model_faster_whisper)
+        segments, info = batched_model.transcribe(client_audio_file, beam_size=3, language="de", condition_on_previous_text="False", word_timestamps=False, batch_size=8)
         return segments
     
     
-    def chunk_asr(self, both_speakers=True):
+    def chunk_asr(self, both_speakers=False):
         '''Requires the full, diarized source file'''
         #first, open the full diarized source file and read it into memory in a nice useful format
         full_rttm = self.output_dir / f"{self.source_file.stem}.rttm"
@@ -86,23 +87,25 @@ class preprocess:
             text_chunk = preprocess.asr_faster()
             
             for t in text_chunk:
-                for word in t.words:    
-                    results.append({
-                        "word" : word.word,
-                        "start" : start_ms + int(word.start * 1000),
-                        "end": start_ms + int(word.end * 1000),
-                        "speaker_id": mapping[next(iter(annotation.get_labels(segment)))]
-                    })
+                results.append({
+                    "text" : t.text,
+                    "start" : start_ms,
+                    "end": end_ms,
+                    "speaker_id" : mapping[next(iter(annotation.get_labels(segment)))]
+                })
+
         return results
 
     
 if __name__=="__main__":
+    start = time.time()
     preprocess = preprocess(source_file="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/test.wav", output_dir="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/")
     #preprocess.diarize()
     results = preprocess.chunk_asr()
+
     with open('/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/results.json', "w") as file:
         json.dump(results, file, indent=4, ensure_ascii=False)
-
+    print(f"Execution time: {time.time() - start:.2f} seconds")
     
     
 
