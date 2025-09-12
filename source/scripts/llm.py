@@ -1,11 +1,15 @@
-from transformers import pipeline
+import argparse
+import yaml
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
 import json
-import torch
 import time
+from transformers import pipeline
+from typing import List
 
-from IPython import embed
-
-
+def load_config(config_path):
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 def create_prompt(text: str) -> list:
     """
@@ -27,26 +31,23 @@ def validate_label(label: str) -> str:
             return v
     return "unknown"
 
-def llm(
-    source_path: str = "files/results.json",
-    output_path: str = "files/results_labels.json",
-    model_name: str = "google/gemma-3-1b-it",
-    device: str = "cpu"
-) -> None:
-    """
-    Label transcribed speech turns using an instruction-tuned LLM.
-    """
+def process_result_file(result_json: str, config: dict):
+    start = time.time()
+    model_name = config.get("llm_model_name", "google/gemma-3-1b-it")
+    device = config.get("llm_device", "cpu")
+    result_path = Path(result_json)
+    output_path = result_path.parent / f"labels_{result_path.stem}.json"
     try:
-        pipe = pipeline("text-generation", model=model_name, device=device, torch_dtype=torch.bfloat16)
+        pipe = pipeline("text-generation", model=model_name, device=device)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
 
     try:
-        with open(source_path, 'r', encoding='utf-8') as f:
+        with open(result_json, 'r', encoding='utf-8') as f:
             turns = json.load(f)
     except Exception as e:
-        print(f"Error reading input file: {e}")
+        print(f"Error reading input file {result_json}: {e}")
         return
 
     labeled_count = 0
@@ -54,24 +55,60 @@ def llm(
         messages = create_prompt(speech_turn["text"])
         try:
             outputs = pipe(messages, max_new_tokens=50)
-            # Extract label from output
             label = outputs[0]["generated_text"][-1]["content"]
             label = validate_label(label)
             turns[idx]["label"] = label
             labeled_count += 1
         except Exception as e:
-            print(f"Error labeling turn {idx}: {e}")
+            print(f"Error labeling turn {idx} in {result_json}: {e}")
             turns[idx]["label"] = "error"
 
     try:
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(turns, f, indent=4, ensure_ascii=False)
-        print(f"Labeled {labeled_count} segments. Output saved to {output_path}.")
+        print(f"Labeled {labeled_count} segments in {result_json}. Output: {output_path}. Time: {time.time() - start:.2f}s")
     except Exception as e:
-        print(f"Error writing output file: {e}")
+        print(f"Error writing output file {output_path}: {e}")
 
+
+def discover_result_jsons(root: Path, pattern_prefix: str = "results_", pattern_suffix: str = ".json") -> List[Path]:
+    """
+    Recursively discover result JSON files in subfolders of root that match pattern results_*.json
+    and are not already labeled (exclude files starting with labels_).
+    """
+    files = []
+    if not root.exists():
+        print(f"Root output directory not found: {root}")
+        return files
+    for p in root.rglob(f"{pattern_prefix}*{pattern_suffix}"):
+        if p.is_file() and not p.name.startswith("labels_"):
+            files.append(p)
+    return files
+
+def main():
+    parser = argparse.ArgumentParser(description="Label psychotherapy session result JSONs using an LLM.")
+    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--output_dir", type=str, required=True, help="Root output directory containing per-file subfolders with results_*.json")
+    parser.add_argument("--result_jsons", nargs="*", help="Optional explicit list of result JSON files. If omitted, auto-discovers results_*.json recursively under --output_dir.")
+    parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    root_output = Path(args.output_dir)
+    if args.result_jsons and len(args.result_jsons) > 0:
+        result_jsons = [Path(f) for f in args.result_jsons]
+    else:
+        result_jsons = discover_result_jsons(root_output)
+        if not result_jsons:
+            print(f"No result JSON files found under {root_output} matching pattern results_*.json")
+            return
+
+    print(f"Discovered {len(result_jsons)} result files to label.")
+
+    with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+        futures = [executor.submit(process_result_file, str(f), config) for f in result_jsons]
+        for fut in futures:
+            fut.result()
 
 if __name__ == "__main__":
-    start = time.time()
-    llm()
-    print(f"Execution time: {time.time() - start:.2f} seconds")
+    main()
