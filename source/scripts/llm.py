@@ -1,8 +1,11 @@
-
 from transformers import pipeline
 import json
 import torch
 import time
+
+from IPython import embed
+
+
 
 def create_prompt(text: str) -> list:
     """
@@ -52,7 +55,7 @@ def llm(
         try:
             outputs = pipe(messages, max_new_tokens=50)
             # Extract label from output
-            label = outputs[0]["generated_text"] if "generated_text" in outputs[0] else outputs[0].get("text", "")
+            label = outputs[0]["generated_text"][-1]["content"]
             label = validate_label(label)
             turns[idx]["label"] = label
             labeled_count += 1

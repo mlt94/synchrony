@@ -121,13 +121,13 @@ if __name__ == "__main__":
         source_file="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/test.wav",
         output_dir="/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/"
     )
-    # pipeline.diarize()
+    pipeline.diarize()
     results = pipeline.chunk_asr()
 
     output_json = Path("/mnt/c/users/mlut/OneDrive - ITU/DESKTOP/sync/synchrony/files/results.json")
     with open(output_json, "w") as file:
         json.dump(results, file, indent=4, ensure_ascii=False)
-    print(f"Execution time: {time.time() - start:.2f} seconds")
+    print(f"Execution time: {time.time() - start:.2f} seconds") #outputs 1358 seconds, i.e., 22 minutes for the four and a half-minute video
 
 
 
