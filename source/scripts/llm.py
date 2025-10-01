@@ -6,10 +6,8 @@ import json
 import time
 from transformers import pipeline
 from typing import List
-
-def load_config(config_path):
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
+import torch
+from utils import load_config
 
 def create_prompt(text: str) -> list:
     """
@@ -38,7 +36,17 @@ def process_result_file(result_json: str, config: dict):
     result_path = Path(result_json)
     output_path = result_path.parent / f"labels_{result_path.stem}.json"
     try:
-        pipe = pipeline("text-generation", model=model_name, device=device)
+        # Map device string to transformer pipeline expectation: -1 CPU, 0 GPU:0
+        device_arg = -1
+        if isinstance(device, str):
+            if device.lower().startswith("cuda"):
+                device_arg = 0
+            elif device.lower() == "cpu":
+                device_arg = -1
+        elif isinstance(device, int):
+            device_arg = device
+
+        pipe = pipeline("text-generation", model=model_name, device=device_arg)
     except Exception as e:
         print(f"Error loading model: {e}")
         return
@@ -55,8 +63,24 @@ def process_result_file(result_json: str, config: dict):
         messages = create_prompt(speech_turn["text"])
         try:
             outputs = pipe(messages, max_new_tokens=50)
-            label = outputs[0]["generated_text"][-1]["content"]
-            label = validate_label(label)
+            # Try to robustly retrieve generated text across model variants
+            label_raw = None
+            try:
+                # Typical chat pipeline output: [{"generated_text": [{"role":..., "content": "..."}, ...]}]
+                if isinstance(outputs, list) and outputs:
+                    first = outputs[0]
+                    if isinstance(first, dict) and "generated_text" in first:
+                        gen = first["generated_text"]
+                        if isinstance(gen, list) and gen and isinstance(gen[-1], dict) and "content" in gen[-1]:
+                            label_raw = gen[-1]["content"]
+                        elif isinstance(gen, str):
+                            label_raw = gen
+            except Exception:
+                pass
+            if label_raw is None:
+                label_raw = str(outputs)
+
+            label = validate_label(label_raw)
             turns[idx]["label"] = label
             labeled_count += 1
         except Exception as e:

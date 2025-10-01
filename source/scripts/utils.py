@@ -1,6 +1,9 @@
 import json
+import os
 from itertools import groupby
 from typing import List, Dict
+import yaml
+import torch
 
 def extract_speech_turns_from_file(json_path: str) -> List[Dict]:
     """
@@ -19,3 +22,22 @@ def extract_speech_turns_from_file(json_path: str) -> List[Dict]:
             "end": group[-1]["end"]
         })
     return speech_turns
+
+def load_config(config_path):
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+        # Dynamically set the device if "auto" is specified
+        if config.get("device", "auto") == "auto":
+            config["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        if config.get("llm_device", "auto") == "auto":
+            config["llm_device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        # Resolve HF token
+        hf_token = config.get("hf_token", "auto")
+        if hf_token == "auto" or hf_token is None:
+            hf_token = (
+                os.getenv("HUGGINGFACE_HUB_TOKEN")
+                or os.getenv("HF_TOKEN")
+                or os.getenv("HUGGINGFACE_TOKEN")
+            )
+        config["hf_token"] = hf_token
+        return config
