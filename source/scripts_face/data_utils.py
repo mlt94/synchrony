@@ -2,20 +2,18 @@
 Utilities for loading OpenFace Action Unit CSVs as PyTorch-ready sequences.
 
 We only care about the following parsed metadata:
-  - identifier (e.g., identifier for the interviewee)
-  - type       (e.g., Wunder, Personal, Bindung)
-  - person     (e.g., interviewer or interviewee)
+	- identifier (e.g., identifier for the interviewee)
+	- type       (e.g., Wunder, Personal, Bindung)
+	- person     (e.g., interviewer or interviewee)
 
 This module provides:
-  - parse_file_metadata: robustly extract (identifier, type, person) from filename
-  - AUSequenceDataset:   a torch.utils.data.Dataset yielding AU time-series per file
-  - pad_collate:         collate function that pads variable-length sequences
-  - make_dataloaders_by: helper to construct DataLoaders split by a given field
+	- parse_file_metadata: extract (identifier, type, person) from filename
+	- AUSequenceDataset:   a torch.utils.data.Dataset yielding AU time-series per file
+	- pad_collate:         collate function that pads variable-length sequences
+	- make_dataloaders_by: helper to construct DataLoaders split by a given field
 """
 
 from __future__ import annotations
-
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,19 +90,20 @@ def _select_au_columns(df: pd.DataFrame, prefer: str = "r") -> List[str]:
 	Choose AU feature columns from a DataFrame. Prefer intensity columns ("*_r").
 	If none found, fall back to presence ("*_c").
 	"""
-	cols = list(df.columns)
+	# Normalize header names lightly
+	cols = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 	if prefer == "r":
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_r$", c)]
+		au_cols = [c for c in cols if re.match(r"^AU\d{2}_r$", c, flags=re.IGNORECASE)]
 		if au_cols:
 			return au_cols
 		# Fallback to presence
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_c$", c)]
+		au_cols = [c for c in cols if re.match(r"^AU\d{2}_c$", c, flags=re.IGNORECASE)]
 		return au_cols
 	else:  # prefer presence
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_c$", c)]
+		au_cols = [c for c in cols if re.match(r"^AU\d{2}_c$", c, flags=re.IGNORECASE)]
 		if au_cols:
 			return au_cols
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_r$", c)]
+		au_cols = [c for c in cols if re.match(r"^AU\d{2}_r$", c, flags=re.IGNORECASE)]
 		return au_cols
 
 
@@ -176,18 +175,28 @@ class AUSequenceDataset(Dataset):
 
 		# Inspect one file to determine AU columns
 		self._au_columns: Optional[List[str]] = None
+		first_columns_sample: List[str] | None = None
 		for m in self._metas:
 			try:
 				head = pd.read_csv(m.path, nrows=0)
+				if first_columns_sample is None:
+					first_columns_sample = [str(c).strip() for c in head.columns]
 				au_cols = _select_au_columns(head, prefer=self.au_prefer)
 				if au_cols:
+					# Preserve exact casing as in DataFrame for consistent indexing later
 					self._au_columns = au_cols
 					break
 			except Exception:
 				continue
 
 		if self._au_columns is None:
-			raise RuntimeError("Could not determine AU columns from any CSV. Ensure files contain AU*_r or AU*_c columns.")
+			details = f"Found {len(self._metas)} candidate CSVs under {self.root}. "
+			if first_columns_sample is not None:
+				details += f"Example header columns: {first_columns_sample[:10]}"
+			raise RuntimeError(
+				"Could not determine AU columns from any CSV. Ensure files contain AU*_r or AU*_c columns. "
+				+ details
+			)
 
 	@property
 	def au_columns(self) -> List[str]:
