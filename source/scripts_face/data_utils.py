@@ -24,9 +24,6 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 
-_IDENT_RE = re.compile(r"^[A-Za-z0-9]+$")
-
-
 @dataclass(frozen=True)
 class FileMeta:
 	path: Path
@@ -58,8 +55,6 @@ def parse_file_metadata(path: Path) -> Optional[FileMeta]:
 		return None
 
 	identifier = tokens[0]
-	if not _IDENT_RE.match(identifier):
-		return None
 
 	# type is typically the penultimate token
 	type_token = tokens[-2] if len(tokens) >= 2 else None
@@ -121,8 +116,7 @@ class AUSequenceDataset(Dataset):
 		au_prefer: str = "r",
 		drop_na: bool = True,
 		labels_csv: Optional[str | Path] = None,
-		labels_identifier_column: str = "ID_Proband",
-		labels_therapist_column: str = "ID_Interviewerin",
+
 	) -> None:
 		super().__init__()
 		self.root = Path(root)
@@ -130,7 +124,7 @@ class AUSequenceDataset(Dataset):
 		self.drop_na = drop_na
 		self._labels_map: Optional[Dict[str, str]] = None
 		if labels_csv is not None:
-			self._labels_map = _load_labels_map(labels_csv, labels_identifier_column, labels_therapist_column)
+			self._labels_map = _load_labels_map(labels_csv)
         
 		files = discover_csv_files(self.root)
         
@@ -141,58 +135,24 @@ class AUSequenceDataset(Dataset):
 				continue
 			metas.append(meta)
 
-		def _in(opt: Optional[Iterable[str]], val: str) -> bool:
-			return True if opt is None else (val in set(opt))
-
-		def _not_in(opt: Optional[Iterable[str]], val: str) -> bool:
-			return True if opt is None else (val not in set(opt))
-
-		filtered: List[FileMeta] = []
-		for m in metas:
-			if not _in(include_identifiers, m.identifier):
-				continue
-			if not _in(include_types, m.type):
-				continue
-			if not _in(include_persons, m.person):
-				continue
-			if not _not_in(exclude_identifiers, m.identifier):
-				continue
-			filtered.append(m)
-
 		# Attach therapist id from labels map if provided
 		if self._labels_map is not None:
 			attached: List[FileMeta] = []
-			for m in filtered:
+			for m in metas:
 				ther = self._labels_map.get(m.identifier)
 				attached.append(FileMeta(path=m.path, identifier=m.identifier, type=m.type, person=m.person, therapist=ther))
 			self._metas = attached
 		else:
-			self._metas = filtered
+			self._metas = metas
 
 		# Inspect one file to determine AU columns
-		self._au_columns: Optional[List[str]] = None
-		first_columns_sample: List[str] | None = None
+		self._au_columns: List[str] = []
 		for m in self._metas:
-			try:
-				head = pd.read_csv(m.path, nrows=0)
-				if first_columns_sample is None:
-					first_columns_sample = [str(c).strip() for c in head.columns]
-				au_cols = _select_au_columns(head, prefer=self.au_prefer)
-				if au_cols:
-					# Preserve exact casing as in DataFrame for consistent indexing later
-					self._au_columns = au_cols
-					break
-			except Exception:
-				continue
-
-		if self._au_columns is None:
-			details = f"Found {len(self._metas)} candidate CSVs under {self.root}. "
-			if first_columns_sample is not None:
-				details += f"Example header columns: {first_columns_sample[:10]}"
-			raise RuntimeError(
-				"Could not determine AU columns from any CSV. Ensure files contain AU*_r or AU*_c columns. "
-				+ details
-			)
+			head = pd.read_csv(m.path, nrows=0)
+			au_cols = _select_au_columns(head, prefer=self.au_prefer)
+			if au_cols:
+				self._au_columns = au_cols
+				break
 
 	@property
 	def au_columns(self) -> List[str]:
@@ -209,8 +169,7 @@ class AUSequenceDataset(Dataset):
 	def __getitem__(self, idx: int) -> Dict:
 		meta = self._metas[idx]
 		df = pd.read_csv(meta.path)
-		# Normalize header names to match detection time (strip BOM and whitespace)
-		df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+		df.columns = [str(c).strip() for c in df.columns] #normalizing due to whitespace
 		cols = self.au_columns
 		x = df[cols]
 		if self.drop_na:
@@ -293,13 +252,11 @@ def make_dataloaders_by(
 	drop_na: bool = True,
 	pad: bool = True,
 	labels_csv: Optional[str | Path] = None,
-	labels_identifier_column: str = "ID_Proband",
-	labels_therapist_column: str = "ID_Interviewerin",
 ) -> Dict[str, DataLoader]:
 	"""
 	Create DataLoaders splitting on a specific metadata field.
 
-	field: one of {"identifier", "type", "person"}
+	field: one of {"identifier", "type", "person", "therapist}
 	train/val/test_values: which values of that field go to each split.
 	Other include_* filters are applied before splitting.
 	"""
@@ -315,8 +272,6 @@ def make_dataloaders_by(
 		au_prefer=au_prefer,
 		drop_na=drop_na,
 		labels_csv=labels_csv,
-		labels_identifier_column=labels_identifier_column,
-		labels_therapist_column=labels_therapist_column,
 	)
 
 	loaders: Dict[str, DataLoader] = {}
