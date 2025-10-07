@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 import torch
@@ -33,6 +33,7 @@ class FileMeta:
 	identifier: str
 	type: str
 	person: str  # "In" or "Pr"
+	therapist: Optional[str] = None  # from labels CSV (e.g., ID_Interviewerin)
 
 
 def parse_file_metadata(path: Path) -> Optional[FileMeta]:
@@ -83,6 +84,33 @@ def parse_file_metadata(path: Path) -> Optional[FileMeta]:
 def discover_csv_files(root: Path | str) -> List[Path]:
 	root = Path(root)
 	return sorted(p for p in root.glob("*.csv") if p.is_file())
+
+
+def _load_labels_map(
+	labels_csv: Path | str,
+	identifier_column: str = "ID_Proband",
+	therapist_column: str = "ID_Interviewerin",
+) -> Dict[str, str]:
+	"""Load a mapping from identifier -> therapist id from a labels CSV.
+
+	Headers are normalized (strip BOM/whitespace). Unknown/missing therapist entries are skipped.
+	"""
+	df = pd.read_csv(labels_csv)
+	df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+	id_col = identifier_column.strip()
+	th_col = therapist_column.strip()
+	if id_col not in df.columns or th_col not in df.columns:
+		raise ValueError(
+			f"labels_csv missing required columns: '{id_col}' and/or '{th_col}'. Available: {list(df.columns)}"
+		)
+	# Build mapping (drop NA therapist IDs)
+	map_: Dict[str, str] = {}
+	for _, row in df[[id_col, th_col]].dropna(subset=[id_col, th_col]).iterrows():
+		key = str(row[id_col]).strip()
+		val = str(row[th_col]).strip()
+		if key:
+			map_[key] = val
+	return map_
 
 
 def _select_au_columns(df: pd.DataFrame, prefer: str = "r") -> List[str]:
@@ -138,11 +166,17 @@ class AUSequenceDataset(Dataset):
 		exclude_identifiers: Optional[Iterable[str]] = None,
 		au_prefer: str = "r",
 		drop_na: bool = True,
+		labels_csv: Optional[str | Path] = None,
+		labels_identifier_column: str = "ID_Proband",
+		labels_therapist_column: str = "ID_Interviewerin",
 	) -> None:
 		super().__init__()
 		self.root = Path(root)
 		self.au_prefer = au_prefer
 		self.drop_na = drop_na
+		self._labels_map: Optional[Dict[str, str]] = None
+		if labels_csv is not None:
+			self._labels_map = _load_labels_map(labels_csv, labels_identifier_column, labels_therapist_column)
         
 		files = discover_csv_files(self.root)
         
@@ -171,7 +205,15 @@ class AUSequenceDataset(Dataset):
 				continue
 			filtered.append(m)
 
-		self._metas = filtered
+		# Attach therapist id from labels map if provided
+		if self._labels_map is not None:
+			attached: List[FileMeta] = []
+			for m in filtered:
+				ther = self._labels_map.get(m.identifier)
+				attached.append(FileMeta(path=m.path, identifier=m.identifier, type=m.type, person=m.person, therapist=ther))
+			self._metas = attached
+		else:
+			self._metas = filtered
 
 		# Inspect one file to determine AU columns
 		self._au_columns: Optional[List[str]] = None
@@ -213,6 +255,8 @@ class AUSequenceDataset(Dataset):
 	def __getitem__(self, idx: int) -> Dict:
 		meta = self._metas[idx]
 		df = pd.read_csv(meta.path)
+		# Normalize header names to match detection time (strip BOM and whitespace)
+		df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 		cols = self.au_columns
 		x = df[cols]
 		if self.drop_na:
@@ -225,6 +269,7 @@ class AUSequenceDataset(Dataset):
 				"identifier": meta.identifier,
 				"type": meta.type,
 				"person": meta.person,
+				"therapist": meta.therapist,
 				"path": str(meta.path),
 			},
 		}
@@ -272,7 +317,7 @@ def _subset_indices_by_field(dataset: AUSequenceDataset, field: str, allowed_val
 	idxs: List[int] = []
 	for i, m in enumerate(dataset.metas):
 		val = getattr(m, field)
-		if val in allowed:
+		if val is not None and val in allowed:
 			idxs.append(i)
 	return idxs
 
@@ -293,7 +338,10 @@ def make_dataloaders_by(
 	num_workers: int = 0,
 	shuffle_train: bool = True,
 	drop_na: bool = True,
-    pad: bool = True,
+	pad: bool = True,
+	labels_csv: Optional[str | Path] = None,
+	labels_identifier_column: str = "ID_Proband",
+	labels_therapist_column: str = "ID_Interviewerin",
 ) -> Dict[str, DataLoader]:
 	"""
 	Create DataLoaders splitting on a specific metadata field.
@@ -302,8 +350,8 @@ def make_dataloaders_by(
 	train/val/test_values: which values of that field go to each split.
 	Other include_* filters are applied before splitting.
 	"""
-	if field not in {"identifier", "type", "person"}:
-		raise ValueError("field must be one of {'identifier','type','person'}")
+	if field not in {"identifier", "type", "person", "therapist"}:
+		raise ValueError("field must be one of {'identifier','type','person','therapist'}")
 
 	base_ds = AUSequenceDataset(
 		root,
@@ -313,6 +361,9 @@ def make_dataloaders_by(
 		exclude_identifiers=exclude_identifiers,
 		au_prefer=au_prefer,
 		drop_na=drop_na,
+		labels_csv=labels_csv,
+		labels_identifier_column=labels_identifier_column,
+		labels_therapist_column=labels_therapist_column,
 	)
 
 	loaders: Dict[str, DataLoader] = {}
