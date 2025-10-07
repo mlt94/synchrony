@@ -86,75 +86,29 @@ def discover_csv_files(root: Path | str) -> List[Path]:
 	return sorted(p for p in root.glob("*.csv") if p.is_file())
 
 
-def _load_labels_map(
-	labels_csv: Path | str,
-	identifier_column: str = "ID_Proband",
-	therapist_column: str = "ID_Interviewerin",
-) -> Dict[str, str]:
-	"""Load a mapping from identifier -> therapist id from a labels CSV.
-
-	Headers are normalized (strip BOM/whitespace). Unknown/missing therapist entries are skipped.
-	"""
-	df = pd.read_csv(labels_csv)
-	df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-	id_col = identifier_column.strip()
-	th_col = therapist_column.strip()
-	if id_col not in df.columns or th_col not in df.columns:
-		raise ValueError(
-			f"labels_csv missing required columns: '{id_col}' and/or '{th_col}'. Available: {list(df.columns)}"
-		)
-	# Build mapping (drop NA therapist IDs)
-	map_: Dict[str, str] = {}
-	for _, row in df[[id_col, th_col]].dropna(subset=[id_col, th_col]).iterrows():
-		key = str(row[id_col]).strip()
-		val = str(row[th_col]).strip()
-		if key:
-			map_[key] = val
-	return map_
+def _load_labels_map(labels_csv: Path | str, id_col: str = "ID_Proband", th_col: str = "ID_Interviewerin") -> Dict[str, str]:
+    """Load a mapping from identifier -> therapist id from a labels CSV."""
+    df = pd.read_csv(labels_csv, usecols=[id_col, th_col]).dropna()
+    return dict(zip(df[id_col].str.strip(), df[th_col].str.strip()))
 
 
 def _select_au_columns(df: pd.DataFrame, prefer: str = "r") -> List[str]:
-	"""
-	Choose AU feature columns from a DataFrame. Prefer intensity columns ("*_r").
-	If none found, fall back to presence ("*_c").
-	"""
-	# Normalize header names lightly
-	cols = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-	if prefer == "r":
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_r$", c, flags=re.IGNORECASE)]
-		if au_cols:
-			return au_cols
-		# Fallback to presence
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_c$", c, flags=re.IGNORECASE)]
-		return au_cols
-	else:  # prefer presence
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_c$", c, flags=re.IGNORECASE)]
-		if au_cols:
-			return au_cols
-		au_cols = [c for c in cols if re.match(r"^AU\d{2}_r$", c, flags=re.IGNORECASE)]
-		return au_cols
+    """Select AU feature columns from a DataFrame based on preference ('r' or 'c')."""
+    # Normalize column names to handle leading/trailing spaces
+    df.columns = df.columns.str.strip()
+    if prefer == "r":
+        return [col for col in df.columns if col.endswith("_r")]
+    return [col for col in df.columns if col.endswith("_c")]
 
 
 class AUSequenceDataset(Dataset):
 	"""Dataset producing full-sequence AU tensors per CSV file.
 
-	Each item is a dict:
+	Each item is a dictionary comprised of:
 	  - x:        FloatTensor [T, D] (T frames, D AU features)
 	  - length:   int (T)
 	  - meta:     dict with keys {identifier, type, person, path}
 
-	Parameters
-	----------
-	root : str | Path
-		Directory containing CSV files.
-	include_identifiers, include_types, include_persons : Optional[Iterable[str]]
-		If provided, only keep files whose field value is in the given set.
-	exclude_identifiers : Optional[Iterable[str]]
-		If provided, drop files whose identifier is in this set.
-	au_prefer : str
-		"r" to prefer intensity columns (default), "c" to prefer presence.
-	drop_na : bool
-		If True, drop rows with any NA across selected AU columns.
 	"""
 
 	def __init__(
@@ -270,7 +224,6 @@ class AUSequenceDataset(Dataset):
 				"type": meta.type,
 				"person": meta.person,
 				"therapist": meta.therapist,
-				"path": str(meta.path),
 			},
 		}
 
