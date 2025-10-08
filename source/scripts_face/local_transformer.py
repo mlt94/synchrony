@@ -17,6 +17,6 @@ They have engaged in 3 interviews together, personality, attachment and wonder-q
 Question 3: How do we structure this training pipeline? By the therapists?
 
 
-Question 4: The recordings have different fps.....
+Question 4: The recordings have different fps: solve through linear interpolation in the timestamp?
 
 '''
