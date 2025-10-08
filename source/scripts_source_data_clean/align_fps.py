@@ -44,16 +44,27 @@ class ParsedName:
 def parse_identifier_and_type(path: Path) -> Optional[ParsedName]:
 	"""Parse identifier and interview type from a filename.
 
-	Expected pattern: IDENTIFIER_YYYY-MM-DD_Interviewtype_In.csv
+	Expected pattern (flexible with '_' or '-' separators):
+	  IDENTIFIER_YYYY-MM-DD_Interviewtype_In.csv
+	  IDENTIFIER_YYYY-MM-DD-Interviewtype-In.csv
+	If the second-to-last token is 'geschnitten', the interview type is the token before it.
 	"""
 	name = path.name
 	if name.lower().endswith(".csv"):
 		name = name[:-4]
-	tokens = name.split("_")
+	# Normalize separators so anomalous '-' delimiters become '_' tokens
+	tokens = [tok for tok in name.replace("-", "_").split("_") if tok]
 	if len(tokens) < 3:
 		return None
 	identifier = tokens[0]
-	interview_type = tokens[-2]  # penultimate token
+	# Handle cases where the penultimate token is 'geschnitten'; use the preceding token
+	penultimate = tokens[-2].lower()
+	if penultimate == "geschnitten":
+		if len(tokens) < 4:
+			return None
+		interview_type = tokens[-3]
+	else:
+		interview_type = tokens[-2]
 	return ParsedName(identifier=identifier.strip(), interview_type=interview_type.strip())
 
 
