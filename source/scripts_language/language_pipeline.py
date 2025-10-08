@@ -18,6 +18,9 @@ def run_diarization(input_wav, output_dir, config):
     file_subdir = Path(output_dir) / input_wav.stem
     file_subdir.mkdir(exist_ok=True)
 
+    target_device = config.get("device", "cpu")
+    print(f"[language_pipeline] Running diarization on device: {target_device}")
+
     try:
         diarization_pipeline = Pipeline.from_pretrained(
             config.get("diary_model", "pyannote/speaker-diarization-3.1"),
@@ -25,7 +28,7 @@ def run_diarization(input_wav, output_dir, config):
         )
         # Move pipeline to the configured device (cuda/cpu) if available
         try:
-            diarization_pipeline.to(config.get("device", "cpu"))
+            diarization_pipeline.to(target_device)
         except Exception:
             # If .to is not supported by the pipeline, continue with default
             pass
@@ -74,6 +77,7 @@ def run_asr(input_wav, output_dir, config):
     model_size = config.get("whisper_model_size", "small")
     device = config.get("device", "cuda")
     compute_type = config.get("whisper_compute_type", "int8")
+    print(f"[language_pipeline] Running ASR on device: {device} (compute_type={compute_type})")
     whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
     batched_model = BatchedInferencePipeline(model=whisper_model)
     audio_pydub = AudioSegment.from_file(str(input_wav))
@@ -123,14 +127,36 @@ def process_file(input_wav, output_dir, config, stage):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config_language.yaml", help="Path to config file")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory containing .wav files")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--parallel", type=int, default=4, help="Number of parallel workers")
     parser.add_argument("--stage", type=str, choices=["diarization", "asr", "full"], default="full", help="Pipeline stage to run")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = load_config(args.config) or {}
+
+    requested = str(config.get("device", "auto") or "auto").lower()
+    cuda_available = False
+    if requested in {"auto", ""}:
+        try:
+            import torch
+
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+        device = "cuda" if cuda_available else "cpu"
+    else:
+        device = config.get("device", "cpu")
+        try:
+            import torch
+
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+
+    config["device"] = device
+    print(f"[language_pipeline] Selected device: {device} | CUDA available: {cuda_available}")
     input_dir = Path(args.input_dir)
     wav_files = list(input_dir.glob("*.wav"))
     output_dir = Path(args.output_dir)

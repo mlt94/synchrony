@@ -1,5 +1,4 @@
 import argparse
-import yaml
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 import json
@@ -32,20 +31,15 @@ def validate_label(label: str) -> str:
 def process_result_file(result_json: str, config: dict):
     start = time.time()
     model_name = config.get("llm_model_name", "google/gemma-3-1b-it")
-    device = config.get("llm_device", "cpu")
+    device = str(config.get("llm_device", "cpu"))
     result_path = Path(result_json)
     output_path = result_path.parent / f"labels_{result_path.stem}.json"
     try:
-        # Map device string to transformer pipeline expectation: -1 CPU, 0 GPU:0
-        device_arg = -1
-        if isinstance(device, str):
-            if device.lower().startswith("cuda"):
-                device_arg = 0
-            elif device.lower() == "cpu":
-                device_arg = -1
-        elif isinstance(device, int):
-            device_arg = device
-
+        try:
+            device_arg = int(device)
+        except ValueError:
+            device_arg = 0 if device.lower().startswith("cuda") else -1
+        print(f"[llm] Labeling {result_json} using {model_name} on device {device} (pipeline arg={device_arg})")
         pipe = pipeline("text-generation", model=model_name, device=device_arg)
     except Exception as e:
         print(f"Error loading model: {e}")
@@ -111,13 +105,31 @@ def discover_result_jsons(root: Path, pattern_prefix: str = "results_", pattern_
 
 def main():
     parser = argparse.ArgumentParser(description="Label psychotherapy session result JSONs using an LLM.")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config_language.yaml", help="Path to config file")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory containing per-file subfolders with results_*.json")
     parser.add_argument("--result_jsons", nargs="*", help="Optional explicit list of result JSON files. If omitted, auto-discovers results_*.json recursively under --output_dir.")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    config = load_config(args.config) or {}
+    requested = str(config.get("llm_device", "auto") or "auto").lower()
+    cuda_available = False
+    if requested in {"auto", ""}:
+        try:
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+        device = "cuda" if cuda_available else "cpu"
+    else:
+        device = config.get("llm_device", "cpu")
+        try:
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+
+    config["llm_device"] = device
+    print(f"[llm] Selected device: {device} | CUDA available: {cuda_available}")
+
     root_output = Path(args.output_dir)
     if args.result_jsons and len(args.result_jsons) > 0:
         result_jsons = [Path(f) for f in args.result_jsons]
