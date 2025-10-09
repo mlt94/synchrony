@@ -1,5 +1,6 @@
 """
-Align OpenFace CSV time series to 60 FPS using linear interpolation based only on the 'timestamp' column.
+Align OpenFace CSV time series down to a target FPS (default 24) using rolling-mean smoothing
+and linear interpolation based on the 'timestamp' column.
 
 Inputs:
   - Directory of CSV files named like: IDENTIFIER_YYYY-MM-DD_Interviewtype_In.csv
@@ -9,20 +10,38 @@ Inputs:
 Behavior:
   - For each CSV, parse identifier and interview type from the filename
   - Look up the source FPS in the Excel by (identifier, interview type)
-	- Resample to 60 FPS with linear interpolation for numeric columns using 'timestamp' only
-	- Preserve 'timestamp' (recomputed at 60 FPS) and 'frame' if present (frame is re-generated sequentially)
+	- Downsample to the target FPS using rolling-mean smoothing and interpolation on 'timestamp'
+	- Preserve 'timestamp' (recomputed on the new grid) and 'frame' if present (frame is re-generated sequentially)
   - Non-numeric columns are carried over from the nearest original frame
   - Save to a new output directory with the same filename
 
+The interpolation and downsampling is done according to:
+- Rolling mean smoothing
+Original timestamps: T₀, T₁, …, T_{N−1}
+Original values for some AU: X₀ … X_{N−1}
+Window size: w_raw = ceil(source_fps / target_fps) ->> I enforce odd so we can center, for instance 30/24 --> 3
+This operatin outputs new AU values (Y) calculated as the mean of its neighbors; the values then need to be transformed onto the new timestep grid
+
+-- Time resampling
+t0 = T₀
+Duration = T_{N−1} − T₀
+Step = Δ = 1 / target_fps
+Generate new relative times (new_timestep vector): τ_k = k · Δ, for k = 0, 1, …, K where K are the integers denoting the corresponding timestep
+Z_k (new AU/feature vectors) = Y_i + (Y{i+1} − Y_i) * (T'k − T_i) / (T{i+1} − T_i)
+Y_i + (Y{i+1} − Y_i) --> how much does the new AU values change between two known points?
+(T'k − T_i) / (T{i+1} − T_i) --> how far are these two points separated in time?
+
+We thus compute a weighted average of the two smoothed neighbor values, weighted according to how far away the target value was between its neighbors.
+
 Usage:
   python align_fps.py --in /path/to/csvs --frame-info /path/to/frame_info.xlsx \
-					  [--out /path/to/output] [--target-fps 60]
+				  [--out /path/to/output] [--target-fps 24]
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -166,8 +185,8 @@ def _compute_time_axis_from_timestamp(df: pd.DataFrame) -> Tuple[np.ndarray, str
 	return times, ts_col, fr_col
 
 
-def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 60.0) -> pd.DataFrame:
-	"""Resample dataframe to target fps using linear interpolation for numeric columns, using only 'timestamp'.
+def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.0) -> pd.DataFrame:
+	"""Resample dataframe to target fps using rolling-mean smoothing plus interpolation on 'timestamp'.
 
 	- Recompute 'timestamp' and 'frame' (if present originally, frame is regenerated)
 	- Preserve column order from the original
@@ -207,25 +226,28 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 60.
 	if fr_col and fr_col in non_numeric_cols:
 		non_numeric_cols.remove(fr_col)
 
+	# Determine smoothing window (odd, >=1) based on ratio between source and target FPS
+	ratio = src_fps / float(target_fps)
+	if ratio <= 1:
+		window = 1
+	else:
+		window = int(np.ceil(ratio))
+		if window % 2 == 0:
+			window += 1
+
 	# Interpolate numeric columns on the time grid
 	interp_data: Dict[str, np.ndarray] = {}
 	for col in numeric_cols:
-		y = pd.to_numeric(df_sorted[col], errors="coerce").to_numpy(dtype=float)
-		# Replace missing at ends by nearest valid to make np.interp happy
+		series = pd.to_numeric(df_sorted[col], errors="coerce")
+		series = series.interpolate(method="linear", limit_direction="both")
+		if window > 1:
+			series = series.rolling(window=window, min_periods=1, center=True).mean()
+		y = series.to_numpy(dtype=float)
 		mask = ~np.isnan(y)
 		if not mask.any():
 			interp_data[col] = np.full_like(new_rel, np.nan)
 			continue
-		# For NaNs at ends, clamp to first/last valid
-		first_idx = np.argmax(mask)
-		last_idx = len(y) - 1 - np.argmax(mask[::-1])
-		if first_idx > 0:
-			y[:first_idx] = y[first_idx]
-		if last_idx < len(y) - 1:
-			y[last_idx + 1 :] = y[last_idx]
-		# Fill interior NaNs via linear interpolation along the original time order
 		if np.isnan(y).any():
-			# Interpolate y over indices of valid points (maintain order aligned with times_rel)
 			idx = np.arange(len(y), dtype=float)
 			y = np.interp(idx, idx[mask], y[mask])
 		interp_data[col] = np.interp(new_rel, times_rel, y)
@@ -269,70 +291,78 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 60.
 # CLI glue
 # ------------------------------
 
-def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target_fps: float = 60.0) -> None:
+def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target_fps: float = 24.0) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
-	frame_info = load_frame_info(frame_info_xlsx)
+	log_path = out_dir / "align_fps_log.txt"
+	with log_path.open("w", encoding="utf-8") as log_file:
+		def log(msg: str) -> None:
+			print(msg)
+			log_file.write(msg + "\n")
+			log_file.flush()
 
-	csv_paths = sorted(p for p in in_dir.glob("*.csv") if p.is_file())
-	if not csv_paths:
-		print(f"No CSV files found in {in_dir}")
-		return
+		frame_info = load_frame_info(frame_info_xlsx)
+		csv_paths = sorted(p for p in in_dir.glob("*.csv") if p.is_file())
+		if not csv_paths:
+			log(f"No CSV files found in {in_dir}")
+			return
 
-	for p in csv_paths:
-		parsed = parse_identifier_and_type(p)
-		if parsed is None:
-			print(f"[skip] Cannot parse identifier/type from: {p.name}")
-			continue
+		log(f"Processing {len(csv_paths)} file(s) to {target_fps} FPS")
 
-		src_fps = get_source_fps(frame_info, parsed.identifier, parsed.interview_type)
-		if src_fps is None:
-			print(
-				f"[skip] Missing FPS for identifier='{parsed.identifier}', type='{parsed.interview_type}' in frame_info.xlsx"
-			)
-			continue
+		for p in csv_paths:
+			parsed = parse_identifier_and_type(p)
+			if parsed is None:
+				log(f"[skip] Cannot parse identifier/type from: {p.name}")
+				continue
 
-		try:
-			df = pd.read_csv(p)
-		except Exception as e:
-			print(f"[skip] Failed to read {p.name}: {e}")
-			continue
+			src_fps = get_source_fps(frame_info, parsed.identifier, parsed.interview_type)
+			if src_fps is None:
+				log(
+					f"[skip] Missing FPS for identifier='{parsed.identifier}', type='{parsed.interview_type}' in frame_info.xlsx"
+				)
+				continue
 
-		if abs(src_fps - target_fps) < 1e-6:
+			try:
+				df = pd.read_csv(p)
+			except Exception as e:
+				log(f"[skip] Failed to read {p.name}: {e}")
+				continue
+
+			if abs(src_fps - target_fps) < 1e-6:
+				out_path = out_dir / p.name
+				try:
+					shutil.copy2(p, out_path)
+					log(f"[copy] {p.name} (already {target_fps} FPS)")
+				except Exception as e:
+					log(f"[error] Copying {p.name} -> {out_path}: {e}")
+				continue
+
+			try:
+				out_df = resample_to_target(df, src_fps=src_fps, target_fps=target_fps)
+			except Exception as e:
+				log(f"[error] Resampling {p.name}: {e}")
+				continue
+
 			out_path = out_dir / p.name
 			try:
-				df.to_csv(out_path, index=False)
-				print(f"[copy] {p.name} (already {target_fps} FPS)")
+				out_df.to_csv(out_path, index=False)
+				log(f"[ok] {p.name}: {src_fps} -> {target_fps} FPS (rows {len(df)} -> {len(out_df)})")
 			except Exception as e:
-				print(f"[error] Writing {out_path.name}: {e}")
-			continue
-
-		try:
-			out_df = resample_to_target(df, src_fps=src_fps, target_fps=target_fps)
-		except Exception as e:
-			print(f"[error] Resampling {p.name}: {e}")
-			continue
-
-		out_path = out_dir / p.name
-		try:
-			out_df.to_csv(out_path, index=False)
-			print(f"[ok] {p.name}: {src_fps} -> {target_fps} FPS (rows {len(df)} -> {len(out_df)})")
-		except Exception as e:
-			print(f"[error] Writing {out_path.name}: {e}")
+				log(f"[error] Writing {out_path.name}: {e}")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-	ap = argparse.ArgumentParser(description="Resample OpenFace CSVs to 60 FPS using frame_info.xlsx metadata")
+	ap = argparse.ArgumentParser(description="Downsample OpenFace CSVs to a target FPS using frame_info.xlsx metadata")
 	ap.add_argument("--in", dest="in_dir", required=True, help="Input directory containing CSV files")
 	ap.add_argument("--frame-info", dest="frame_info", required=True, help="Path to frame_info.xlsx")
-	ap.add_argument("--out", dest="out_dir", default=None, help="Output directory for resampled CSVs (default: <in>/aligned_60fps)")
-	ap.add_argument("--target-fps", dest="target_fps", type=float, default=60.0, help="Target FPS (default: 60)")
+	ap.add_argument("--out", dest="out_dir", default=None, help="Output directory for resampled CSVs (default: <in>/aligned_24fps)")
+	ap.add_argument("--target-fps", dest="target_fps", type=float, default=24.0, help="Target FPS (default: 24)")
 	return ap.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
 	args = parse_args(argv)
 	in_dir = Path(args.in_dir).expanduser().resolve()
-	out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else (in_dir / "aligned_60fps")
+	out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else (in_dir / "aligned_24fps")
 	frame_info = Path(args.frame_info).expanduser().resolve()
 
 	if not in_dir.exists() or not in_dir.is_dir():
@@ -350,4 +380,4 @@ if __name__ == "__main__":
 	raise SystemExit(main())
 
 #python /home/mlut/synchrony/source/scripts_source_data_clean/align_fps.py --in /path/to/openface/csvs --frame-info /path/to/frame_info.xlsx
-#python /home/mlut/synchrony/source/scripts_source_data_clean/align_fps.py --in /path/to/openface/csvs --frame-info /path/to/frame_info.xlsx --out /path/to/output --target-fps 60
+#python /home/mlut/synchrony/source/scripts_source_data_clean/align_fps.py --in /path/to/openface/csvs --frame-info /path/to/frame_info.xlsx --out /path/to/output --target-fps 24
