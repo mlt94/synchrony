@@ -1,7 +1,17 @@
 """
 Utilities for loading OpenFace Action Unit CSVs as PyTorch-ready sequences.
 
-We only care about the following parsed metadata:
+09/10-25: I decide to remove the identifiers from the source dataset, which have only
+4 recordings (i.e., no wunder question --> C3IJ, C4OF, I9LB, K8OM).
+I also remove the two recordings from N1EL that has "Personal1", leaving 6 for this dyad.
+I also remove the two recordings from C8LA that has "Personal", leaving 6 for this dyad.
+I also remove the two recordings from A2ER that has ... 
+Note, that the tar-ball in the OpenFace_Output_MSB folder can always be unpacked again to recover the original source files.
+
+
+This leaves 79 dyads, with 6 recordings each.
+
+I only care about the following parsed metadata:
 	- identifier (e.g., identifier for the interviewee)
 	- type       (e.g., Wunder, Personal, Bindung)
 	- person     (e.g., interviewer or interviewee)

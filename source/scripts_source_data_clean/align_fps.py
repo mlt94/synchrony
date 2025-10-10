@@ -21,6 +21,7 @@ Original timestamps: T₀, T₁, …, T_{N−1}
 Original values for some AU: X₀ … X_{N−1}
 Window size: w_raw = ceil(source_fps / target_fps) ->> I enforce odd so we can center, for instance 30/24 --> 3
 This operatin outputs new AU values (Y) calculated as the mean of its neighbors; the values then need to be transformed onto the new timestep grid
+This is done to smooth out jitters in the high frequency of the AU estimates
 
 -- Time resampling
 t0 = T₀
