@@ -19,6 +19,7 @@ DIAR_PIPELINE = None  # Lazily loaded diarization pipeline
 
 
 def _normalise_device_name(device: str) -> str:
+    '''I noticed pyannote would sometimes not allocate the device correctly, because it only accepted "cuda", therefore this change'''
     device = str(device)
     if device.startswith("cuda") and ":" not in device:
         return "cuda:0"
@@ -26,7 +27,7 @@ def _normalise_device_name(device: str) -> str:
 
 
 def _load_diarization_pipeline(config: dict, log_prefix: str = "[language_pipeline]"):
-    """Load the pyannote diarization pipeline and move it to the configured device."""
+    """Load the pyannote diarization pipeline and move it to device."""
     from pyannote.audio import Pipeline
 
     diary_model = config.get("diary_model", "pyannote/speaker-diarization-3.1")
@@ -71,8 +72,7 @@ def run_diarization(input_wav, output_dir, config):
             DIAR_PIPELINE = _load_diarization_pipeline(config)
         except Exception as e:
             print(
-                "Failed to load pyannote pipeline. Ensure you have access and are authenticated. "
-                "If using gated repos, set hf_token in config.yaml or the HUGGINGFACE_HUB_TOKEN env var.\n"
+                "Failed to load pyannote pipeline. "
                 f"Error: {e}"
             )
             return
@@ -109,7 +109,7 @@ def run_asr(input_wav, output_dir, config):
                 annotation[segment] = speaker
     mapping = {
         annotation.argmax(): "client",
-        [label for label in annotation.labels() if label != annotation.argmax()][0]: "therapist"
+        [label for label in annotation.labels() if label != annotation.argmax()][0]: "therapist" #The most-speaking individual is inferred to be the client
     }
 
     model_size = config.get("whisper_model_size", "small")
@@ -124,11 +124,6 @@ def run_asr(input_wav, output_dir, config):
     device_index = torch_device.index if torch_device.index is not None else 0
 
     compute_type = config.get("whisper_compute_type", "int8")
-    if device_type == "cpu" and compute_type not in {"int8", "float32"}:
-        # float16/int8 not supported on CPU; fall back to float32 for stability
-        print(f"[language_pipeline] compute_type '{compute_type}' not supported on CPU; using 'float32'")
-        compute_type = "float32"
-
     print(
         f"[language_pipeline] Running ASR on device: {device_type}"
         f" (index={device_index}, compute_type={compute_type})"
@@ -155,6 +150,7 @@ def run_asr(input_wav, output_dir, config):
     audio_pydub = AudioSegment.from_file(str(input_wav_path))
     results = []
     export_path = file_subdir / f"{input_wav_path.stem}_chunk.wav"
+
     for segment in annotation.itersegments():
         speaker_label = mapping[next(iter(annotation.get_labels(segment)))]
         if not config.get("both_speakers", False) and speaker_label == "therapist":
@@ -203,7 +199,7 @@ def extract_audio_from_mov(input_mov: Path, temp_audio_dir: Path, config: dict) 
                 str(output_wav),
                 ac=channels,
                 ar=sample_rate,
-                **{"vn": None},  # drop video stream
+                **{"vn": None},  # drop video 
             )
             .overwrite_output()
             .run(quiet=True)
