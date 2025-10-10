@@ -8,6 +8,7 @@ from typing import List
 import torch
 from utils import load_config
 
+
 def create_prompt(text: str) -> list:
     """
     Create prompt messages for the LLM labeling task.
@@ -89,6 +90,7 @@ def process_result_file(result_json: str, config: dict):
         print(f"Error writing output file {output_path}: {e}")
 
 
+
 def discover_result_jsons(root: Path, pattern_prefix: str = "results_", pattern_suffix: str = ".json") -> List[Path]:
     """
     Recursively discover result JSON files in subfolders of root that match pattern results_*.json
@@ -112,23 +114,16 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config) or {}
-    requested = str(config.get("llm_device", "auto") or "auto").lower()
-    cuda_available = False
-    if requested in {"auto", ""}:
+
+    device = config.get("llm_device", "auto")
+    if str(device).lower() in ("auto", ""):
         try:
-            cuda_available = torch.cuda.is_available()
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         except Exception:
-            cuda_available = False
-        device = "cuda" if cuda_available else "cpu"
-    else:
-        device = config.get("llm_device", "cpu")
-        try:
-            cuda_available = torch.cuda.is_available()
-        except Exception:
-            cuda_available = False
+            device = "cpu"
 
     config["llm_device"] = device
-    print(f"[llm] Selected device: {device} | CUDA available: {cuda_available}")
+    print(f"[llm] Selected device: {device}")
 
     root_output = Path(args.output_dir)
     if args.result_jsons and len(args.result_jsons) > 0:
