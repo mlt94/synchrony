@@ -156,8 +156,8 @@ def run_asr(input_wav, output_dir, config):
         if not config.get("both_speakers", False) and speaker_label == "therapist":
             continue
         start_ms = int(segment.start * 1000)
-        end_ms = int(segment.end * 1000)
-        if end_ms - start_ms < 1000:
+        end_ms = int(segment.end * 1000) 
+        if end_ms - start_ms < 1500: #if the speach turn is less than 1500 milliseconds, dont transcribe ("uh", "mhmm", "und..")
             continue
         chunk = audio_pydub[start_ms:end_ms]
         chunk.export(export_path, format="wav")
