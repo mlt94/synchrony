@@ -4,7 +4,7 @@ from typing import List
 
 import torch
 
-from .data_utils import make_dataloaders_by, summarize_dataset
+from .local_dataloader import make_dataloaders_by, summarize_dataset
 
 
 def main():

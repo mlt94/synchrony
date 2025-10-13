@@ -15,8 +15,6 @@ Confirmation point 2: We will train one encoder-block with the patient embedding
 one decoder block with the therapist embedding and cross-attention as per above
 --> train two encoders, therapist and patient, one decoder for therapist
 
-
-
 Data characteristics:
 We have 82 patient-therapist dyads.
 They have engaged in 3 interviews together, personality, attachment and wonder-question.
@@ -29,5 +27,8 @@ Question 4: The recordings have different fps: solve through linear interpolatio
 --> downsample to lowest denominator (24)
 --> investigate if the team can re-run the OpenFace algorithm, else find smoothing/filter/downsampling algorithms
 
+##############################################################
+Supervision 15/10-25:
+--> the labels. We have a "problem" in that the distribution of them is severely skewed, towards positive instances.
 
 '''

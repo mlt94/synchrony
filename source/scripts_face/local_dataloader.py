@@ -5,8 +5,8 @@ Utilities for loading OpenFace Action Unit CSVs as PyTorch-ready sequences.
 4 recordings (i.e., no wunder question --> C3IJ, C4OF, I9LB, K8OM).
 I also remove the two recordings from N1EL that has "Personal1", leaving 6 for this dyad.
 I also remove the two recordings from C8LA that has "Personal", leaving 6 for this dyad.
-I also remove the two recordings from A2ER that has ... 
-Note, that the tar-ball in the OpenFace_Output_MSB folder can always be unpacked again to recover the original source files.
+The source corpus has two files pr. person in the "Bindung" section; we combine these two as the video was interrupted due to internet connection  
+Note, that the tar-ball in the msb folder can always be unpacked again to recover the original source files received from Mindy.
 
 
 This leaves 79 dyads, with 6 recordings each.
