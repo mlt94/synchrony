@@ -3,29 +3,18 @@ Align OpenFace CSV time series down to a target FPS (default 24) using rolling-m
 and linear interpolation based on the 'timestamp' column.
 
 Inputs:
-  - Directory of CSV files named like: IDENTIFIER_YYYY-MM-DD_Interviewtype_In.csv
+  - Directory of CSV files named like: IDENTIFIER_YYYY-MM-DD_Interviewtype_targetperson.csv
   - Excel file frame_info.xlsx with columns:
 		Pseudonym, FPS BRFI, FPS STiP, FPS WF
-
-Behavior:
-  - For each CSV, parse identifier and interview type from the filename
-  - Look up the source FPS in the Excel by (identifier, interview type)
-	- Downsample to the target FPS using rolling-mean smoothing and interpolation on 'timestamp'
-	- Preserve 'timestamp' (recomputed on the new grid) and 'frame' if present (frame is re-generated sequentially)
-  - Non-numeric columns are carried over from the nearest original frame
-  - Save to a new output directory with the same filename
-
 The interpolation and downsampling is done according to:
-- Rolling mean smoothing
+- Rolling mean smoothing (pandas.rolling)
 Original timestamps: T₀, T₁, …, T_{N−1}
 Original values for some AU: X₀ … X_{N−1}
 Window size: w_raw = ceil(source_fps / target_fps) ->> I enforce odd so we can center, for instance 30/24 --> 3
 This operatin outputs new AU values (Y) calculated as the mean of its neighbors; the values then need to be transformed onto the new timestep grid
 This is done to smooth out jitters in the high frequency of the AU estimates
 
--- Time resampling
-t0 = T₀
-Duration = T_{N−1} − T₀
+-- Time resampling (np.interp(new_timestep vector τ_k, old_timesteps T_i, values from rolling mean y))
 Step = Δ = 1 / target_fps
 Generate new relative times (new_timestep vector): τ_k = k · Δ, for k = 0, 1, …, K where K are the integers denoting the corresponding timestep
 Z_k (new AU/feature vectors) = Y_i + (Y{i+1} − Y_i) * (T'k − T_i) / (T{i+1} − T_i)
@@ -34,9 +23,16 @@ Y_i + (Y{i+1} − Y_i) --> how much does the new AU values change between two kn
 
 We thus compute a weighted average of the two smoothed neighbor values, weighted according to how far away the target value was between its neighbors.
 
-Usage:
-  python align_fps.py --in /path/to/csvs --frame-info /path/to/frame_info.xlsx \
-				  [--out /path/to/output] [--target-fps 24]
+python source/scripts_source_data_clean/align_fps.py --in /home/data_shares/genface/data/MentalHealth/msb/OpenFace_Output_MSB/ --out /home/data_shares/
+genface/data/MentalHealth/msb/ --target-fps 30 --frame-info /home/data_shares/genface/data
+/MentalHealth/msb/frame_info.xlsx
+
+the --in argument specifies the path where all the .csv files should be located, you know, the openface outputs
+the --target-fps specifies the target fps rate
+the --frame-info is the xlsx file that stores the fps rates from the .csv located (those we reference in --in)
+the --out is the path where you want the new, aligned files saved (a directory will be created, but you need to specify the path)
+In addition an "align_fps_log.txt" is created which stores one line pr file designating if it was copied, aligned or or if it failed. Super useful to know if something went wrong!
+
 """
 
 from __future__ import annotations
@@ -209,10 +205,10 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 	# Sort the dataframe by timestamp to align values with times_rel
 	df_sorted = df.sort_values(by=ts_col).reset_index(drop=True)
 
-	t_end = times_rel[-1]
+	t_end = times_rel[-1] #original timesteps
 	# Compute number of samples so last new time <= t_end
-	n_new = int(np.floor(t_end * target_fps)) + 1
-	new_rel = np.arange(n_new, dtype=float) / float(target_fps)
+	n_new = int(np.floor(t_end * target_fps)) + 1 
+	new_rel = np.arange(n_new, dtype=float) / float(target_fps) #the new time steps
 	new_abs = t0 + new_rel
 
 	# Identify columns
@@ -251,7 +247,8 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 		if np.isnan(y).any():
 			idx = np.arange(len(y), dtype=float)
 			y = np.interp(idx, idx[mask], y[mask])
-		interp_data[col] = np.interp(new_rel, times_rel, y)
+		interp_data[col] = np.interp(new_rel, times_rel, y) 
+		#new_rel --> vector of new timesteps, times_rel --> original timesteps, y--> values after rolling mean
 
 	# Align non-numeric columns by nearest original time
 	nonnum_df = pd.DataFrame({})
@@ -355,7 +352,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 	ap = argparse.ArgumentParser(description="Downsample OpenFace CSVs to a target FPS using frame_info.xlsx metadata")
 	ap.add_argument("--in", dest="in_dir", required=True, help="Input directory containing CSV files")
 	ap.add_argument("--frame-info", dest="frame_info", required=True, help="Path to frame_info.xlsx")
-	ap.add_argument("--out", dest="out_dir", default=None, help="Output directory for resampled CSVs (default: <in>/aligned_24fps)")
+	ap.add_argument("--out", dest="out_dir", required=True, default=None, help="Output directory for resampled CSVs")
 	ap.add_argument("--target-fps", dest="target_fps", type=float, default=24.0, help="Target FPS (default: 24)")
 	return ap.parse_args(argv)
 
@@ -363,7 +360,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[list[str]] = None) -> int:
 	args = parse_args(argv)
 	in_dir = Path(args.in_dir).expanduser().resolve()
-	out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else (in_dir / "aligned_24fps")
+	out_dir_name = f"aligned_{args.target_fps}fps"
+	out_dir = Path(args.out_dir).expanduser().resolve() / out_dir_name
 	frame_info = Path(args.frame_info).expanduser().resolve()
 
 	if not in_dir.exists() or not in_dir.is_dir():
