@@ -1,145 +1,190 @@
 import argparse
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor
 import json
 import time
-from transformers import pipeline
-from typing import List
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
+
 import torch
+from transformers import pipeline
+
 from utils import load_config
 
 
-def create_prompt(text: str) -> list:
-    """
-    Create prompt messages for the LLM labeling task.
-    """
-    return [
-        {"role": "system", "content": "You are an expert psychologist. Please annotate the following german psychotherapy sequences according to one of three categories, negative, neutral or positive. Please only output the annotation category."},
-        {"role": "user", "content": text}
-    ]
+def _coerce_ms(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return default
 
-def validate_label(label: str) -> str:
-    """
-    Ensure label is one of the expected categories.
-    """
-    valid = {"negative", "neutral", "positive"}
-    label = label.strip().lower()
-    for v in valid:
-        if v in label:
-            return v
-    return "unknown"
 
-def process_result_file(result_json: str, config: dict):
-    start = time.time()
+def _window_indices(start_ms: int, end_ms: int, window_ms: int) -> Iterable[int]:
+    if window_ms <= 0:
+        yield 0
+        return
+    last_ms = max(end_ms - 1, start_ms)
+    start_idx = start_ms // window_ms
+    end_idx = last_ms // window_ms
+    for idx in range(start_idx, end_idx + 1):
+        yield idx
+
+
+def group_text_by_window(turns: List[dict], window_ms: int) -> Tuple[Dict[int, List[str]], int]:
+    grouped: Dict[int, List[str]] = {}
+    max_end_ms = 0
+
+    for turn in turns:
+        text = str(turn.get("text", "")).strip()
+        if not text:
+            continue
+
+        start_ms = max(0, _coerce_ms(turn.get("start"), 0))
+        end_ms = _coerce_ms(turn.get("end"), start_ms)
+        end_ms = max(end_ms, start_ms)
+
+        max_end_ms = max(max_end_ms, end_ms)
+
+        for idx in _window_indices(start_ms, end_ms, window_ms):
+            grouped.setdefault(idx, []).append(text)
+
+    return grouped, max_end_ms
+
+
+def create_summary_prompt(window_start_ms: int, window_end_ms: int, combined_text: str) -> str:
+    start_seconds = max(window_start_ms, 0) // 1000
+    end_seconds = max(window_end_ms, 0) // 1000
+    start_minute, start_second = divmod(start_seconds, 60)
+    end_minute, end_second = divmod(end_seconds, 60)
+    time_range = f"Time {start_minute:02d}:{start_second:02d}–{end_minute:02d}:{end_second:02d}"
+    return (
+        "You are a concise psychotherapy note-taker."
+        "Provide a short, anonymous English summary (1-2 sentences) of the conversation."
+        "Conversation excerpt:\n"
+        f"{combined_text}\n"
+        "Summary:"
+    )
+
+
+def generate_summary(text_pipe, prompt: str, max_new_tokens: int = 120) -> str:
+    outputs = text_pipe(prompt, max_new_tokens=max_new_tokens, return_full_text=False)
+    if isinstance(outputs, list) and outputs:
+        return str(outputs[0].get("generated_text", "")).strip()
+    if isinstance(outputs, dict):
+        return str(outputs.get("generated_text", "")).strip()
+    return str(outputs).strip()
+
+
+def process_result_file(result_json: str, config: dict, window_seconds: int):
+    start_time = time.time()
     model_name = config.get("llm_model_name", "google/gemma-3-1b-it")
     device = str(config.get("llm_device", "cpu"))
     result_path = Path(result_json)
-    output_path = result_path.parent / f"labels_{result_path.stem}.json"
-    try:
-        try:
-            device_arg = int(device)
-        except ValueError:
-            device_arg = 0 if device.lower().startswith("cuda") else -1
-        print(f"[llm] Labeling {result_json} using {model_name} on device {device} (pipeline arg={device_arg})")
-        pipe = pipeline("text-generation", model=model_name, device=device_arg)
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return
+    output_path = result_path.parent / f"summaries_{result_path.stem}.json"
 
     try:
-        with open(result_json, 'r', encoding='utf-8') as f:
-            turns = json.load(f)
-    except Exception as e:
-        print(f"Error reading input file {result_json}: {e}")
-        return
+        device_arg = int(device)
+    except ValueError:
+        device_arg = 0 if device.lower().startswith("cuda") else -1
 
-    labeled_count = 0
-    for idx, speech_turn in enumerate(turns):
-        messages = create_prompt(speech_turn["text"])
-        try:
-            outputs = pipe(messages, max_new_tokens=50)
-            # Try to robustly retrieve generated text across model variants
-            label_raw = None
-            try:
-                # Typical chat pipeline output: [{"generated_text": [{"role":..., "content": "..."}, ...]}]
-                if isinstance(outputs, list) and outputs:
-                    first = outputs[0]
-                    if isinstance(first, dict) and "generated_text" in first:
-                        gen = first["generated_text"]
-                        if isinstance(gen, list) and gen and isinstance(gen[-1], dict) and "content" in gen[-1]:
-                            label_raw = gen[-1]["content"]
-                        elif isinstance(gen, str):
-                            label_raw = gen
-            except Exception:
-                pass
-            if label_raw is None:
-                label_raw = str(outputs)
+    print(f"[llm] Summarising {result_json} using {model_name} on device {device}")
+    text_pipe = pipeline("text-generation", model=model_name, device=device_arg)
 
-            label = validate_label(label_raw)
-            turns[idx]["label"] = label
-            labeled_count += 1
-        except Exception as e:
-            print(f"Error labeling turn {idx} in {result_json}: {e}")
-            turns[idx]["label"] = "error"
+    with open(result_json, "r", encoding="utf-8") as f:
+        turns = json.load(f)
 
-    try:
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(turns, f, indent=4, ensure_ascii=False)
-        print(f"Labeled {labeled_count} segments in {result_json}. Output: {output_path}. Time: {time.time() - start:.2f}s")
-    except Exception as e:
-        print(f"Error writing output file {output_path}: {e}")
+    window_ms = window_seconds * 1000
+    grouped_windows, max_end_ms = group_text_by_window(turns, window_ms)
+    results: List[Dict[str, int | str]] = []
 
+    for window_index in sorted(grouped_windows):
+        combined_text = " ".join(grouped_windows[window_index]).strip()
+        if not combined_text:
+            continue
+
+        window_start_ms = window_index * window_ms
+        default_end = (window_index + 1) * window_ms - 1
+        window_end_ms = min(default_end, max_end_ms) if max_end_ms else default_end
+
+        prompt = create_summary_prompt(window_start_ms, window_end_ms, combined_text)
+        summary = generate_summary(text_pipe, prompt)
+
+        results.append(
+            {
+                "window_index": window_index,
+                "window_start_ms": window_start_ms,
+                "window_end_ms": window_end_ms,
+                "summary": summary,
+            }
+        )
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=4, ensure_ascii=False)
+
+    duration_desc = f"{window_seconds}s" if window_seconds < 60 else f"{window_seconds / 60:.1f}min"
+    elapsed = time.time() - start_time
+    print(f"Summarised {len(results)} windows ({duration_desc}) in {result_json}. Output: {output_path}. Time: {elapsed:.2f}s")
 
 
 def discover_result_jsons(root: Path, pattern_prefix: str = "results_", pattern_suffix: str = ".json") -> List[Path]:
-    """
-    Recursively discover result JSON files in subfolders of root that match pattern results_*.json
-    and are not already labeled (exclude files starting with labels_).
-    """
-    files = []
     if not root.exists():
         print(f"Root output directory not found: {root}")
-        return files
-    for p in root.rglob(f"{pattern_prefix}*{pattern_suffix}"):
-        if p.is_file() and not p.name.startswith("labels_"):
-            files.append(p)
-    return files
+        return []
+
+    candidates = root.rglob(f"{pattern_prefix}*{pattern_suffix}")
+    pending = []
+    for path in candidates:
+        if not path.is_file() or path.name.startswith("labels_"):
+            continue
+        summary_path = path.parent / f"summaries_{path.stem}.json"
+        if not summary_path.exists():
+            pending.append(path)
+    return pending
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Label psychotherapy session result JSONs using an LLM.")
+    parser = argparse.ArgumentParser(description="Summarise psychotherapy session result JSONs using an LLM.")
     parser.add_argument("--config", type=str, default="config_language.yaml", help="Path to config file")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory containing per-file subfolders with results_*.json")
     parser.add_argument("--result_jsons", nargs="*", help="Optional explicit list of result JSON files. If omitted, auto-discovers results_*.json recursively under --output_dir.")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers")
+    parser.add_argument("--window_seconds", type=int, default=60, help="Length of each summarisation window in seconds")
     args = parser.parse_args()
 
     config = load_config(args.config) or {}
 
-    device = config.get("llm_device", "auto")
-    if str(device).lower() in ("auto", ""):
-        try:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            device = "cpu"
+    requested_device = str(config.get("llm_device", "auto")).lower()
+    if requested_device in ("auto", ""):
+        config["llm_device"] = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        config["llm_device"] = requested_device
 
-    config["llm_device"] = device
-    print(f"[llm] Selected device: {device}")
+    print(f"[llm] Selected device: {config['llm_device']}")
 
     root_output = Path(args.output_dir)
-    if args.result_jsons and len(args.result_jsons) > 0:
-        result_jsons = [Path(f) for f in args.result_jsons]
+    if args.result_jsons:
+        result_jsons = [Path(p) for p in args.result_jsons]
     else:
         result_jsons = discover_result_jsons(root_output)
         if not result_jsons:
             print(f"No result JSON files found under {root_output} matching pattern results_*.json")
             return
 
-    print(f"Discovered {len(result_jsons)} result files to label.")
+    print(f"Discovered {len(result_jsons)} result files to summarise.")
 
     with ProcessPoolExecutor(max_workers=args.parallel) as executor:
-        futures = [executor.submit(process_result_file, str(f), config) for f in result_jsons]
-        for fut in futures:
-            fut.result()
+        futures = [
+            executor.submit(process_result_file, str(path), config, args.window_seconds)
+            for path in result_jsons
+        ]
+        for future in futures:
+            future.result()
+
 
 if __name__ == "__main__":
     main()
