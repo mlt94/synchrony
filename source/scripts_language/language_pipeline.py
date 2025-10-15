@@ -183,10 +183,10 @@ def run_asr(input_wav, output_dir, config):
     print(f"ASR for {input_wav_path} done in {time.time() - start:.2f}s. Output: {output_json}")
 
 
-def extract_audio_from_mov(input_mov: Path, temp_audio_dir: Path, config: dict) -> Path | None:
-    """Extract the audio track from a .mov file into a temporary .wav file."""
+def extract_audio_from_video(input_video: Path, temp_audio_dir: Path, config: dict) -> Path | None:
+    """Extract the audio track from a video file (.mov or .mp4) into a temporary .wav file."""
     temp_audio_dir.mkdir(parents=True, exist_ok=True)
-    output_wav = temp_audio_dir / f"{input_mov.stem}.wav"
+    output_wav = temp_audio_dir / f"{input_video.stem}.wav"
 
     sample_rate = int(config.get("audio_sample_rate", 16000))
     channels = int(config.get("audio_channels", 1))
@@ -194,7 +194,7 @@ def extract_audio_from_mov(input_mov: Path, temp_audio_dir: Path, config: dict) 
     try:
         (
             ffmpeg
-            .input(str(input_mov))
+            .input(str(input_video))
             .output(
                 str(output_wav),
                 ac=channels,
@@ -204,10 +204,10 @@ def extract_audio_from_mov(input_mov: Path, temp_audio_dir: Path, config: dict) 
             .overwrite_output()
             .run(quiet=True)
         )
-        print(f"[language_pipeline] Extracted audio: {input_mov} -> {output_wav}")
+        print(f"[language_pipeline] Extracted audio: {input_video} -> {output_wav}")
         return output_wav
     except ffmpeg.Error as e:
-        print(f"[language_pipeline] Failed to extract audio from {input_mov}: {e}")
+        print(f"[language_pipeline] Failed to extract audio from {input_video}: {e}")
         return None
 
 
@@ -225,7 +225,7 @@ def process_file(input_wav, output_dir, config, stage):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config_language.yaml", help="Path to config file")
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing .wav or .mov files")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing .wav, .mov, or .mp4 files")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--stage", type=str, choices=["diarization", "asr", "full"], default="full", help="Pipeline stage to run")
     args = parser.parse_args()
@@ -252,9 +252,9 @@ def main():
     temp_audio_dir = output_dir / "_temp_audio"
     audio_files = []
 
-    mov_files = list(input_dir.glob("*.mov"))
-    for mov_file in mov_files:
-        extracted = extract_audio_from_mov(mov_file, temp_audio_dir, config)
+    video_files = list(input_dir.glob("*.mov")) + list(input_dir.glob("*.mp4"))
+    for video_file in video_files:
+        extracted = extract_audio_from_video(video_file, temp_audio_dir, config)
         if extracted is not None:
             audio_files.append(extracted)
 
@@ -262,10 +262,10 @@ def main():
     audio_files.extend(wav_files)
 
     if not audio_files:
-        print(f"No .wav or .mov files found in {input_dir}")
+        print(f"No .wav, .mov, or .mp4 files found in {input_dir}")
         return
 
-    print(f"[language_pipeline] Found {len(audio_files)} audio files (.wav/.mov) in {input_dir}.")
+    print(f"[language_pipeline] Found {len(audio_files)} audio files (.wav/.mov/.mp4) in {input_dir}.")
 
     for audio_path in audio_files:
         print(f"[language_pipeline] Processing {audio_path} ({args.stage})")
