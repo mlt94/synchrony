@@ -1,20 +1,27 @@
-# Synchrony investigation
-This repo explores how the facial expressions between a client and a therapist can be analyzed by factoring in the audio/text modality. We chunk the facial expressions in terms of who was talking when and for how long, and we also label the speech turn using an LLM. This gives a much richer background for analyzing the facial movements compared to existing tools.
-
-## Features
-- 2‑speaker diarization (`pyannote.audio`)
-- Heuristic role mapping (most speech = client)
-- Faster Whisper ASR (German) on client or both speakers
-- Skips very short (<1s) segments
-- Optional LLM post‑labeling (sentiment-style: negative / neutral / positive)
-- JSON outputs for downstream analysis
+# Dyadic synchrony in psychotherapy: OpenTSLM with facial movements and transcripts
+This repo attempts to solve core problems in psychotherapy research with regards to how a client and a therapist aligns and adjusts their non-verbal behavior over the course of a treatment session. 
+The time-series inputs are the action unit estimates of both the client and the therapists facial movements; the text-based input is the transcribed audio from the psychotherapy sessions.
+The core questions asked the openTSLM pipeline relates to different measures of relational quality, rappor and synchrony, for which we have client and therapist self-reported labels.
 
 ## Repo Layout
 ```
-source/scripts/
-	language_pipeline.py  # diarization + chunked ASR
-	llm.py                # simple labeling of transcribed segments
-	utils.py              # helper: merge words into speech turns
-files/                  # example audio + generated artifacts
-```
+.
+├── README.md
+├── opentslm/
+│   ├── src/
+│   │   ├── time_series_datasets/
+│   │   └── ...
+│   └── evaluation/
+├── source/
+│   ├── scripts_language/
+│   │   ├── language_pipeline.py
+│   │   ├── consistency_check_therapist_client.py
+│   │   └── ...
+│   ├── scripts_source_data_clean/
+│   │   └── ...
+│   ├── scripts_face/
+│   │   ├── local_dataloader.py
+│   │   └── ...
+│   └── plotting/
+
 
