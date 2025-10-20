@@ -54,7 +54,6 @@ def main():
 		pad=not args.no_pad,
 	)
 
-	# Quick smoke test: iterate one batch from each split
 	for split, loader in loaders.items():
 		print(f"Split {split}: {len(loader.dataset)} files")
 		for batch in loader:
