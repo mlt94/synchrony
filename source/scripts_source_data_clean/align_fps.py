@@ -139,9 +139,11 @@ def _compute_time_axis_from_timestamp(df: pd.DataFrame) -> Tuple[np.ndarray, str
 	norm_cols = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 	# Map lower -> original name
 	col_map = {c.lower(): orig for c, orig in zip(norm_cols, df.columns)}
-	ts_key = next((k for k in col_map if k == "timestamp"), None) 
+	ts_key = next((k for k in col_map if k == "timestamp"), None)
+	if ts_key is None:
+		raise KeyError("Required 'timestamp' column not found (case-insensitive)")
 	ts_col = col_map[ts_key]
-	fr_col = col_map["frame"]
+	fr_col = col_map.get("frame")
 
 	times = pd.to_numeric(df[ts_col], errors="raise").to_numpy(dtype=float)
 	return times, ts_col, fr_col
@@ -165,7 +167,7 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 	# Sort the dataframe by timestamp to align values with times_rel
 	df_sorted = df.sort_values(by=ts_col).reset_index(drop=True)
 
-	t_end = times_rel[-1] 
+	t_end = times_rel[-1]
 	# Compute number of new frames n_new and create the new timestep grid new_rel
 	n_new = int(np.floor(t_end * target_fps)) + 1 
 	new_rel = np.arange(n_new, dtype=float) / float(target_fps) #the new time steps
@@ -228,7 +230,8 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 	out_cols: Dict[str, np.ndarray] = {}
 	for col in original_cols:
 		if col == ts_col:
-			out_cols[col] = new_abs
+			# Write clean, zero-based seconds for timestamp (no huge epoch-like numbers)
+			out_cols[col] = new_rel
 		elif fr_col and col == fr_col:
 			# Generate new sequential frame indices starting at 0
 			out_cols[col] = np.arange(n_new, dtype=int)
@@ -285,14 +288,13 @@ def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target
 				log(f"[skip] Failed to read {p.name}: {e}")
 				continue
 
+			# Even if FPS matches, rewrite file to normalize timestamp and ensure comma-separated output
 			if abs(src_fps - target_fps) < 1e-6:
-				out_path = out_dir / p.name
 				try:
-					shutil.copy2(p, out_path)
-					log(f"[copy] {p.name} (already {target_fps} FPS)")
+					out_df = resample_to_target(df, src_fps=src_fps, target_fps=target_fps)
 				except Exception as e:
-					log(f"[error] Copying {p.name} -> {out_path}: {e}")
-				continue
+					log(f"[error] Normalizing (same-FPS) {p.name}: {e}")
+					continue
 
 			try:
 				out_df = resample_to_target(df, src_fps=src_fps, target_fps=target_fps)
@@ -302,7 +304,8 @@ def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target
 
 			out_path = out_dir / p.name
 			try:
-				out_df.to_csv(out_path, index=False)
+				# Enforce comma-separated CSV output
+				out_df.to_csv(out_path, index=False, sep=",")
 				log(f"[ok] {p.name}: {src_fps} -> {target_fps} FPS (rows {len(df)} -> {len(out_df)})")
 			except Exception as e:
 				log(f"[error] Writing {out_path.name}: {e}")
