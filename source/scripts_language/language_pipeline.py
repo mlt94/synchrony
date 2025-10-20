@@ -8,6 +8,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+import re
 
 import ffmpeg
 import torch
@@ -55,6 +56,15 @@ def _load_diarization_pipeline(config: dict, log_prefix: str = "[language_pipeli
     return pipeline
 
 
+def _sanitize_uri(text: str) -> str:
+    """Make a safe RTTM-friendly URI by replacing whitespace with underscores.
+
+    RTTM is space-separated; URIs must not contain spaces. We keep other characters
+    intact and collapse any whitespace runs to a single underscore.
+    """
+    return re.sub(r"\s+", "_", str(text))
+
+
 def run_diarization(input_wav, output_dir, config):
     """Run pyannote diarization on the provided audio file."""
     global DIAR_PIPELINE
@@ -79,6 +89,12 @@ def run_diarization(input_wav, output_dir, config):
 
     num_speakers = int(config.get("diarization_num_speakers", 2))
     diarization = DIAR_PIPELINE(str(input_wav_path), num_speakers=num_speakers)
+    # Ensure RTTM URI contains no spaces (RTTM uses space-separated fields)
+    try:
+        diarization.uri = _sanitize_uri(input_wav_path.stem)
+    except Exception:
+        # If attribute assignment fails for some reason, fall back silently; write_rttm may error if spaces remain
+        pass
     rttm_path = file_subdir / f"{input_wav_path.stem}.rttm"
     with open(rttm_path, "w") as rttm_file:
         diarization.write_rttm(rttm_file)
@@ -225,9 +241,22 @@ def process_file(input_wav, output_dir, config, stage):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="config_language.yaml", help="Path to config file")
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory containing .wav, .mov, or .mp4 files")
+    parser.add_argument(
+        "--input_dir",
+        type=str,
+        required=True,
+        help="Directory containing .wav, .mov, or .mp4 files (recursively searched). Ignored when --use_temp_audio is set.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
     parser.add_argument("--stage", type=str, choices=["diarization", "asr", "full"], default="full", help="Pipeline stage to run")
+    parser.add_argument(
+        "--use_temp_audio",
+        action="store_true",
+        help="Process from <output_dir>/_temp_audio instead of scanning input_dir. Useful for resuming after extraction.")
+    parser.add_argument(
+        "--skip_existing",
+        action="store_true",
+        help="Skip work when outputs already exist (e.g., skip diarization if RTTM exists; skip ASR if results JSON exists; in 'full', run only missing steps).",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config) or {}
@@ -252,22 +281,57 @@ def main():
     temp_audio_dir = output_dir / "_temp_audio"
     audio_files = []
 
-    video_files = list(input_dir.glob("*.mov")) + list(input_dir.glob("*.mp4"))
-    for video_file in video_files:
-        extracted = extract_audio_from_video(video_file, temp_audio_dir, config)
-        if extracted is not None:
-            audio_files.append(extracted)
+    if args.use_temp_audio:
+        # Resume mode: use already extracted audio from temp directory only
+        audio_files = list(temp_audio_dir.rglob("*.wav"))
+        if not audio_files:
+            print(f"[language_pipeline] No temp audio found in {temp_audio_dir}. Did you run extraction previously?")
+    else:
+        # Recursively discover video files in all subdirectories
+        video_files = list(input_dir.rglob("*.mov")) + list(input_dir.rglob("*.mp4"))
+        for video_file in video_files:
+            # If skip_existing is on and the extracted temp wav already exists, reuse it
+            candidate_temp_wav = temp_audio_dir / f"{video_file.stem}.wav"
+            if args.skip_existing and candidate_temp_wav.exists():
+                audio_files.append(candidate_temp_wav)
+                continue
+            extracted = extract_audio_from_video(video_file, temp_audio_dir, config)
+            if extracted is not None:
+                audio_files.append(extracted)
 
-    wav_files = list(input_dir.glob("*.wav"))
-    audio_files.extend(wav_files)
+        # Recursively discover wav files in all subdirectories
+        wav_files = list(input_dir.rglob("*.wav"))
+        audio_files.extend(wav_files)
 
     if not audio_files:
         print(f"No .wav, .mov, or .mp4 files found in {input_dir}")
         return
 
-    print(f"[language_pipeline] Found {len(audio_files)} audio files (.wav/.mov/.mp4) in {input_dir}.")
+    print(f"[language_pipeline] Found {len(audio_files)} audio files (.wav/.mov/.mp4) in {input_dir} (recursively).")
 
     for audio_path in audio_files:
+        audio_path = Path(audio_path)
+        stem = audio_path.stem
+        file_subdir = output_dir / stem
+        rttm_path = file_subdir / f"{stem}.rttm"
+        results_json = file_subdir / f"results_{stem}.json"
+
+        if args.skip_existing:
+            if args.stage == "diarization" and rttm_path.exists():
+                print(f"[language_pipeline] Skip diarization for {audio_path} (RTTM exists: {rttm_path})")
+                continue
+            if args.stage == "asr" and results_json.exists():
+                print(f"[language_pipeline] Skip ASR for {audio_path} (results exist: {results_json})")
+                continue
+            if args.stage == "full":
+                if rttm_path.exists() and results_json.exists():
+                    print(f"[language_pipeline] Skip full pipeline for {audio_path} (both outputs exist)")
+                    continue
+                if rttm_path.exists() and not results_json.exists():
+                    print(f"[language_pipeline] Resume ASR only for {audio_path} (RTTM exists)")
+                    run_asr(str(audio_path), str(output_dir), config)
+                    continue
+
         print(f"[language_pipeline] Processing {audio_path} ({args.stage})")
         process_file(str(audio_path), str(output_dir), config, args.stage)
 
