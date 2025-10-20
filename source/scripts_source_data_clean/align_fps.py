@@ -171,6 +171,7 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 	# Compute number of new frames n_new and create the new timestep grid new_rel
 	n_new = int(np.floor(t_end * target_fps)) + 1 
 	new_rel = np.arange(n_new, dtype=float) / float(target_fps) #the new time steps
+	new_rel = np.round(new_rel, 6) #many decimals when going from, for instance 60 fps to 24
 	new_abs = t0 + new_rel
 
 	# Identify columns
@@ -305,7 +306,7 @@ def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target
 			out_path = out_dir / p.name
 			try:
 				# Enforce comma-separated CSV output
-				out_df.to_csv(out_path, index=False, sep=",")
+				out_df.to_csv(out_path, index=False, sep=";")
 				log(f"[ok] {p.name}: {src_fps} -> {target_fps} FPS (rows {len(df)} -> {len(out_df)})")
 			except Exception as e:
 				log(f"[error] Writing {out_path.name}: {e}")
