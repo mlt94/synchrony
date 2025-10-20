@@ -29,6 +29,10 @@ Question 4: The recordings have different fps: solve through linear interpolatio
 
 ##############################################################
 Supervision 15/10-25:
+
+--> OpenTSML - a foundational architecture for us
 --> the labels. We have a "problem" in that the distribution of them is severely skewed, towards positive instances.
+--> the alignment of the fps in the videos solved via a simple rolling mean function and a linear interpolation onto the new time grid
+
 
 '''

@@ -7,7 +7,7 @@ Inputs:
   - Excel file frame_info.xlsx with columns:
 		Pseudonym, FPS BRFI, FPS STiP, FPS WF
 The interpolation and downsampling is done according to:
-- Rolling mean smoothing (pandas.rolling)
+- Rolling mean smoothing (pandas.rolling, only where source_fps > target_fps)
 Original timestamps: T₀, T₁, …, T_{N−1}
 Original values for some AU: X₀ … X_{N−1}
 Window size: w_raw = ceil(source_fps / target_fps) ->> I enforce odd so we can center, for instance 30/24 --> 3
@@ -60,7 +60,6 @@ class ParsedName:
 def parse_identifier_and_type(path: Path) -> Optional[ParsedName]:
 	"""Parse identifier and interview type from a filename.
 
-	Expected pattern (flexible with '_' or '-' separators):
 	  IDENTIFIER_YYYY-MM-DD_Interviewtype_In.csv
 	  IDENTIFIER_YYYY-MM-DD-Interviewtype-In.csv
 	If the second-to-last token is 'geschnitten', the interview type is the token before it.
@@ -68,12 +67,12 @@ def parse_identifier_and_type(path: Path) -> Optional[ParsedName]:
 	name = path.name
 	if name.lower().endswith(".csv"):
 		name = name[:-4]
-	# Normalize separators so anomalous '-' delimiters become '_' tokens
+	# Some of the file names contains '-' delimiters ; make all --> '_'
 	tokens = [tok for tok in name.replace("-", "_").split("_") if tok]
 	if len(tokens) < 3:
 		return None
 	identifier = tokens[0]
-	# Handle cases where the penultimate token is 'geschnitten'; use the preceding token
+	# Handle cases where the second-to-last token is 'geschnitten'; use the preceding token
 	penultimate = tokens[-2].lower()
 	if penultimate == "geschnitten":
 		if len(tokens) < 4:
@@ -98,7 +97,7 @@ TYPE_TO_COLUMN = {
 def normalize_type_for_column(t: str) -> Optional[str]:
 	"""Map various interview type strings to the frame_info.xlsx column name.
 
-	Returns the column name to use in the Excel ('FPS BRFI'/'FPS STiP'/'FPS WF'), or None if unknown.
+	Returns the column name to use in the Excel ('FPS BRFI'/'FPS STiP'/'FPS WF').
 	"""
 	tl = t.strip().lower()
 	if "bind" in tl:
@@ -112,30 +111,19 @@ def normalize_type_for_column(t: str) -> Optional[str]:
 
 def load_frame_info(xlsx_path: Path) -> pd.DataFrame:
 	df = pd.read_excel(xlsx_path)
-	# Standardize column names whitespace
 	df.columns = [str(c).strip() for c in df.columns]
-	# Normalize Pseudonym as string key
-	if "Pseudonym" not in df.columns:
-		raise ValueError("frame_info.xlsx must contain a 'Pseudonym' column")
 	df["Pseudonym"] = df["Pseudonym"].astype(str).str.strip()
 	return df
 
 
 def get_source_fps(frame_info: pd.DataFrame, identifier: str, interview_type: str) -> Optional[float]:
 	col = normalize_type_for_column(interview_type)
-	if col is None:
-		return None
-	if col not in frame_info.columns:
-		raise ValueError(f"Expected column '{col}' not found in frame_info.xlsx")
 	row = frame_info.loc[frame_info["Pseudonym"].astype(str).str.strip() == str(identifier).strip()]
 	if row.empty:
 		return None
-	val = row.iloc[0][col]
-	try:
-		fps = float(val)
-	except Exception:
-		return None
-	return fps if fps > 0 else None
+	val = row.iloc[0][col] #the corresponding fps rate for the identifier for the interview type
+	fps = float(val)
+	return fps
 
 
 # ------------------------------
@@ -145,68 +133,40 @@ def get_source_fps(frame_info: pd.DataFrame, identifier: str, interview_type: st
 def _compute_time_axis_from_timestamp(df: pd.DataFrame) -> Tuple[np.ndarray, str, Optional[str]]:
 	"""Return times (seconds), the exact timestamp column name used, and (if present) the frame column name.
 
-	Requires a 'timestamp' column (case-insensitive). If missing, raises ValueError.
+	Requires a 'timestamp' column (case-insensitive). 
 	"""
 	# Normalize header names to strip BOM/whitespace for detection (do not overwrite original df.columns order)
 	norm_cols = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 	# Map lower -> original name
 	col_map = {c.lower(): orig for c, orig in zip(norm_cols, df.columns)}
-	ts_key = next((k for k in col_map if k == "timestamp"), None)
-	if ts_key is None:
-		raise ValueError("CSV must contain a 'timestamp' column (case-insensitive)")
-
+	ts_key = next((k for k in col_map if k == "timestamp"), None) 
 	ts_col = col_map[ts_key]
-	# Frame column is optional; we only use timestamp for interpolation
-	fr_col = None
-	if "frame" in col_map:
-		fr_col = col_map["frame"]
+	fr_col = col_map["frame"]
 
-	times = pd.to_numeric(df[ts_col], errors="coerce").to_numpy(dtype=float)
-	# If there are NaNs in timestamp, interpolate timestamps over index
-	if np.isnan(times).any():
-		idx = np.arange(len(times), dtype=float)
-		mask = ~np.isnan(times)
-		times = np.interp(idx, idx[mask], times[mask])
-
-	# Ensure strictly increasing by sorting; keep stable order mapping for downstream
-	order = np.argsort(times)
-	times = times[order]
-	# Monotonic correction for any duplicate timestamps
-	diffs = np.diff(times)
-	if np.any(diffs <= 0):
-		eps = 1e-9
-		for i in range(1, len(times)):
-			if times[i] <= times[i - 1]:
-				times[i] = times[i - 1] + eps
-
+	times = pd.to_numeric(df[ts_col], errors="raise").to_numpy(dtype=float)
 	return times, ts_col, fr_col
 
 
 def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.0) -> pd.DataFrame:
-	"""Resample dataframe to target fps using rolling-mean smoothing plus interpolation on 'timestamp'.
+	"""Resample dataframe to target fps using rolling-mean (pandas.rolling) smoothing plus interpolation on 'timestamp' (np.interp).
 
 	- Recompute 'timestamp' and 'frame' (if present originally, frame is regenerated)
 	- Preserve column order from the original
 	- Non-numeric columns are aligned by nearest original sample
 	"""
-	if src_fps <= 0:
-		raise ValueError("src_fps must be > 0")
-
-	# Clean header BOM/whitespace to reliably detect 'timestamp' and 'frame'
+	# Clean headers for whitespace and similiar
 	df = df.copy()
 	df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 
 	times_old, ts_col, fr_col = _compute_time_axis_from_timestamp(df)
-	t0 = times_old[0] if len(times_old) > 0 else 0.0
-	times_rel = times_old - t0
-	if len(times_rel) == 0:
-		return df.copy()
+	t0 = times_old[0] #to account for the few cases where first timesteps may not be 0
+	times_rel = times_old - t0 #original timesteps
 
 	# Sort the dataframe by timestamp to align values with times_rel
 	df_sorted = df.sort_values(by=ts_col).reset_index(drop=True)
 
-	t_end = times_rel[-1] #original timesteps
-	# Compute number of samples so last new time <= t_end
+	t_end = times_rel[-1] 
+	# Compute number of new frames n_new and create the new timestep grid new_rel
 	n_new = int(np.floor(t_end * target_fps)) + 1 
 	new_rel = np.arange(n_new, dtype=float) / float(target_fps) #the new time steps
 	new_abs = t0 + new_rel
@@ -226,7 +186,7 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 	# Determine smoothing window (odd, >=1) based on ratio between source and target FPS
 	ratio = src_fps / float(target_fps)
 	if ratio <= 1:
-		window = 1
+		window = 1 #if src_fps is smaller than target fps, dont do rolling mean
 	else:
 		window = int(np.ceil(ratio))
 		if window % 2 == 0:
