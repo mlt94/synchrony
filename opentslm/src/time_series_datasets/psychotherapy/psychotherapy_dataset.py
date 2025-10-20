@@ -32,5 +32,8 @@ class PsychotherapyQADataset(QADataset):
         return "Answer:"
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
-        # TODO: Load AU data from CSVs and create prompts
-        return []
+        # TODO: Load AU data from CSVs and create prompts text: A descriptive label for the ECG lead (e.g., "ECG Lead I - sampled at ~100Hz, normalized (mean=..., std=...)").
+              #time_series: The actual numerical time-series data (a list of normalized signal values for that lead).
+        prompts = []
+        #prompts.append(TextTimeSeriesPrompt("text, normalized with mean (x) and std(y)", normalized_AU_signal.tolist())
+        return prompts
