@@ -1,14 +1,8 @@
 This file is just an overview to keep track of all the data-cleaning activites that takes place
 OpenFace Outputs and the transcripts.
 
-1: Removing some dyads 
-I decide to remove the identifiers from the source dataset, which have only
-4 recordings (i.e., no wunder question --> C3IJ, C4OF, I9LB, K8OM).
-I also remove the two recordings from N1EL that has "Personal1", leaving 6 for this dyad.
-I also remove the two recordings from C8LA that has "Personal", leaving 6 for this dyad.
-I remove S5EA as the client and therapist had virtually indistinguiable voices, so the diarization model could not tell them apart.
-The source corpus has two files pr. person (A2ER) in the "Bindung" section; we combine these two as the video was interrupted due to internet connection  
-This leaves 78 dyads, with 6 recordings each.
+1: Removing some dyads according to unpack_source_openface_outputs.py
+and align A2ER according to combine_bindung_recordings_A2ER.py
 
 2: Align_fps.
 The source openface outputs came from recordings with different fps.
