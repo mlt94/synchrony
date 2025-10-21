@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -80,12 +81,17 @@ def generate_summary(text_pipe, prompt: str, max_new_tokens: int = 120) -> str:
     return str(outputs).strip()
 
 
-def process_result_file(result_json: str, config: dict, window_seconds: int):
+def process_result_file(result_json: str, config: dict, window_seconds: int, force: bool = False):
     start_time = time.time()
     model_name = config.get("llm_model_name", "google/gemma-3-1b-it")
     device = str(config.get("llm_device", "cpu"))
     result_path = Path(result_json)
     output_path = result_path.parent / f"summaries_{result_path.stem}.json"
+
+    # Skip if summary already exists (unless forced)
+    if not force and output_path.exists():
+        print(f"[llm] Skip existing summary: {output_path}")
+        return
 
     try:
         device_arg = int(device)
@@ -123,8 +129,12 @@ def process_result_file(result_json: str, config: dict, window_seconds: int):
             }
         )
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    # Write atomically: write to a temp file then replace the target
+    tmp_path = output_path.parent / (output_path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
+    # os.replace is atomic on most platforms and overwrites if exists
+    os.replace(tmp_path, output_path)
 
     duration_desc = f"{window_seconds}s" if window_seconds < 60 else f"{window_seconds / 60:.1f}min"
     elapsed = time.time() - start_time
@@ -154,6 +164,7 @@ def main():
     parser.add_argument("--result_jsons", nargs="*", help="Optional explicit list of result JSON files. If omitted, auto-discovers results_*.json recursively under --output_dir.")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers")
     parser.add_argument("--window_seconds", type=int, default=60, help="Length of each summarisation window in seconds")
+    parser.add_argument("--force", action="store_true", help="Recompute summaries even if summaries_*.json already exists")
     args = parser.parse_args()
 
     config = load_config(args.config) or {}
@@ -168,8 +179,19 @@ def main():
 
     root_output = Path(args.output_dir)
     if args.result_jsons:
-        result_jsons = [Path(p) for p in args.result_jsons]
+        all_paths = [Path(p) for p in args.result_jsons]
+        if args.force:
+            result_jsons = all_paths
+        else:
+            result_jsons = []
+            for p in all_paths:
+                summary_path = p.parent / f"summaries_{p.stem}.json"
+                if summary_path.exists():
+                    print(f"[llm] Skip (already summarised): {p} -> {summary_path}")
+                else:
+                    result_jsons.append(p)
     else:
+        # Auto-discovery already skips existing summaries
         result_jsons = discover_result_jsons(root_output)
         if not result_jsons:
             print(f"No result JSON files found under {root_output} matching pattern results_*.json")
@@ -179,7 +201,7 @@ def main():
 
     with ProcessPoolExecutor(max_workers=args.parallel) as executor:
         futures = [
-            executor.submit(process_result_file, str(path), config, args.window_seconds)
+            executor.submit(process_result_file, str(path), config, args.window_seconds, args.force)
             for path in result_jsons
         ]
         for future in futures:

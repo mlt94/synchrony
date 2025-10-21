@@ -2,7 +2,8 @@ This file is just an overview to keep track of all the data-cleaning activites t
 OpenFace Outputs and the transcripts.
 
 1: Removing some dyads according to unpack_source_openface_outputs.py
-and align A2ER according to combine_bindung_recordings_A2ER.py
+and align A2ER according to combine_bindung_recordings_A2ER.py (C:\Users\User\Desktop\martins\synchrony> python .\source\scripts_source_data_clean\combine_bindung_recordings_A2ER.py --root C:\Users\User\Desktop\martins\output_files\Openface_Output_MSB\A2ER)
+Then create data model using populate_data_model_yaml.py
 
 2: Align_fps.
 The source openface outputs came from recordings with different fps.

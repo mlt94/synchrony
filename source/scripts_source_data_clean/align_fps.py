@@ -254,6 +254,10 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 # ------------------------------
 
 def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target_fps: float = 24.0) -> None:
+	"""Process all CSVs under in_dir recursively and write outputs preserving subfolders under out_dir.
+
+	The output structure mirrors the input tree beneath a new parent folder (aligned_XXfps from main()).
+	"""
 	out_dir.mkdir(parents=True, exist_ok=True)
 	log_path = out_dir / "align_fps_log.txt"
 	with log_path.open("w", encoding="utf-8") as log_file:
@@ -263,12 +267,12 @@ def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target
 			log_file.flush()
 
 		frame_info = load_frame_info(frame_info_xlsx)
-		csv_paths = sorted(p for p in in_dir.glob("*.csv") if p.is_file())
+		csv_paths = sorted(p for p in in_dir.rglob("*.csv") if p.is_file())
 		if not csv_paths:
-			log(f"No CSV files found in {in_dir}")
+			log(f"No CSV files found under {in_dir} (recursive)")
 			return
 
-		log(f"Processing {len(csv_paths)} file(s) to {target_fps} FPS")
+		log(f"Processing {len(csv_paths)} file(s) to {target_fps} FPS (recursive)")
 
 		for p in csv_paths:
 			parsed = parse_identifier_and_type(p)
@@ -289,27 +293,27 @@ def process_directory(in_dir: Path, out_dir: Path, frame_info_xlsx: Path, target
 				log(f"[skip] Failed to read {p.name}: {e}")
 				continue
 
-			# Even if FPS matches, rewrite file to normalize timestamp and ensure comma-separated output
-			if abs(src_fps - target_fps) < 1e-6:
-				try:
-					out_df = resample_to_target(df, src_fps=src_fps, target_fps=target_fps)
-				except Exception as e:
-					log(f"[error] Normalizing (same-FPS) {p.name}: {e}")
-					continue
-
+			# Always run resampling pipeline (also normalizes timestamps when FPS matches)
 			try:
 				out_df = resample_to_target(df, src_fps=src_fps, target_fps=target_fps)
 			except Exception as e:
 				log(f"[error] Resampling {p.name}: {e}")
 				continue
 
-			out_path = out_dir / p.name
+			# Preserve subfolder structure beneath out_dir
+			try:
+				rel = p.relative_to(in_dir)
+			except ValueError:
+				# If for some reason p is not under in_dir, fall back to flat output
+				rel = Path(p.name)
+			out_path = out_dir / rel
+			out_path.parent.mkdir(parents=True, exist_ok=True)
 			try:
 				# Enforce comma-separated CSV output
-				out_df.to_csv(out_path, index=False, sep=";")
-				log(f"[ok] {p.name}: {src_fps} -> {target_fps} FPS (rows {len(df)} -> {len(out_df)})")
+				out_df.to_csv(out_path, index=False)
+				log(f"[ok] {rel}: {src_fps} -> {target_fps} FPS (rows {len(df)} -> {len(out_df)})")
 			except Exception as e:
-				log(f"[error] Writing {out_path.name}: {e}")
+				log(f"[error] Writing {out_path}: {e}")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:

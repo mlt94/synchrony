@@ -4,7 +4,7 @@ Input: a source directory with OpenFace CSV outputs (possibly nested).
 Output: a destination directory with per-identifier subfolders and cleaned filenames.
 
 Rules (from header):
-- Drop identifiers with only 4 recordings (no wunder question): C3IJ, C4OF, I9LB, K8OM.
+- Drop identifiers with only 4 recordings (no wunder question): C3IJ, C4OF, I9LB, K8OM, I8LM and D3NM
 - Drop all of S5EA (diarization indistinguishable voices).
 - For N1EL: remove two recordings that contain "Personal1".
 - For C8LA: remove any recordings for the first Personal variant (e.g., "Personal1", "Personal_ln1", "Personal_pr1", "Personal_In1").
@@ -12,7 +12,7 @@ Rules (from header):
 - For B4CA and F1EY: Trailing .csv is cleaned --> B4CA_2024-07-08_Personal_In.csv.csv
 - A3EW has a trailing 2 in its bindung condition; this is removed
 
-This gives 78 dyads with 6 interviews each!
+This gives 76 dyads with 3 interviews each!
 
 Safety & UX:
 - Supports --dry-run (no changes), --copy (default) or --move, and --overwrite to replace existing files.
@@ -29,7 +29,7 @@ import re
 from typing import Iterable
 
 
-EXCLUDE_IDS = {"C3IJ", "C4OF", "I9LB", "K8OM", "S5EA"}
+EXCLUDE_IDS = {"C3IJ", "C4OF", "I9LB", "K8OM", "S5EA", "D3NM", "I8LM"}
 SPECIAL_DROP = {
 	"N1EL": [re.compile(r"personal1", re.IGNORECASE)],
 	# C8LA: drop any first Personal variant: Personal1, Personal_ln1, Personal_pr1, Personal_in1
