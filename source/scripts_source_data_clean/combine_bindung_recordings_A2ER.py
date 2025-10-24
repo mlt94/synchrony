@@ -8,7 +8,6 @@ import re
 import pandas as pd
 
 ##This script is needed as we have two source files for the same interview;
-#it got terminated.
 #This script fixes it; remember that it still outputs two .json files, you only need the first
 
 def load_csv(path: Path) -> pd.DataFrame:

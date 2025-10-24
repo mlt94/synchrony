@@ -62,6 +62,20 @@ TYPE_TOKEN_MAP = {
 # Omit these identifiers entirely when building the model
 OMIT_IDS = {"C3IJ", "C4OF", "S5EA", "K8OM"}
 
+# Columns to drop from labels before inserting into data model
+LABELS_COLUMNS_TO_DROP = [
+	'T0_Pr_measured', 'T1_Pr_measured', 'T1_In_measured',
+	'T2_MEA_measured', 'T2_OpenFace_measured',
+	'T3_Pr_measured', 'T3_In_measured',
+	'T4_MEA_measured', 'T4_OpenFace_measured', 'T4_STiP_measured',
+	'T5_Pr_measured', 'T5_In_measured',
+	'T6_MEA_measured', 'T6_OpenFace_measured', 'T6_LSM_measured',
+	'T7_Pr_measured', 'T7_In_measured',
+	'T0_STARTED_Pr', 'T1_STARTED_Pr', 'T1_STARTED_In',
+	'T3_STARTED_Pr', 'T3_STARTED_In', 'T4_STARTED_In',
+	'T5_STARTED_Pr', 'T5_STARTED_In', 'T7_STARTED_Pr', 'T7_STARTED_In',
+]
+
 
 def _lower(s: str) -> str:
 	return s.lower()
@@ -72,10 +86,21 @@ def _contains_all(text: str, tokens: Iterable[str]) -> bool:
 	return all(tok in t for tok in tokens)
 
 
-def read_labels_all_rows(labels_csv: Path) -> list[tuple[str, str]]:
+def read_labels_all_rows(labels_csv: Path) -> tuple[list[tuple[str, str]], pd.DataFrame]:
+	"""Read labels and return (id_pairs, labels_df_cleaned).
+	
+	Returns:
+		id_pairs: list of (therapist_id, patient_id) tuples
+		labels_df: cleaned DataFrame with dropped columns, indexed by row number
+	"""
 	df = pd.read_csv(labels_csv)
 	if df.shape[1] < 2 or df.shape[0] < 1:
 		raise ValueError("labels CSV must have at least 1 row and 2 columns")
+	
+	# Drop unwanted columns
+	cols_to_drop = [c for c in LABELS_COLUMNS_TO_DROP if c in df.columns]
+	df_clean = df.drop(columns=cols_to_drop)
+	
 	pairs: list[tuple[str, str]] = []
 	for i in range(df.shape[0]):
 		c0 = df.iloc[i, 0]
@@ -91,7 +116,7 @@ def read_labels_all_rows(labels_csv: Path) -> list[tuple[str, str]]:
 		if patient_id in OMIT_IDS or therapist_id in OMIT_IDS:
 			continue
 		pairs.append((therapist_id, patient_id))
-	return pairs
+	return pairs, df_clean
 
 
 def pick_openface_for_type(base_id: str, of_dir: Path, type_name: str, *, of_files: Optional[list[Path]] = None) -> tuple[Optional[Path], Optional[Path]]:
@@ -186,7 +211,60 @@ def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str
 	return None
 
 
-def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_dir: Path, *, of_files: Optional[list[Path]] = None, transcript_files: Optional[list[Path]] = None) -> dict:
+def extract_labels_for_row(df: pd.DataFrame, row_idx: int) -> dict:
+	"""Extract label columns for a given row, organized by timepoint.
+	
+	Returns a dict with keys: 'baseline', 'after_personal', 'after_bindung', 'after_wunder'.
+	Each contains a dict of {column_name: value} for that timepoint.
+	
+	Rules:
+	- T0, T1 columns → baseline
+	- T3 columns → after_personal
+	- T5 columns → after_bindung
+	- T7 columns → after_wunder
+	- T2, T4, T6 columns are excluded (already dropped)
+	- First two columns (patient_id, therapist_id) are excluded
+	"""
+	if row_idx >= len(df):
+		return {"baseline": {}, "after_personal": {}, "after_bindung": {}, "after_wunder": {}}
+	
+	row = df.iloc[row_idx]
+	cols = df.columns[2:]  # Skip first two ID columns
+	
+	baseline = {}
+	after_personal = {}
+	after_bindung = {}
+	after_wunder = {}
+	
+	for col in cols:
+		val = row[col]
+		# Skip NaN values
+		if pd.isna(val):
+			continue
+		
+		col_upper = col.upper()
+		# Convert numpy types to native Python types for YAML compatibility
+		if hasattr(val, 'item'):
+			val = val.item()
+		
+		if col_upper.startswith('T0') or col_upper.startswith('T1'):
+			baseline[col] = val
+		elif col_upper.startswith('T3'):
+			after_personal[col] = val
+		elif col_upper.startswith('T5'):
+			after_bindung[col] = val
+		elif col_upper.startswith('T7'):
+			after_wunder[col] = val
+	
+	return {
+		"baseline": baseline,
+		"after_personal": after_personal,
+		"after_bindung": after_bindung,
+		"after_wunder": after_wunder,
+	}
+
+
+def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_dir: Path, labels_dict: dict, *, of_files: Optional[list[Path]] = None, transcript_files: Optional[list[Path]] = None) -> dict:
 	# The base identifier commonly shared across both roles; prefer patient_id for transcripts per user instruction
 	base_id = patient_id if patient_id else therapist_id
 
@@ -197,6 +275,7 @@ def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_di
 		"patient": {
 			"patient_id": patient_id,
 		},
+		"baseline": labels_dict.get("baseline", {}),
 		"types": {
 			"bindung": {},
 			"personal": {},
@@ -212,6 +291,11 @@ def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_di
 			"patient_openface": str(t_of_pr) if t_of_pr else None,
 			"transcript": str(t_json) if t_json else None,
 		}
+	
+	# Insert timepoint-specific labels after each interview type
+	entry["types"]["personal"]["labels"] = labels_dict.get("after_personal", {})
+	entry["types"]["bindung"]["labels"] = labels_dict.get("after_bindung", {})
+	entry["types"]["wunder"]["labels"] = labels_dict.get("after_wunder", {})
 
 	return entry
 
@@ -223,13 +307,6 @@ def main(argv: list[str] | None = None) -> int:
 		type=Path,
 		default=Path("C:/Users/User/Desktop/martins/source_files/meta/labels_cleaned.csv"),
 		help="Path to labels_cleaned.csv (first row: [patient, therapist])",
-	)
-	# Back-compat single dir, plus new multi-dir option
-	parser.add_argument(
-		"--openface_dir",
-		type=Path,
-		default=None,
-		help="[Deprecated] Single directory containing OpenFace CSV outputs (use --openface_dirs instead)",
 	)
 	parser.add_argument(
 		"--openface_dirs",
@@ -258,7 +335,7 @@ def main(argv: list[str] | None = None) -> int:
 	args = parser.parse_args(argv)
 
 	try:
-		pairs = read_labels_all_rows(args.labels_csv)
+		pairs, labels_df = read_labels_all_rows(args.labels_csv)
 	except Exception as e:
 		print(f"[populate] Failed to read labels: {e}")
 		return 1
@@ -267,8 +344,6 @@ def main(argv: list[str] | None = None) -> int:
 	of_dirs: list[Path] = []
 	if args.openface_dirs:
 		of_dirs.extend([d.resolve() for d in args.openface_dirs if d])
-	elif args.openface_dir:
-		of_dirs.append(args.openface_dir.resolve())
 	else:
 		# Sensible defaults: original raw location and the unpacked destination
 		of_dirs = [
@@ -285,12 +360,16 @@ def main(argv: list[str] | None = None) -> int:
 	transcript_files = list(args.transcripts_dir.rglob("results_*.json")) if args.transcripts_dir.exists() else []
 
 	interviews: list[dict] = []
-	for therapist_id, patient_id in pairs:
+	for idx, (therapist_id, patient_id) in enumerate(pairs):
+		# Extract labels for this row
+		labels_dict = extract_labels_for_row(labels_df, idx)
+		
 		entry = build_entry(
 			therapist_id,
 			patient_id,
-			args.openface_dir,
+			args.openface_dirs,
 			args.transcripts_dir,
+			labels_dict,
 			of_files=of_files,
 			transcript_files=transcript_files,
 		)

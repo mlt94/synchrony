@@ -171,7 +171,7 @@ def execute_plan(plan: list[PlanItem], *, dry_run: bool) -> None:
 def main() -> int:
 	parser = argparse.ArgumentParser(description="Unpack and clean OpenFace outputs")
 	parser.add_argument("--input_dir", type=Path, required=True, help="Source directory with OpenFace outputs")
-	parser.add_argument("--output_dir", type=Path, required=True, help="Destination directory for cleaned outputs")
+	parser.add_argument("--output_dir", type=Path, required=True, help="Destination directory for cleaned outputs (not created)")
 	parser.add_argument("--move", action="store_true", help="Move files instead of copying (default is copy)")
 	parser.add_argument("--overwrite", action="store_true", help="Overwrite existing destination files if present")
 	parser.add_argument("--dry_run", action="store_true", help="Print plan without making changes")

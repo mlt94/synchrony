@@ -6,22 +6,8 @@ from typing import List
 import torch
 from transformers import pipeline
 
-from utils import load_config
 
-
-DEFAULT_MODEL_NAME = "google/gemma-3-1b-it"
-
-LANG_LABELS = {
-    "de": "German",
-    "deu": "German",
-    "deu_latn": "German",
-    "ger": "German",
-    "german": "German",
-    "en": "English",
-    "eng": "English",
-    "eng_latn": "English",
-    "english": "English",
-}
+DEFAULT_MODEL_NAME = "Helsinki-NLP/opus-mt-de-en"
 
 
 def discover_result_jsons(root: Path) -> List[Path]:
@@ -45,77 +31,26 @@ def resolve_device(preferred: str | int) -> tuple[str, int]:
         return device_name, device_arg
 
 
-def load_translation_pipeline(config: dict):
-    model_name = config.get("translation_model_name") or config.get("llm_model_name") or DEFAULT_MODEL_NAME
-    hf_token = config.get("hf_token")
-    device_pref = config.get("translation_device", config.get("llm_device", "auto"))
-    device_name, device_arg = resolve_device(device_pref)
-    print(f"[translate] Loading translation model '{model_name}' on {device_name} (pipeline device arg={device_arg})")
+def load_translation_pipeline(device: str = "auto"):
+    device_name, device_arg = resolve_device(device)
+    print(f"[translate] Loading translation model '{DEFAULT_MODEL_NAME}' on {device_name} (pipeline device arg={device_arg})")
 
     pipe_kwargs = {
-        "task": "text-generation",
-        "model": model_name,
-        "device": device_arg,
+        "task": "translation",
+        "model": DEFAULT_MODEL_NAME,
+        "device": device_arg
     }
     if device_arg != -1 and torch.cuda.is_available():
         pipe_kwargs["torch_dtype"] = torch.float16
-    if hf_token:
-        pipe_kwargs["token"] = hf_token
 
     text_pipe = pipeline(**pipe_kwargs)
     return text_pipe, device_name
-
-
-def normalise_language_label(label: str | None, fallback: str) -> str:
-    if not label:
-        return fallback
-    lookup = label.strip().lower()
-    return LANG_LABELS.get(lookup, label)
-
-
-def create_translation_prompt(text: str, source_lang: str, target_lang: str) -> list:
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are a professional translator. Always translate the user's text into {}. "
-                "Return only the translated text without additional commentary."
-            ).format(target_lang or "English"),
-        },
-        {
-            "role": "user",
-            "content": (
-                "Source language: {}. Translate this text to {} and preserve the meaning faithfully:\n{}"
-            ).format(source_lang or "German", target_lang or "English", text),
-        },
-    ]
-
-
-def extract_generated_text(outputs) -> str:
-    try:
-        if isinstance(outputs, list) and outputs:
-            first = outputs[0]
-            if isinstance(first, dict):
-                generated = first.get("generated_text")
-                if isinstance(generated, list):
-                    for message in reversed(generated):
-                        if isinstance(message, dict) and "content" in message:
-                            content = message["content"].strip()
-                            if content:
-                                return content
-                elif isinstance(generated, str):
-                    return generated.strip()
-    except Exception:
-        pass
-    return str(outputs).strip()
 
 
 def translate_file(
     input_path: Path,
     output_path: Path,
     text_pipe,
-    source_lang_label: str,
-    target_lang_label: str,
     max_new_tokens: int | None,
 ):
     with open(input_path, "r", encoding="utf-8") as handle:
@@ -130,10 +65,13 @@ def translate_file(
         if not text:
             translated_text = ""
         else:
-            messages = create_translation_prompt(text, source_lang_label, target_lang_label)
             try:
-                outputs = text_pipe(messages, max_new_tokens=max_new_tokens or 256, temperature=0.1, top_p=0.9)
-                translated_text = extract_generated_text(outputs)
+                # Helsinki models expect plain text input and return [{'translation_text': '...'}]
+                outputs = text_pipe(text, max_length=max_new_tokens or 512)
+                if isinstance(outputs, list) and outputs:
+                    translated_text = outputs[0].get("translation_text", text).strip()
+                else:
+                    translated_text = text
             except Exception as exc:
                 print(f"[translate] Error translating segment {idx} in {input_path}: {exc}")
                 translated_text = text
@@ -154,13 +92,7 @@ def translate_file(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate ASR results from German to English.")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="config_language.yaml",
-        help="Path to config file with translation settings.",
-    )
+    parser = argparse.ArgumentParser(description="Translate ASR results from German to English using Helsinki-NLP/opus-mt-de-en.")
     parser.add_argument(
         "--input_dir",
         type=str,
@@ -172,6 +104,12 @@ def main():
         type=str,
         default=None,
         help="Directory to write translated JSON files. Defaults to the same location as inputs.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use for translation: 'auto', 'cuda', 'cpu', or device index (default: auto).",
     )
     parser.add_argument(
         "--max_new_tokens",
@@ -186,11 +124,7 @@ def main():
     )
     args = parser.parse_args()
 
-    config = load_config(args.config) or {}
-
-    text_pipe, device_name = load_translation_pipeline(config)
-    source_lang_label = normalise_language_label(config.get("translation_source_lang"), "German")
-    target_lang_label = normalise_language_label(config.get("translation_target_lang"), "English")
+    text_pipe, device_name = load_translation_pipeline(args.device)
 
     input_root = Path(args.input_dir).resolve()
     if not input_root.exists():
@@ -206,18 +140,17 @@ def main():
     print(f"[translate] Found {len(result_files)} files to translate")
 
     for input_path in result_files:
-        relative_parent = input_path.parent.relative_to(input_root)
+        # Use the subdirectory name (parent folder name) as the ID
+        file_id = input_path.parent.name
+        
+        # Output translate_<id>.json in the same directory as the source results_*.json
         if output_root:
+            relative_parent = input_path.parent.relative_to(input_root)
             target_dir = output_root / relative_parent
         else:
             target_dir = input_path.parent
 
-        output_name = input_path.name
-        if output_name.startswith("results_"):
-            output_name = f"translated_{output_name}"
-        else:
-            output_name = f"translated_{output_name}"
-        output_path = target_dir / output_name
+        output_path = target_dir / f"translate_{file_id}.json"
 
         if output_path.exists() and not args.overwrite:
             print(f"[translate] Skipping existing {output_path}")
@@ -227,8 +160,6 @@ def main():
             input_path,
             output_path,
             text_pipe,
-            source_lang_label,
-            target_lang_label,
             max_new_tokens=args.max_new_tokens,
         )
 
