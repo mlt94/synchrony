@@ -1,0 +1,7 @@
+# OpenTSLM Configuration
+# Hard-coded splits for psychotherapy dataset
+
+psychotherapy_splits:
+  train: ["I7EY", "S9LT", "P7AJ", "E2LC", "I8AW", "M7BS", "0000"]  # 58 interviews
+  val: ["G1BW"]  # 14 interviews
+  test: ["S0EO"]  # 10 interviews
