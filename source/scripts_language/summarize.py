@@ -25,50 +25,83 @@ def _coerce_ms(value, default: int = 0) -> int:
     return default
 
 
-def _window_indices(start_ms: int, end_ms: int, window_ms: int) -> Iterable[int]:
-    if window_ms <= 0:
-        yield 0
-        return
-    last_ms = max(end_ms - 1, start_ms)
-    start_idx = start_ms // window_ms
-    end_idx = last_ms // window_ms
-    for idx in range(start_idx, end_idx + 1):
-        yield idx
-
-
-def group_text_by_window(turns: List[dict], window_ms: int) -> Tuple[Dict[int, List[str]], int]:
-    grouped: Dict[int, List[str]] = {}
-    max_end_ms = 0
-
-    for turn in turns:
+def group_text_by_speaker_turns(turns: List[dict]) -> List[Dict]:
+    """Group consecutive turns by the same speaker into speaker turns.
+    
+    Returns:
+        List of dicts with keys: speaker_id, text, start_ms, end_ms, turn_indices
+    """
+    if not turns:
+        return []
+    
+    speaker_turns = []
+    current_speaker = None
+    current_texts = []
+    current_start_ms = None
+    current_end_ms = None
+    current_turn_indices = []
+    
+    for idx, turn in enumerate(turns):
         text = str(turn.get("text", "")).strip()
         if not text:
             continue
-
+        
+        speaker_id = str(turn.get("speaker_id", "unknown")).strip().lower()
         start_ms = max(0, _coerce_ms(turn.get("start"), 0))
-        end_ms = _coerce_ms(turn.get("end"), start_ms)
-        end_ms = max(end_ms, start_ms)
+        end_ms = max(_coerce_ms(turn.get("end"), start_ms), start_ms)
+        
+        # If speaker changes or first turn, start a new speaker turn
+        if speaker_id != current_speaker:
+            # Save previous speaker turn if exists
+            if current_speaker is not None and current_texts:
+                speaker_turns.append({
+                    "speaker_id": current_speaker,
+                    "text": " ".join(current_texts),
+                    "start_ms": current_start_ms,
+                    "end_ms": current_end_ms,
+                    "turn_indices": current_turn_indices
+                })
+            
+            # Start new speaker turn
+            current_speaker = speaker_id
+            current_texts = [text]
+            current_start_ms = start_ms
+            current_end_ms = end_ms
+            current_turn_indices = [idx]
+        else:
+            # Same speaker, concatenate text
+            current_texts.append(text)
+            current_end_ms = end_ms  # Update end time to latest
+            current_turn_indices.append(idx)
+    
+    # Don't forget the last speaker turn
+    if current_speaker is not None and current_texts:
+        speaker_turns.append({
+            "speaker_id": current_speaker,
+            "text": " ".join(current_texts),
+            "start_ms": current_start_ms,
+            "end_ms": current_end_ms,
+            "turn_indices": current_turn_indices
+        })
+    
+    return speaker_turns
 
-        max_end_ms = max(max_end_ms, end_ms)
 
-        for idx in _window_indices(start_ms, end_ms, window_ms):
-            grouped.setdefault(idx, []).append(text)
-
-    return grouped, max_end_ms
-
-
-def create_summary_prompt(window_start_ms: int, window_end_ms: int, combined_text: str) -> str:
-    start_seconds = max(window_start_ms, 0) // 1000
-    end_seconds = max(window_end_ms, 0) // 1000
+def create_summary_prompt(speaker_id: str, start_ms: int, end_ms: int, combined_text: str) -> str:
+    start_seconds = max(start_ms, 0) // 1000
+    end_seconds = max(end_ms, 0) // 1000
     start_minute, start_second = divmod(start_seconds, 60)
     end_minute, end_second = divmod(end_seconds, 60)
     time_range = f"Time {start_minute:02d}:{start_second:02d}–{end_minute:02d}:{end_second:02d}"
+    
+    speaker_label = "Therapist" if speaker_id == "therapist" else "Client" if speaker_id == "client" else speaker_id.title()
+    
     return (
-        "You are a concise psychotherapy note-taker."
-        "Provide a short, anonymous English summary (1-2 sentences) of the conversation."
-        "Conversation excerpt:\n"
+        f"You are a concise psychotherapy note-taker. "
+        f"Provide a short, anonymous English summary (1-2 sentences) of what the {speaker_label} said.\n"
+        f"{speaker_label}'s speech excerpt:\n"
         f"{combined_text}\n"
-        "Summary:"
+        f"Summary:"
     )
 
 
@@ -81,50 +114,73 @@ def generate_summary(text_pipe, prompt: str, max_new_tokens: int = 120) -> str:
     return str(outputs).strip()
 
 
-def process_result_file(result_json: str, config: dict, window_seconds: int, force: bool = False):
+def process_result_file(result_json: str, config: dict, force: bool = False):
     start_time = time.time()
-    model_name = config.get("llm_model_name", "google/gemma-3-1b-it")
+    model_name = config.get("llm_model_name", "google/gemma-7b-it")
     device = str(config.get("llm_device", "cpu"))
     result_path = Path(result_json)
-    output_path = result_path.parent / f"summaries_{result_path.stem}.json"
+    output_path = result_path.parent / f"summaries_speaker_turns_{result_path.stem}.json"
 
     # Skip if summary already exists (unless forced)
     if not force and output_path.exists():
         print(f"[llm] Skip existing summary: {output_path}")
         return
 
-    try:
-        device_arg = int(device)
-    except ValueError:
-        device_arg = 0 if device.lower().startswith("cuda") else -1
+    # Convert device string to the format expected by transformers pipeline
+    # transformers expects: -1 for CPU, 0+ for GPU index, or "cuda"/"cpu" string
+    if device.lower() in ("cuda", "gpu"):
+        device_arg = 0  # Use first GPU
+    elif device.lower() == "cpu":
+        device_arg = -1  # Use CPU
+    else:
+        # Try to parse as integer (GPU index)
+        try:
+            device_arg = int(device)
+        except ValueError:
+            print(f"[warning] Invalid device '{device}', falling back to CPU")
+            device_arg = -1
 
-    print(f"[llm] Summarising {result_json} using {model_name} on device {device}")
-    text_pipe = pipeline("text-generation", model=model_name, device=device_arg)
+    device_name = f"cuda:{device_arg}" if device_arg >= 0 else "cpu"
+    print(f"[llm] Summarising {result_json} by speaker turns using {model_name} on {device_name}")
+    
+    text_pipe = pipeline(
+        "text-generation", 
+        model=model_name, 
+        device=device_arg,
+        torch_dtype=torch.float16 if device_arg >= 0 else torch.float32  # Use fp16 on GPU for speed
+    )
 
     with open(result_json, "r", encoding="utf-8") as f:
         turns = json.load(f)
 
-    window_ms = window_seconds * 1000
-    grouped_windows, max_end_ms = group_text_by_window(turns, window_ms)
-    results: List[Dict[str, int | str]] = []
+    speaker_turns = group_text_by_speaker_turns(turns)
+    print(f"[llm] Processing {len(speaker_turns)} speaker turns from {len(turns)} original turns")
+    results: List[Dict[str, int | str | List[int]]] = []
 
-    for window_index in sorted(grouped_windows):
-        combined_text = " ".join(grouped_windows[window_index]).strip()
+    for idx, speaker_turn in enumerate(speaker_turns):
+        combined_text = speaker_turn["text"]
         if not combined_text:
             continue
 
-        window_start_ms = window_index * window_ms
-        default_end = (window_index + 1) * window_ms - 1
-        window_end_ms = min(default_end, max_end_ms) if max_end_ms else default_end
+        speaker_id = speaker_turn["speaker_id"]
+        start_ms = speaker_turn["start_ms"]
+        end_ms = speaker_turn["end_ms"]
+        turn_indices = speaker_turn["turn_indices"]
 
-        prompt = create_summary_prompt(window_start_ms, window_end_ms, combined_text)
+        turn_start = time.time()
+        prompt = create_summary_prompt(speaker_id, start_ms, end_ms, combined_text)
         summary = generate_summary(text_pipe, prompt)
+        turn_elapsed = time.time() - turn_start
+        
+        print(f"[llm]   Turn {idx+1}/{len(speaker_turns)} ({speaker_id}): {turn_elapsed:.1f}s")
 
         results.append(
             {
-                "window_index": window_index,
-                "window_start_ms": window_start_ms,
-                "window_end_ms": window_end_ms,
+                "turn_index": idx,
+                "speaker_id": speaker_id,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "original_turn_indices": turn_indices,
                 "summary": summary,
             }
         )
@@ -136,9 +192,8 @@ def process_result_file(result_json: str, config: dict, window_seconds: int, for
     # os.replace is atomic on most platforms and overwrites if exists
     os.replace(tmp_path, output_path)
 
-    duration_desc = f"{window_seconds}s" if window_seconds < 60 else f"{window_seconds / 60:.1f}min"
     elapsed = time.time() - start_time
-    print(f"Summarised {len(results)} windows ({duration_desc}) in {result_json}. Output: {output_path}. Time: {elapsed:.2f}s")
+    print(f"Summarised {len(results)} speaker turns in {result_json}. Output: {output_path}. Time: {elapsed:.2f}s")
 
 
 def discover_result_jsons(root: Path, pattern_prefix: str = "results_", pattern_suffix: str = ".json") -> List[Path]:
@@ -151,20 +206,19 @@ def discover_result_jsons(root: Path, pattern_prefix: str = "results_", pattern_
     for path in candidates:
         if not path.is_file() or path.name.startswith("labels_"):
             continue
-        summary_path = path.parent / f"summaries_{path.stem}.json"
+        summary_path = path.parent / f"summaries_speaker_turns_{path.stem}.json"
         if not summary_path.exists():
             pending.append(path)
     return pending
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Summarise psychotherapy session result JSONs using an LLM.")
+    parser = argparse.ArgumentParser(description="Summarise psychotherapy session result JSONs by speaker turns using an LLM.")
     parser.add_argument("--config", type=str, default="config_language.yaml", help="Path to config file")
     parser.add_argument("--output_dir", type=str, required=True, help="Root output directory containing per-file subfolders with results_*.json")
     parser.add_argument("--result_jsons", nargs="*", help="Optional explicit list of result JSON files. If omitted, auto-discovers results_*.json recursively under --output_dir.")
     parser.add_argument("--parallel", type=int, default=1, help="Number of parallel workers")
-    parser.add_argument("--window_seconds", type=int, default=60, help="Length of each summarisation window in seconds")
-    parser.add_argument("--force", action="store_true", help="Recompute summaries even if summaries_*.json already exists")
+    parser.add_argument("--force", action="store_true", help="Recompute summaries even if summaries_speaker_turns_*.json already exists")
     args = parser.parse_args()
 
     config = load_config(args.config) or {}
@@ -175,7 +229,11 @@ def main():
     else:
         config["llm_device"] = requested_device
 
+    print(f"[llm] CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[llm] CUDA device: {torch.cuda.get_device_name(0)}")
     print(f"[llm] Selected device: {config['llm_device']}")
+    print(f"[llm] Model: {config.get('llm_model_name', 'google/gemma-7b-it')}")
 
     root_output = Path(args.output_dir)
     if args.result_jsons:
@@ -185,7 +243,7 @@ def main():
         else:
             result_jsons = []
             for p in all_paths:
-                summary_path = p.parent / f"summaries_{p.stem}.json"
+                summary_path = p.parent / f"summaries_speaker_turns_{p.stem}.json"
                 if summary_path.exists():
                     print(f"[llm] Skip (already summarised): {p} -> {summary_path}")
                 else:
@@ -197,11 +255,11 @@ def main():
             print(f"No result JSON files found under {root_output} matching pattern results_*.json")
             return
 
-    print(f"Discovered {len(result_jsons)} result files to summarise.")
+    print(f"Discovered {len(result_jsons)} result files to summarise by speaker turns.")
 
     with ProcessPoolExecutor(max_workers=args.parallel) as executor:
         futures = [
-            executor.submit(process_result_file, str(path), config, args.window_seconds, args.force)
+            executor.submit(process_result_file, str(path), config, args.force)
             for path in result_jsons
         ]
         for future in futures:
