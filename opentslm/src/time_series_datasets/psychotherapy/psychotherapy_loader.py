@@ -145,7 +145,7 @@ def _extract_windows(
     fps: float,
     labels: Dict,
     baseline: Dict,
-    max_windows: int = None  # Add parameter
+    max_windows: int = None
 ) -> List[Dict]:
     """Extract sliding windows from therapist and patient AU data."""
     samples = []
@@ -153,8 +153,8 @@ def _extract_windows(
     # Normalize column names
     therapist_df.columns = therapist_df.columns.str.strip()
     patient_df.columns = patient_df.columns.str.strip()
-
-    # Now find the timestamp column (handle case variations)
+    
+    # Find timestamp column
     timestamp_col = None
     for col in therapist_df.columns:
         if col.lower() == 'timestamp':
@@ -180,7 +180,7 @@ def _extract_windows(
     start_time = max(therapist_df[timestamp_col].min(), patient_df[timestamp_col].min())
     end_time = min(therapist_df[timestamp_col].max(), patient_df[timestamp_col].max())
     
-    # Extract AU columns (adjust pattern to match your data)
+    # Extract AU columns (only _r regression values)
     au_cols = [c for c in therapist_df.columns if 'AU' in c and '_r' in c]
     
     if not au_cols:
@@ -191,7 +191,7 @@ def _extract_windows(
     current_time = start_time
     
     while current_time + window_size_seconds <= end_time:
-        # Early exit if we have enough windows from this session
+        # Early exit if we have enough windows
         if max_windows is not None and len(samples) >= max_windows:
             break
             
@@ -211,43 +211,60 @@ def _extract_windows(
             current_time += step_size_seconds
             continue
         
-        # Aggregate AU signals (mean across all AUs per frame)
-        # Extract AU signals as matrix (time × num_AUs)
-        therapist_signal = therapist_window[au_cols].to_numpy()  # shape: (time_steps, num_AUs)
-        patient_signal = patient_window[au_cols].to_numpy()
+        # Extract each AU as a separate vector
+        therapist_au_vectors = {}
+        therapist_au_stats = {}
         
-        # Normalize per-AU (column-wise)
-        therapist_means = therapist_signal.mean(axis=0)  # mean per AU
-        therapist_stds = therapist_signal.std(axis=0)
-        patient_means = patient_signal.mean(axis=0)
-        patient_stds = patient_signal.std(axis=0)
+        for au_col in au_cols:
+            au_signal = therapist_window[au_col].to_numpy()
+            au_mean = float(au_signal.mean())
+            au_std = float(au_signal.std())
+            
+            # Normalize
+            if au_std > 1e-6:
+                au_signal_norm = (au_signal - au_mean) / au_std
+            else:
+                au_signal_norm = au_signal - au_mean
+            
+            therapist_au_vectors[au_col] = au_signal_norm.tolist()
+            therapist_au_stats[au_col] = {"mean": au_mean, "std": au_std}
         
-        # Avoid division by zero
-        therapist_stds = np.where(therapist_stds > 1e-6, therapist_stds, 1.0)
-        patient_stds = np.where(patient_stds > 1e-6, patient_stds, 1.0)
+        # Same for patient
+        patient_au_vectors = {}
+        patient_au_stats = {}
         
-        therapist_signal = (therapist_signal - therapist_means) / therapist_stds
-        patient_signal = (patient_signal - patient_means) / patient_stds
+        for au_col in au_cols:
+            au_signal = patient_window[au_col].to_numpy()
+            au_mean = float(au_signal.mean())
+            au_std = float(au_signal.std())
+            
+            # Normalize
+            if au_std > 1e-6:
+                au_signal_norm = (au_signal - au_mean) / au_std
+            else:
+                au_signal_norm = au_signal - au_mean
+            
+            patient_au_vectors[au_col] = au_signal_norm.tolist()
+            patient_au_stats[au_col] = {"mean": au_mean, "std": au_std}
         
-        # Create sample with 2D signals
+        # Create sample
         sample = {
             "patient_id": patient_id,
             "therapist_id": therapist_id,
             "interview_type": interview_type,
             "window_start": float(current_time),
             "window_end": float(window_end),
-            "therapist_signal": therapist_signal.tolist(),  # 2D: [[AU01, AU02, ...], [AU01, AU02, ...], ...]
-            "therapist_mean": therapist_means.tolist(),
-            "therapist_std": therapist_stds.tolist(),
-            "patient_signal": patient_signal.tolist(),  # 2D
-            "patient_mean": patient_means.tolist(),
-            "patient_std": patient_stds.tolist(),
-            "au_columns": au_cols,  # Store AU names for reference
+            "therapist_au_vectors": therapist_au_vectors,  # Dict: {AU_name: [normalized_values]}
+            "therapist_au_stats": therapist_au_stats,      # Dict: {AU_name: {mean, std}}
+            "patient_au_vectors": patient_au_vectors,
+            "patient_au_stats": patient_au_stats,
+            "au_columns": au_cols,
+            "labels": labels,
             "baseline": baseline,
             "rationale": ""
         }
-        
         samples.append(sample)
+        
         current_time += step_size_seconds
     
     return samples
