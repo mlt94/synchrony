@@ -4,8 +4,8 @@ Input: a source directory with OpenFace CSV outputs (possibly nested).
 Output: a destination directory with per-identifier subfolders and cleaned filenames.
 
 Rules (from header):
-- Drop identifiers with only 4 recordings (no wunder question): C3IJ, C4OF, I9LB, K8OM, I8LM and D3NM
-- Drop all of S5EA (diarization indistinguishable voices).
+
+- Drop all of S5EA, D3NM (diarization indistinguishable voices).
 - For N1EL: remove two recordings that contain "Personal1".
 - For C8LA: remove any recordings for the first Personal variant (e.g., "Personal1", "Personal_ln1", "Personal_pr1", "Personal_In1").
 - For O0EA: filenames use hyphens instead of underscores; convert hyphens to underscores in destination.
@@ -29,13 +29,13 @@ import re
 from typing import Iterable
 
 
-EXCLUDE_IDS = {"C3IJ", "C4OF", "I9LB", "K8OM", "S5EA", "D3NM", "I8LM"}
+EXCLUDE_IDS = {"S5EA", "D3NM"}
 SPECIAL_DROP = {
 	"N1EL": [re.compile(r"personal1", re.IGNORECASE)],
 	# C8LA: drop any first Personal variant: Personal1, Personal_ln1, Personal_pr1, Personal_in1
 	"C8LA": [re.compile(r"personal(?:[_-]?(?:ln|pr|in))?1", re.IGNORECASE)],
 }
-NEEDS_NAME_NORMALIZATION = {"B4CA", "F1EY"}
+NEEDS_NAME_NORMALIZATION = {"B4CA", "F1EY", "C3IJ", "I9LB"}
 HYPHEN_TO_UNDERSCORE_IDS = {"O0EA"}
 
 

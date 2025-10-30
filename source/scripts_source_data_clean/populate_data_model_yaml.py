@@ -12,6 +12,11 @@ Rules provided by user:
 
 The resulting YAML structure (now across ALL rows in labels):
 
+NOTE; inspect_single_speaker_assignment.py it occurs for a >10% of the corpus that the diarization fails and only a single speaker is assigned.
+This renders the transcripts for this particular recording unuseable and they need to be removed.
+The local file "speaker_imbalance_ids.txt" holds these. 
+
+
 interviews:
 	- therapist:
 			therapist_id: <id>
@@ -60,7 +65,7 @@ TYPE_TOKEN_MAP = {
 }
 
 # Omit these identifiers entirely when building the model
-OMIT_IDS = {"C3IJ", "C4OF", "S5EA", "K8OM"}
+OMIT_IDS = {"S5EA", "I8LM"} #I8LM contains only single-labelled diarization outputs
 
 # Columns to drop from labels before inserting into data model
 LABELS_COLUMNS_TO_DROP = [
@@ -77,13 +82,28 @@ LABELS_COLUMNS_TO_DROP = [
 ]
 
 
-def _lower(s: str) -> str:
-	return s.lower()
-
-
-def _contains_all(text: str, tokens: Iterable[str]) -> bool:
-	t = text.lower()
-	return all(tok in t for tok in tokens)
+def load_speaker_imbalance_ids(imbalance_file: Path) -> set[str]:
+	"""Load speaker imbalance file IDs to exclude from transcripts.
+	
+	Returns a set of filenames (e.g., 'A4IK_2024-02-27_Bindung_geschnitten.json')
+	that should be excluded from the data model.
+	"""
+	if not imbalance_file.exists():
+		print(f"[populate] Warning: speaker imbalance file not found: {imbalance_file}")
+		return set()
+	
+	excluded = set()
+	with open(imbalance_file, "r", encoding="utf-8") as f:
+		for line in f:
+			line = line.strip()
+			if line and not line.startswith("#"):
+				# Remove 'results_' prefix if present
+				if line.startswith("results_"):
+					line = line[8:]
+				excluded.add(line.lower())
+	
+	print(f"[populate] Loaded {len(excluded)} speaker-imbalanced transcript IDs to exclude")
+	return excluded
 
 
 def read_labels_all_rows(labels_csv: Path) -> tuple[list[tuple[str, str]], pd.DataFrame]:
@@ -161,20 +181,32 @@ def _lower_tokens(tokens: Iterable[str]) -> list[str]:
 	return [t.lower() for t in tokens]
 
 
-def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str, *, transcript_files: Optional[list[Path]] = None) -> Optional[Path]:
-	"""Pick the best transcript JSON for a type, following the user's priority rules.
+def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str, *, transcript_files: Optional[list[Path]] = None, excluded_ids: Optional[set[str]] = None) -> Optional[Path]:
+	"""Pick the best transcript JSON for a type.
 
 	Priority tiers within files that already contain the base_id:
 	  1) contains "geschnitten" and contains any of type primary/alias tokens
 	  2) contains any type primary tokens (wunder/personal/bindung)
 	  3) contains any type alias tokens (WF/STIP/BRFI)
 	As a final fallback, if nothing is found for the type, pick the best "geschnitten" match for the ID (any type).
+	
+	Args:
+		excluded_ids: Set of lowercase filenames to exclude (speaker imbalance files)
 	"""
 	type_info = TYPE_TOKEN_MAP[type_name]
 	prim = _lower_tokens(type_info["primary"])
 	alias = _lower_tokens(type_info["aliases"])
 
 	search_space = transcript_files if transcript_files is not None else list(transcripts_dir.rglob("results_*.json"))
+	
+	# Filter out excluded files
+	if excluded_ids:
+		search_space = [
+			p for p in search_space 
+			if p.name.lower() not in excluded_ids 
+			and p.name.lower().replace("results_", "") not in excluded_ids
+		]
+	
 	cands = [p for p in search_space if base_id.lower() in p.name.lower()]
 	if not cands:
 		return None
@@ -204,10 +236,7 @@ def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str
 	tier3 = [p for p in cands if any(t in p.name.lower() for t in alias)]
 	if tier3:
 		return sorted(tier3, key=score, reverse=True)[0]
-	# Final fallback: any geschnitten for ID
-	tier4 = [p for p in cands if "geschnitten" in p.name.lower()]
-	if tier4:
-		return sorted(tier4, key=lambda p: p.name.lower(), reverse=True)[0]
+	# No fallback: if no type-specific match found, return None
 	return None
 
 
@@ -264,7 +293,7 @@ def extract_labels_for_row(df: pd.DataFrame, row_idx: int) -> dict:
 	}
 
 
-def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_dir: Path, labels_dict: dict, *, of_files: Optional[list[Path]] = None, transcript_files: Optional[list[Path]] = None) -> dict:
+def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_dir: Path, labels_dict: dict, *, of_files: Optional[list[Path]] = None, transcript_files: Optional[list[Path]] = None, excluded_ids: Optional[set[str]] = None) -> dict:
 	# The base identifier commonly shared across both roles; prefer patient_id for transcripts per user instruction
 	base_id = patient_id if patient_id else therapist_id
 
@@ -276,26 +305,28 @@ def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_di
 			"patient_id": patient_id,
 		},
 		"baseline": labels_dict.get("baseline", {}),
-		"types": {
-			"bindung": {},
-			"personal": {},
-			"wunder": {},
-		},
+		"types": {},
+	}
+
+	# Map of timepoint labels for each interview type
+	labels_map = {
+		"personal": labels_dict.get("after_personal", {}),
+		"bindung": labels_dict.get("after_bindung", {}),
+		"wunder": labels_dict.get("after_wunder", {}),
 	}
 
 	for tname in ("bindung", "personal", "wunder"):
 		t_of_in, t_of_pr = pick_openface_for_type(base_id, of_dir, tname, of_files=of_files)
-		t_json = pick_transcript_for_type(patient_id, transcripts_dir, tname, transcript_files=transcript_files)
-		entry["types"][tname] = {
-			"therapist_openface": str(t_of_in) if t_of_in else None,
-			"patient_openface": str(t_of_pr) if t_of_pr else None,
-			"transcript": str(t_json) if t_json else None,
-		}
-	
-	# Insert timepoint-specific labels after each interview type
-	entry["types"]["personal"]["labels"] = labels_dict.get("after_personal", {})
-	entry["types"]["bindung"]["labels"] = labels_dict.get("after_bindung", {})
-	entry["types"]["wunder"]["labels"] = labels_dict.get("after_wunder", {})
+		t_json = pick_transcript_for_type(patient_id, transcripts_dir, tname, transcript_files=transcript_files, excluded_ids=excluded_ids)
+		
+		# Only include this interview type if all three paths are populated
+		if t_of_in and t_of_pr and t_json:
+			entry["types"][tname] = {
+				"therapist_openface": str(t_of_in),
+				"patient_openface": str(t_of_pr),
+				"transcript": str(t_json),
+				"labels": labels_map[tname],
+			}
 
 	return entry
 
@@ -328,6 +359,12 @@ def main(argv: list[str] | None = None) -> int:
 		help="Destination YAML file to write",
 	)
 	parser.add_argument(
+		"--speaker_imbalance_file",
+		type=Path,
+		default=Path(__file__).resolve().parents[2] / ".utils" / "speaker_imbalance_ids.txt",
+		help="File containing speaker-imbalanced transcript IDs to exclude",
+	)
+	parser.add_argument(
 		"--force",
 		action="store_true",
 		help="Overwrite output YAML if it already exists (by default, skip when present).",
@@ -339,6 +376,9 @@ def main(argv: list[str] | None = None) -> int:
 	except Exception as e:
 		print(f"[populate] Failed to read labels: {e}")
 		return 1
+
+	# Load speaker imbalance IDs to exclude
+	excluded_ids = load_speaker_imbalance_ids(args.speaker_imbalance_file)
 
 	# Resolve OpenFace directories list
 	of_dirs: list[Path] = []
@@ -372,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
 			labels_dict,
 			of_files=of_files,
 			transcript_files=transcript_files,
+			excluded_ids=excluded_ids,
 		)
 		interviews.append(entry)
 
@@ -389,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
 		yaml.safe_dump(model, f, allow_unicode=True, sort_keys=False)
 	action = "Overwrote" if args.output_yaml.exists() else "Created"
 	print(f"[populate] {action} {args.output_yaml} with {len(interviews)} interview entries")
+	print(f"[populate] Excluded {len(excluded_ids)} speaker-imbalanced transcripts")
 	return 0
 
 
