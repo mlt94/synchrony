@@ -6,9 +6,11 @@ import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from prompt.text_time_series_prompt import TextTimeSeriesPrompt
+
 from time_series_datasets.QADataset import QADataset
 from time_series_datasets.psychotherapy.psychotherapy_loader import load_psychotherapy_cot_splits
 
+from IPython import embed
 
 class PsychotherapyCoTQADataset(QADataset):
     """
@@ -21,8 +23,10 @@ class PsychotherapyCoTQADataset(QADataset):
                  EOS_TOKEN: str,
                  format_sample_str: bool = False, 
                  time_series_format_function=None,
-                 max_samples: int = None):
+                 max_samples: int = None,
+                 feature_columns: List[str] = None):
         self.max_samples = max_samples
+        self.feature_columns = feature_columns
         super().__init__(
             split=split,
             EOS_TOKEN=EOS_TOKEN, 
@@ -33,7 +37,8 @@ class PsychotherapyCoTQADataset(QADataset):
     def _load_splits(self) -> Tuple[List, List, List]:
         """Load train/val/test splits as plain Python lists."""
         train_list, val_list, test_list = load_psychotherapy_cot_splits(
-            max_samples=self.max_samples
+            max_samples=self.max_samples,
+            feature_columns=self.feature_columns
         )
         
         return train_list, val_list, test_list
@@ -47,9 +52,7 @@ class PsychotherapyCoTQADataset(QADataset):
         return """You are given facial action unit (AU) time-series for a patient and a therapist during a psychotherapy session. Your task is to analyze and summarize patterns in the time-series, paying special attention to co-occurrence or overlap in facial movements between the two individuals.
 
 Instructions:
-- Describe temporal patterns (e.g., synchrony, turn-taking, simultaneous activation).
-- Write your reasoning as a single, coherent paragraph without bullet points or section headers.
-- Always provide a rationale based on the data.
+- Be SPECIFIC with regards to which Action Units are active and when
 
 """
 
@@ -71,8 +74,7 @@ Instructions:
         patient_au_vectors = row["patient_au_vectors"]
         patient_au_stats = row["patient_au_stats"]
         
-        # Convert to torch tensors for consistent processing (like HAR dataset)
-        # Build tensor: [therapist_AU1, therapist_AU2, ..., patient_AU1, patient_AU2, ...]
+        
         all_signals = []
         all_means = []
         all_stds = []
@@ -97,8 +99,7 @@ Instructions:
             all_means.append(stats["mean"])
             all_stds.append(stats["std"])
             all_labels.append(f"patient for {au_name}")
-        
-        # Convert to tensor for validation (like HAR)
+
         series = torch.tensor(all_signals, dtype=torch.float32)
         
         # Check for invalid data (from HAR)
@@ -149,6 +150,5 @@ if __name__ == "__main__":
         print("Therapist ID:", sample.get("therapist_id"))
         print("Interview type:", sample.get("interview_type"))
         print("Window:", f"{sample.get('window_start'):.2f}s - {sample.get('window_end'):.2f}s")
-        print("Number of time-series prompts:", len(sample.get("time_series_text", [])))
         print(sample["time_series_text"])
         #print(sample["time_series"][0])

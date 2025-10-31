@@ -25,10 +25,10 @@ print("=" * 60)
 # Setup device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
-BASE_LLM_ID = "meta-llama/Llama-3.2-3B" 
 
-CHECKPOINT_REPO_ID = "OpenTSLM/llama3b-ecg-flamingo"
-CHECKPOINT_FILENAME = "best_model.pt"
+# Define model and checkpoint paths
+BASE_LLM_ID = "google/gemma-3-270m"  # Base model ID
+CHECKPOINT_PATH = "/home/mlut/synchrony/opentslm/results/gemma_3_270m/OpenTSLMFlamingo/stage2_captioning/checkpoints/best_model.pt"
 
 try:
     print(f"Initializing model architecture using base: {BASE_LLM_ID}...")
@@ -38,13 +38,8 @@ try:
     )
     print("Model architecture built.")
 
-    print(f"Downloading checkpoint from {CHECKPOINT_REPO_ID}...")
-    checkpoint_path = hf_hub_download(
-        repo_id=CHECKPOINT_REPO_ID,
-        filename=CHECKPOINT_FILENAME
-    )
-
-    model.load_from_file(checkpoint_path)
+    print(f"Loading checkpoint from {CHECKPOINT_PATH}...")
+    model.load_from_file(CHECKPOINT_PATH)
 
     model.eval() 
 
@@ -53,7 +48,6 @@ try:
 
 except Exception as e:
     print(f"\n❌ An error occurred: {e}")
-
 
 dataset = PsychotherapyCoTQADataset(split="train", EOS_TOKEN=";", max_samples=1, feature_columns=['AU01_r', 'AU02_r', 'AU04_r', 'AU06_r'])
 pre_prompt = dataset._get_pre_prompt(dataset[0])
@@ -73,6 +67,7 @@ print("Patient ID:", dataset[0].get("patient_id"))
 print("Therapist ID:", dataset[0].get("therapist_id"))
 print("Interview type:", dataset[0].get("interview_type"))
 
+
 for config in test_configs:
     print("=" * 60)
     print(f"Testing with {config['name']}")
@@ -83,6 +78,6 @@ for config in test_configs:
     
     print(f"Output length: {len(output)} characters")
     print(f"Output: '{output}'")
-    
+
 
 

@@ -10,9 +10,9 @@ def load_psychotherapy_cot_splits(
     data_model_path: str = '/home/mlut/synchrony/data_model.yaml',
     window_size_seconds: float = 30.0,
     step_size_seconds: float = 15.0,
-    fps: float = 24.0,
     interview_types: List[str] = None,
-    max_samples: int = None  # Add max_samples parameter here
+    max_samples: int = None,  # Add max_samples parameter here
+    feature_columns: List[str] = None  # Columns to extract from CSV files
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Load psychotherapy data from data_model.yaml and create train/val/test splits by therapist.
@@ -22,9 +22,9 @@ def load_psychotherapy_cot_splits(
         data_model_path: Path to data_model.yaml
         window_size_seconds: Time window size
         step_size_seconds: Sliding window step
-        fps: Frames per second
         interview_types: List of interview types to include (default: ['bindung', 'personal', 'wunder'])
         max_samples: Maximum samples per split (for debugging; None = no limit)
+        feature_columns: List of column names to extract from CSV files (default: AU columns with '_r' suffix)
     
     Returns:
         Tuple of (train_samples, val_samples, test_samples) as lists of dicts
@@ -45,15 +45,15 @@ def load_psychotherapy_cot_splits(
     # Process splits with early exit if max_samples reached
     train_samples = _process_split(
         data_model['interviews'], train_therapists, interview_types,
-        window_size_seconds, step_size_seconds, fps, max_samples
+        window_size_seconds, step_size_seconds, max_samples, feature_columns
     )
     val_samples = _process_split(
         data_model['interviews'], val_therapists, interview_types,
-        window_size_seconds, step_size_seconds, fps, max_samples
+        window_size_seconds, step_size_seconds, max_samples, feature_columns
     )
     test_samples = _process_split(
         data_model['interviews'], test_therapists, interview_types,
-        window_size_seconds, step_size_seconds, fps, max_samples
+        window_size_seconds, step_size_seconds, max_samples, feature_columns
     )
     
     print(f"[psychotherapy_loader] Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
@@ -67,8 +67,8 @@ def _process_split(
     interview_types: List[str],
     window_size_seconds: float,
     step_size_seconds: float,
-    fps: float,
-    max_samples: int = None  # Add parameter
+    max_samples: int = None,  # Add parameter
+    feature_columns: List[str] = None
 ) -> List[Dict]:
     """Process all interviews for therapists in the given split."""
     samples = []
@@ -124,10 +124,11 @@ def _process_split(
             session_samples = _extract_windows(
                 therapist_df, patient_df,
                 patient_id, therapist_id, interview_type,
-                window_size_seconds, step_size_seconds, fps,
+                window_size_seconds, step_size_seconds,
                 type_data.get('labels', {}),
                 baseline,
-                max_samples - len(samples) if max_samples else None  # Remaining budget
+                max_samples - len(samples) if max_samples else None,  # Remaining budget
+                feature_columns
             )
             samples.extend(session_samples)
     
@@ -142,10 +143,10 @@ def _extract_windows(
     interview_type: str,
     window_size_seconds: float,
     step_size_seconds: float,
-    fps: float,
     labels: Dict,
     baseline: Dict,
-    max_windows: int = None
+    max_windows: int = None,
+    feature_columns: List[str] = None
 ) -> List[Dict]:
     """Extract sliding windows from therapist and patient AU data."""
     samples = []
@@ -180,8 +181,16 @@ def _extract_windows(
     start_time = max(therapist_df[timestamp_col].min(), patient_df[timestamp_col].min())
     end_time = min(therapist_df[timestamp_col].max(), patient_df[timestamp_col].max())
     
-    # Extract AU columns (only _r regression values)
-    au_cols = [c for c in therapist_df.columns if 'AU' in c and '_r' in c]
+    # Extract AU columns (only _r regression values by default, or use specified columns)
+    if feature_columns is not None:
+        # Use specified columns
+        au_cols = [c for c in feature_columns if c in therapist_df.columns and c in patient_df.columns]
+        if len(au_cols) < len(feature_columns):
+            missing_cols = set(feature_columns) - set(au_cols)
+            print(f"[warn] Missing columns for {patient_id} ({interview_type}): {missing_cols}")
+    else:
+        # Default: extract AU columns with _r suffix
+        au_cols = [c for c in therapist_df.columns if 'AU' in c and '_r' in c]
     
     if not au_cols:
         print(f"[warn] No AU columns found for {patient_id} ({interview_type})")
