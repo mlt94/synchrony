@@ -1,276 +1,398 @@
 """
-Script to generate first part of the rationales for our psychotherapy dataset using a trained OpenTSLMFlamingo model.
-This creates the time-series rationales that we - in another script - will augment with the transcripts to get the final rationales
+Refactored script to generate time-series rationales using the Gemma-3 multimodal pipeline.
+This script:
+1. Reads data_model.yaml to get interview information
+2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
+3. Generates 6 subplots with therapist and client AUs overlaid
+4. Feeds plots into Gemma-3 27b-it for rationale generation
 """
 
 import sys
 import os
 import torch
-import pandas as pd
 import numpy as np
+import pandas as pd
 import random
 import json
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+from transformers import pipeline
+import yaml
 
 # Add OpenTSLM src to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "opentslm", "src")))
+opentslm_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+src_dir = os.path.join(opentslm_dir, "src")
+sys.path.insert(0, opentslm_dir)
+sys.path.insert(0, src_dir)
 
-from src.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
-from src.time_series_datasets.psychotherapy.psychotherapyCoTQADataset import PsychotherapyCoTQADataset
-from src.prompt.full_prompt import FullPrompt
-from src.prompt.text_prompt import TextPrompt
-from src.prompt.text_time_series_prompt import TextTimeSeriesPrompt
-from src.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
 def setup_device():
-    if torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     return device
 
 
-def load_trained_model(checkpoint_path: str, device: str, llm_id: str = "google/gemma-3-270m"):
-    """Load the trained OpenTSLMFlamingo model from checkpoint
-    I trained these models locally, as per 29/10-25 they were not available through HuggingFace (only softprompts)."""
-    print(f"Loading trained OpenTSLMFlamingo model from {checkpoint_path}...")
-    
-    model = OpenTSLMFlamingo(
-        device=device,
-        llm_id=llm_id,
-        cross_attn_every_n_layers=1,
-    )
-    
-    model.load_from_file(checkpoint_path)
-    model.eval()
-    print(f"✅ Model loaded successfully")
-    return model
+def load_data_model(yaml_path: Path) -> Dict:
+    """Load the data_model.yaml file."""
+    print(f"Loading data model from {yaml_path}...")
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    print(f"✅ Loaded {len(data['interviews'])} interviews")
+    return data
 
 
-def load_dataset(split: str = "train", max_samples: int = None):
-    """Load psychotherapy dataset."""
-    print(f"Loading psychotherapy dataset ({split} split)...")
-    
-    # Use the dataset class - it already handles prompt construction
-    # We use format_sample_str=False to get structured FullPrompt objects
-    dataset = PsychotherapyCoTQADataset(
-        split=split,
-        EOS_TOKEN="",  # We don't need EOS for generation
-        format_sample_str=False,
-        max_samples=max_samples
-    )
-    
-    print(f"✅ Loaded {len(dataset)} samples")
-    return dataset
+def load_speech_turns(json_path: Path) -> List[Dict]:
+    """Load speech turns from transcript JSON."""
+    with open(json_path, 'r') as f:
+        turns = json.load(f)
+    return turns
 
 
-def generate_rationale_with_model(
-    model: OpenTSLMFlamingo,
-    prompt: FullPrompt,
-    max_new_tokens: int = 300,
-    temperature: float = 0.7,
-    do_sample: bool = True,
-    top_p: float = 0.9
-) -> str:
-    """Generate a rationale using the trained OpenTSLMFlamingo model."""
-    # Note: eval_prompt doesn't directly support generation kwargs yet
-    # We need to pass them through the batch to generate()
-    with torch.no_grad():
-        batch = [prompt.to_dict()]
-        from src.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
-        batch = extend_time_series_to_match_patch_size_and_aggregate(batch)
+def extract_au_window(csv_path: Path, start_ms: float, end_ms: float, au_columns: List[str]) -> pd.DataFrame:
+    """Extract AU data from OpenFace CSV for a specific time window.
+    
+    Args:
+        csv_path: Path to OpenFace CSV
+        start_ms: Start time in milliseconds
+        end_ms: End time in milliseconds
+        au_columns: List of AU column names to extract
+    
+    Returns:
+        DataFrame with timestamp and AU columns for the specified window
+    """
+    # Read CSV with whitespace handling
+    df = pd.read_csv(csv_path, skipinitialspace=True)
+    
+    # Convert timestamp from seconds to milliseconds
+    df['timestamp_ms'] = df['timestamp'] * 1000
+    
+    # Filter to time window
+    mask = (df['timestamp_ms'] >= start_ms) & (df['timestamp_ms'] <= end_ms)
+    window_df = df.loc[mask, ['timestamp_ms'] + au_columns].copy()
+    
+    return window_df
+
+
+def generate_plot_for_turn(
+    therapist_csv: Path,
+    patient_csv: Path,
+    turn: Dict,
+    au_names: List[str],
+    output_path: Path
+) -> bool:
+    """Generate a 2x3 subplot with therapist and patient AUs overlaid.
+    
+    Args:
+        therapist_csv: Path to therapist OpenFace CSV
+        patient_csv: Path to patient OpenFace CSV
+        turn: Speech turn dict with start_ms, end_ms, speaker_id
+        au_names: List of 6 AU names to plot
+        output_path: Where to save the plot
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        start_ms = turn['start_ms']
+        end_ms = turn['end_ms']
+        speaker_id = turn['speaker_id']
+        turn_index = turn['turn_index']
         
-        # Call generate with proper parameters
-        outputs = model.generate(
-            batch, 
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=do_sample,
-            top_p=top_p
+        # Extract AU data for both therapist and patient
+        therapist_data = extract_au_window(therapist_csv, start_ms, end_ms, au_names)
+        patient_data = extract_au_window(patient_csv, start_ms, end_ms, au_names)
+        
+        # Check if we have data
+        if therapist_data.empty or patient_data.empty:
+            print(f"⚠️ No data found for turn {turn_index} ({start_ms}-{end_ms}ms)")
+            return False
+        
+        # Create 2x3 subplot
+        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+        axes = axes.flatten()
+        
+        colors_therapist = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E', '#BC4B51']
+        colors_patient = ['#5BB9DB', '#C26BA2', '#FFA531', '#E76D4D', '#9AC97E', '#DC7B81']
+        
+        for i, au_name in enumerate(au_names):
+            ax = axes[i]
+            
+            # Plot therapist AU
+            ax.plot(therapist_data['timestamp_ms'], therapist_data[au_name], 
+                   linewidth=2, color=colors_therapist[i], label='Therapist', alpha=0.8)
+            
+            # Plot patient AU
+            ax.plot(patient_data['timestamp_ms'], patient_data[au_name], 
+                   linewidth=2, color=colors_patient[i], label='Client', alpha=0.8, linestyle='--')
+            
+            ax.set_title(f"{au_name} - Speaker: {speaker_id.capitalize()}", 
+                        fontsize=11, pad=10, fontweight='bold')
+            ax.set_xlabel("Time (ms)", fontsize=9)
+            ax.set_ylabel("Activation", fontsize=9)
+            ax.grid(True, alpha=0.3, linestyle='--')
+            ax.legend(loc='upper right', fontsize=8)
+            ax.tick_params(labelsize=8)
+        
+        plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)", 
+                    fontsize=14, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error generating plot for turn {turn.get('turn_index', '?')}: {e}")
+        return False
+
+
+def generate_rationale_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
+    """Generate rationale using the Gemma-3 pipeline."""
+    
+    pre_prompt = """You are shown facial Action Unit (AU) activation plots for both therapist and client during a psychotherapy speech turn.
+
+Describe the patterns in 2-3 SHORT sentences. Focus ONLY on:
+- Which AUs show notable activation or variability
+- Differences between therapist and client patterns
+- Overall synchrony or divergence
+
+Be concise. No speculation about emotions or therapeutic implications."""
+    
+    au_list = ", ".join(au_names)
+    context = f"""Speech Turn {turn['turn_index']}: {turn['speaker_id'].capitalize()} speaking
+Time window: {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
+Action Units shown: {au_list}
+
+Description: """
+    
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "url": str(image_path)},
+                {"type": "text", "text": f"{pre_prompt}\n\n{context}"}
+            ]
+        }
+    ]
+    
+    try:
+        output = pipe(
+            text=messages,
+            max_new_tokens=100,
+            do_sample=False,
+            temperature=0.1
         )
-        generated_text = outputs[0] if outputs else ""
-    
-    return generated_text.strip()
+        return output[0]["generated_text"][-1]["content"].strip()
+    except Exception as e:
+        print(f"❌ Error generating rationale: {e}")
+        return f"Error: {str(e)}"
 
 
-def run_rationale_generation(
-    model: OpenTSLMFlamingo,
-    dataset: PsychotherapyCoTQADataset,
-    num_samples: int = None,
-    max_new_tokens: int = 30000,
-    random_seed: int = 42,
+def process_interview(
+    interview: Dict,
+    interview_type: str,
+    pipe,
+    output_dir: Path,
+    au_names: List[str],
+    max_turns: int = None
 ) -> List[Dict[str, Any]]:
-    """Generate rationales for psychotherapy samples using the trained model."""
-    print(f"Generating rationales for {num_samples or 'all'} samples...")
+    """Process a single interview type for rationale generation.
     
-    # Set random seed for reproducibility
-    random.seed(random_seed)
-    torch.manual_seed(random_seed)
+    Args:
+        interview: Interview dict from data_model.yaml
+        interview_type: One of 'bindung', 'personal', 'wunder'
+        pipe: Gemma-3 pipeline
+        output_dir: Directory to save plots and results
+        au_names: List of AU names to analyze
+        max_turns: Maximum number of turns to process (None = all)
     
-    # Select samples
-    dataset_size = len(dataset)
-    if num_samples is None or num_samples >= dataset_size:
-        selected_indices = list(range(dataset_size))
-    else:
-        selected_indices = random.sample(range(dataset_size), num_samples)
+    Returns:
+        List of results dicts
+    """
+    if interview_type not in interview['types']:
+        print(f"⚠️ Interview type '{interview_type}' not found, skipping")
+        return []
+    
+    type_data = interview['types'][interview_type]
+    therapist_csv = Path(type_data['therapist_openface'])
+    patient_csv = Path(type_data['patient_openface'])
+    transcript_json = Path(type_data['transcript'])
+    
+    # Validate paths
+    if not therapist_csv.exists():
+        print(f"❌ Therapist CSV not found: {therapist_csv}")
+        return []
+    if not patient_csv.exists():
+        print(f"❌ Patient CSV not found: {patient_csv}")
+        return []
+    if not transcript_json.exists():
+        print(f"❌ Transcript JSON not found: {transcript_json}")
+        return []
+    
+    # Load speech turns
+    turns = load_speech_turns(transcript_json)
+    
+    # Limit turns if requested
+    if max_turns:
+        turns = turns[:max_turns]
     
     results = []
+    therapist_id = interview['therapist']['therapist_id']
+    patient_id = interview['patient']['patient_id']
     
-    with torch.no_grad():
-        for i, idx in enumerate(tqdm(selected_indices, desc="Generating rationales")):
-            try:
-                # Get the sample dict from the dataset
-                sample = dataset[idx]
-                # Reconstruct FullPrompt from the dict (same as HARCoT dataset format)
-                prompt = FullPrompt(
-                    TextPrompt(sample["pre_prompt"]),
-                    [TextTimeSeriesPrompt(text, ts) for text, ts in zip(sample["time_series_text"], sample["time_series"])],
-                    TextPrompt(sample["post_prompt"])
-                )
-
-                # Generate rationale openTSLMFlamingo
-                generated_rationale = generate_rationale_with_model(
-                    model, prompt, 
-                    max_new_tokens=max_new_tokens,
-                    temperature=0.7,
-                    do_sample=True,
-                    top_p=0.9
-                )
-                
-                # Collect result with all metadata
-                result = {
-                    "sample_index": idx,
-                    "therapist_id": sample.get("therapist_id"),
-                    "patient_id": sample.get("patient_id"),
-                    "interview_type": sample.get("interview_type"),
-                    "window_start": sample.get("window_start"),
-                    "window_end": sample.get("window_end"),
-                    "generated_rationale": generated_rationale,
-                    "window_duration": sample.get("window_end", 0) - sample.get("window_start", 0),
-                }
-                
-                results.append(result)
-                
-            except Exception as e:
-                print(f"\n❌ Error processing sample {idx}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+    print(f"\nProcessing {patient_id}/{therapist_id} - {interview_type}: {len(turns)} turns")
     
-    print(f"✅ Successfully generated rationales for {len(results)} samples")
+    for turn in tqdm(turns, desc=f"{patient_id} {interview_type}"):
+        turn_index = turn['turn_index']
+        
+        # Generate plot
+        plot_path = output_dir / f"{patient_id}_{interview_type}_turn{turn_index:03d}.jpg"
+        success = generate_plot_for_turn(therapist_csv, patient_csv, turn, au_names, plot_path)
+        
+        if not success:
+            continue
+        
+        # Generate rationale
+        rationale = generate_rationale_with_pipeline(pipe, plot_path, turn, au_names)
+        
+        # Collect result
+        result = {
+            "patient_id": patient_id,
+            "therapist_id": therapist_id,
+            "interview_type": interview_type,
+            "turn_index": turn_index,
+            "speaker_id": turn['speaker_id'],
+            "start_ms": turn['start_ms'],
+            "end_ms": turn['end_ms'],
+            "duration_ms": turn['end_ms'] - turn['start_ms'],
+            "generated_rationale": rationale,
+            "plot_path": str(plot_path)
+        }
+        results.append(result)
+    
     return results
 
 
-def save_results(results: List[Dict[str, Any]], output_path: str):
-    """Save the generated rationales JSON."""
-    print(f"Saving results to {output_path}...")
-    
-    json_path = output_path + ".json"
-    with open(json_path, 'w') as f:
+def save_results(results: List[Dict[str, Any]], output_path: Path):
+    """Save the generated rationales to JSON."""
+    print(f"\n💾 Saving {len(results)} results to {output_path}...")
+    with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"✅ JSON saved to {json_path}")
+    print(f"✅ Results saved")
     
-    # Print summary
-    print(f"\n📊 Summary:")
-    print(f"Total samples processed: {len(results)}")
     if results:
-        avg_rationale_length = np.mean([len(r["generated_rationale"]) for r in results])
-        print(f"Average rationale length: {avg_rationale_length:.1f} characters")
-        
-        # Show first rationale as example
-        print(f"\n📝 Example rationale (sample {results[0]['sample_index']}):")
-        print(f"Therapist: {results[0]['therapist_id']}, Patient: {results[0]['patient_id']}")
-        print(f"Window: {results[0]['window_start']:.2f}s - {results[0]['window_end']:.2f}s")
-        print(f"Rationale: {results[0]['generated_rationale'][:300]}...")
+        avg_duration = np.mean([r['duration_ms'] for r in results])
+        avg_rationale_len = np.mean([len(r['generated_rationale']) for r in results])
+        print(f"\n📊 Summary:")
+        print(f"  Total turns processed: {len(results)}")
+        print(f"  Average turn duration: {avg_duration:.0f}ms")
+        print(f"  Average rationale length: {avg_rationale_len:.0f} characters")
 
 
 def main():
-    """Main function to run rationale generation."""
     parser = argparse.ArgumentParser(
-        description="Generate rationales for psychotherapy dataset using trained OpenTSLMFlamingo model"
+        description="Generate AU rationales from data_model.yaml using Gemma-3 multimodal pipeline"
     )
     parser.add_argument(
-        "--checkpoint", 
-        type=str, 
-        default="/home/mlut/synchrony/opentslm/results/gemma_3_270m/OpenTSLMFlamingo/stage2_captioning/checkpoints/best_model.pt",
-        help="Path to trained OpenTSLMFlamingo checkpoint"
+        "--data_model",
+        type=Path,
+        default=Path("/home/mlut/synchrony/data_model.yaml"),
+        help="Path to data_model.yaml"
     )
     parser.add_argument(
-        "--llm_id", 
-        type=str, 
-        default="google/gemma-3-270m",
-        help="Base LLM ID used for training"
+        "--output_dir",
+        type=Path,
+        default=Path("/home/data_shares/genface/data/MentalHealth/msb/results/"),
+        help="Output directory for plots and results"
     )
     parser.add_argument(
-        "--split", 
-        type=str, 
-        default="train", 
-        choices=["train", "validation", "test"],
-        help="Dataset split to process"
+        "--interview_types",
+        nargs="+",
+        default=["wunder", "personal", "bindung"],
+        help="Interview types to process"
     )
     parser.add_argument(
-        "--num_samples", 
-        type=int, 
+        "--max_interviews",
+        type=int,
         default=None,
-        help="Number of samples to process (None = all)"
+        help="Maximum number of interviews to process (None = all)"
     )
     parser.add_argument(
-        "--max_new_tokens", 
-        type=int, 
-        default=300,
-        help="Maximum tokens to generate per rationale"
+        "--max_turns_per_interview",
+        type=int,
+        default=None,
+        help="Maximum turns per interview (None = all)"
     )
     parser.add_argument(
-        "--output", 
-        type=str, 
-        default="psychotherapy_rationales",
-        help="Output file prefix (without extension)"
-    )
-    parser.add_argument(
-        "--random_seed", 
-        type=int, 
-        default=42,
-        help="Random seed for reproducibility"
+        "--au_columns",
+        nargs="+",
+        default=['AU04_r', 'AU15_r', 'AU06_r', 'AU12_r', 'AU01_r', 'AU07_r'],
+        help="AU columns to analyze"
     )
     
     args = parser.parse_args()
     
-    print("🚀 Starting psychotherapy rationale generation with OpenTSLMFlamingo...")
-    print("=" * 60)
+    print("🚀 Starting AU rationale generation with Gemma-3 multimodal pipeline")
+    print("=" * 80)
     print(f"Configuration:")
-    print(f"  Checkpoint: {args.checkpoint}")
-    print(f"  LLM ID: {args.llm_id}")
-    print(f"  Split: {args.split}")
-    print(f"  Num samples: {args.num_samples or 'all'}")
-    print(f"  Max new tokens: {args.max_new_tokens}")
-    print(f"  Output: {args.output}")
+    print(f"  Data model: {args.data_model}")
+    print(f"  Output dir: {args.output_dir}")
+    print(f"  Interview types: {args.interview_types}")
+    print(f"  AU columns: {args.au_columns}")
     print()
     
     # Setup
     device = setup_device()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load trained model
-    model = load_trained_model(args.checkpoint, device, args.llm_id)
+    # Load data model
+    data_model = load_data_model(args.data_model)
+    interviews = data_model['interviews']
     
-    # Load dataset (uses the QADataset class with proper prompt construction)
-    dataset = load_dataset(split=args.split, max_samples=args.num_samples)
+    if args.max_interviews:
+        interviews = interviews[:args.max_interviews]
     
-    # Generate rationales
-    results = run_rationale_generation(
-        model,
-        dataset,
-        num_samples=args.num_samples,
-        max_new_tokens=args.max_new_tokens,
-        random_seed=args.random_seed,
+    # Initialize Gemma-3 pipeline
+    print(f"\n🔧 Loading Gemma-3-27b-it model...")
+    pipe = pipeline(
+        "image-text-to-text",
+        model="google/gemma-3-27b-it",
+        device=device,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32
     )
+    print("✅ Model loaded")
     
-    # Save results
-    output_path = f"/home/mlut/synchrony/.garbage/{args.output}_{args.split}"
-    save_results(results, output_path)
+    # Process all interviews
+    all_results = []
+    
+    for interview_idx, interview in enumerate(interviews):
+        patient_id = interview['patient']['patient_id']
+        therapist_id = interview['therapist']['therapist_id']
+        
+        print(f"\n{'='*80}")
+        print(f"Interview {interview_idx + 1}/{len(interviews)}: {patient_id}/{therapist_id}")
+        print(f"{'='*80}")
+        
+        for interview_type in args.interview_types:
+            results = process_interview(
+                interview,
+                interview_type,
+                pipe,
+                args.output_dir,
+                args.au_columns,
+                max_turns=args.max_turns_per_interview
+            )
+            all_results.extend(results)
+    
+    # Save all results
+    output_json = args.output_dir / "all_rationales.json"
+    save_results(all_results, output_json)
+    
+    print(f"\n✅ Complete! Generated rationales for {len(all_results)} speech turns")
+
 
 if __name__ == "__main__":
     main()
