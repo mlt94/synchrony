@@ -49,16 +49,18 @@ class PsychotherapyCoTQADataset(QADataset):
 
     def _get_pre_prompt(self, row) -> str:
         """Generate the pre-prompt instruction."""
-        return """You are given facial action unit (AU) time-series for a patient and a therapist during a psychotherapy session. Your task is to analyze and summarize patterns in the time-series, paying special attention to co-occurrence or overlap in facial movements between the two individuals.
-
+        return """You are given facial action unit (AU) time-series for a patient and a therapist during a psychotherapy session. 
+Your task is to offer a BRIEF description of the activation pattern in the AUs        
 Instructions:
-- Be SPECIFIC with regards to which Action Units are active and when
+- Be SPECIFIC with regards to which AU show spikes, are flat or produce other noticeable patterns
+- Comment on the overlap in activation patterns for each AU for both the speaker and the client.
 
+Offer one or two sentences describing the most noticeable patterns in the AU activation for all given AUs.
 """
 
     def _get_post_prompt(self, row) -> str:
         """Generate the post-prompt."""
-        return "Please write your rationale based on the time-series: "
+        return "Description: "
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         """
@@ -114,7 +116,7 @@ Instructions:
         # Create prompts (one per AU, already normalized in loader)
         prompts = []
         for label, time_series, mean, std in zip(all_labels, series.tolist(), all_means, all_stds):
-            text_prompt = f"The following is facial movement data for the {label} which occured during the speech turn by <insert speaker id> in the time frame {row['window_start']:.2f}s - {row['window_end']:.2f}s with, mean={mean:.4f} and std={std:.4f}:"
+            text_prompt = f"The following is facial movement data for the {label} which occured during the speech turn by the client in the time frame {row['window_start']:.2f}s - {row['window_end']:.2f}s with, mean={mean:.4f} and std={std:.4f}:"
             prompts.append(TextTimeSeriesPrompt(text_prompt, time_series))
         
         return prompts
