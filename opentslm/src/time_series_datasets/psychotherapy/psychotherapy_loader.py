@@ -229,13 +229,13 @@ def _extract_windows(
             au_mean = float(au_signal.mean())
             au_std = float(au_signal.std())
             
-            # Normalize
-            if au_std > 1e-6:
-                au_signal_norm = (au_signal - au_mean) / au_std
-            else:
-                au_signal_norm = au_signal - au_mean
+            # # Normalize
+            # if au_std > 1e-6:
+            #     au_signal_norm = (au_signal - au_mean) / au_std
+            # else:
+            #     au_signal_norm = au_signal - au_mean
             
-            therapist_au_vectors[au_col] = au_signal_norm.tolist()
+            therapist_au_vectors[au_col] = au_signal.tolist()
             therapist_au_stats[au_col] = {"mean": au_mean, "std": au_std}
         
         # Same for patient
@@ -244,16 +244,16 @@ def _extract_windows(
         
         for au_col in au_cols:
             au_signal = patient_window[au_col].to_numpy()
-            au_mean = float(au_signal.mean())
-            au_std = float(au_signal.std())
+            # au_mean = float(au_signal.mean())
+            # au_std = float(au_signal.std())
             
-            # Normalize
-            if au_std > 1e-6:
-                au_signal_norm = (au_signal - au_mean) / au_std
-            else:
-                au_signal_norm = au_signal - au_mean
+            # # Normalize
+            # if au_std > 1e-6:
+            #     au_signal_norm = (au_signal - au_mean) / au_std
+            # else:
+            #     au_signal_norm = au_signal - au_mean
             
-            patient_au_vectors[au_col] = au_signal_norm.tolist()
+            patient_au_vectors[au_col] = au_signal.tolist()
             patient_au_stats[au_col] = {"mean": au_mean, "std": au_std}
         
         # Create sample

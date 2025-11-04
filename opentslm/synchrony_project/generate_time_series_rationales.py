@@ -1,22 +1,6 @@
 """
-Script to generate rationales for psychotherapy dataset using a trained OpenTSLMFlamingo model.
-This creates the time-series rationales that we - in another script - will augment with the transcripts
-
-The script:
-1. Loads the psychotherapy dataset using PsychotherapyCoTQADataset (which handles prompt construction)
-2. Loads the trained OpenTSLMFlamingo model from checkpoint
-3. Runs inference to generate rationales based on time-series data
-4. Saves rationales to CSV/JSON for incorporation into the training dataset
-
-Note: This script uses the existing dataset class to avoid duplicating prompt construction logic.
-
-Usage:
-    python generate_rationales.py --num_samples 100 --split train
-
-Requirements:
-    - Trained OpenTSLMFlamingo model checkpoint
-    - The psychotherapy data loader and dataset
-    - Required dependencies: torch, pandas, numpy
+Script to generate first part of the rationales for our psychotherapy dataset using a trained OpenTSLMFlamingo model.
+This creates the time-series rationales that we - in another script - will augment with the transcripts to get the final rationales
 """
 
 import sys
@@ -34,15 +18,14 @@ from tqdm import tqdm
 # Add OpenTSLM src to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "opentslm", "src")))
 
-from model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
-from time_series_datasets.psychotherapy.psychotherapyCoTQADataset import PsychotherapyCoTQADataset
-from prompt.full_prompt import FullPrompt
-from prompt.text_prompt import TextPrompt
-from prompt.text_time_series_prompt import TextTimeSeriesPrompt
-from time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
+from src.model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
+from src.time_series_datasets.psychotherapy.psychotherapyCoTQADataset import PsychotherapyCoTQADataset
+from src.prompt.full_prompt import FullPrompt
+from src.prompt.text_prompt import TextPrompt
+from src.prompt.text_time_series_prompt import TextTimeSeriesPrompt
+from src.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
 
 def setup_device():
-    """Setup the device for model inference."""
     if torch.cuda.is_available():
         device = "cuda"
     else:
@@ -52,7 +35,8 @@ def setup_device():
 
 
 def load_trained_model(checkpoint_path: str, device: str, llm_id: str = "google/gemma-3-270m"):
-    """Load the trained OpenTSLMFlamingo model from checkpoint."""
+    """Load the trained OpenTSLMFlamingo model from checkpoint
+    I trained these models locally, as per 29/10-25 they were not available through HuggingFace (only softprompts)."""
     print(f"Loading trained OpenTSLMFlamingo model from {checkpoint_path}...")
     
     model = OpenTSLMFlamingo(
@@ -68,7 +52,7 @@ def load_trained_model(checkpoint_path: str, device: str, llm_id: str = "google/
 
 
 def load_dataset(split: str = "train", max_samples: int = None):
-    """Load psychotherapy dataset using the proper QADataset class."""
+    """Load psychotherapy dataset."""
     print(f"Loading psychotherapy dataset ({split} split)...")
     
     # Use the dataset class - it already handles prompt construction
@@ -87,11 +71,29 @@ def load_dataset(split: str = "train", max_samples: int = None):
 def generate_rationale_with_model(
     model: OpenTSLMFlamingo,
     prompt: FullPrompt,
-    max_new_tokens: int = 30000
+    max_new_tokens: int = 300,
+    temperature: float = 0.7,
+    do_sample: bool = True,
+    top_p: float = 0.9
 ) -> str:
     """Generate a rationale using the trained OpenTSLMFlamingo model."""
+    # Note: eval_prompt doesn't directly support generation kwargs yet
+    # We need to pass them through the batch to generate()
     with torch.no_grad():
-        generated_text = model.eval_prompt(prompt, max_new_tokens=max_new_tokens)
+        batch = [prompt.to_dict()]
+        from src.time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
+        batch = extend_time_series_to_match_patch_size_and_aggregate(batch)
+        
+        # Call generate with proper parameters
+        outputs = model.generate(
+            batch, 
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            top_p=top_p
+        )
+        generated_text = outputs[0] if outputs else ""
+    
     return generated_text.strip()
 
 
@@ -124,16 +126,19 @@ def run_rationale_generation(
                 # Get the sample dict from the dataset
                 sample = dataset[idx]
                 # Reconstruct FullPrompt from the dict (same as HARCoT dataset format)
-                # The dataset returns a dict with keys: pre_prompt, time_series, time_series_text, post_prompt
                 prompt = FullPrompt(
                     TextPrompt(sample["pre_prompt"]),
                     [TextTimeSeriesPrompt(text, ts) for text, ts in zip(sample["time_series_text"], sample["time_series"])],
                     TextPrompt(sample["post_prompt"])
                 )
 
-                # Generate rationale using the trained model
+                # Generate rationale openTSLMFlamingo
                 generated_rationale = generate_rationale_with_model(
-                    model, prompt, max_new_tokens
+                    model, prompt, 
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.7,
+                    do_sample=True,
+                    top_p=0.9
                 )
                 
                 # Collect result with all metadata

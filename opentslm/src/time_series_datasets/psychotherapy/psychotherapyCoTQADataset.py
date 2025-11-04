@@ -49,14 +49,13 @@ class PsychotherapyCoTQADataset(QADataset):
 
     def _get_pre_prompt(self, row) -> str:
         """Generate the pre-prompt instruction."""
-        return """You are given facial action unit (AU) time-series for a patient and a therapist during a psychotherapy session. 
-Your task is to offer a BRIEF description of the activation pattern in the AUs        
-Instructions:
-- Be SPECIFIC with regards to which AU show spikes, are flat or produce other noticeable patterns
-- Comment on the overlap in activation patterns for each AU for both the speaker and the client.
+        return """You are shown a plot of facial Action Unit (AU) activation over time.
 
-Offer one or two sentences describing the most noticeable patterns in the AU activation for all given AUs.
-"""
+Describe the pattern in 1-2 SHORT sentences. Focus ONLY on:
+- Overall variability (flat/stable vs. dynamic/variable)
+- Spike timing (early, middle, late, or distributed)
+- Be specific as to which AU show which specific pattern.
+Be concise. No explanations or speculation."""
 
     def _get_post_prompt(self, row) -> str:
         """Generate the post-prompt."""
@@ -116,7 +115,9 @@ Offer one or two sentences describing the most noticeable patterns in the AU act
         # Create prompts (one per AU, already normalized in loader)
         prompts = []
         for label, time_series, mean, std in zip(all_labels, series.tolist(), all_means, all_stds):
-            text_prompt = f"The following is facial movement data for the {label} which occured during the speech turn by the client in the time frame {row['window_start']:.2f}s - {row['window_end']:.2f}s with, mean={mean:.4f} and std={std:.4f}:"
+            # Simplified text prompt focusing only on role and AU name
+            role = "therapist" if "therapist" in label else "patient"
+            text_prompt = f"Facial AU activation for {au_cols[0]} ({role})"
             prompts.append(TextTimeSeriesPrompt(text_prompt, time_series))
         
         return prompts
