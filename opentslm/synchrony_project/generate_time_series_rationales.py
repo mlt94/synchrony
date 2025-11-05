@@ -3,7 +3,7 @@ Refactored script to generate time-series rationales using the Gemma-3 multimoda
 This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
-3. Generates 6 subplots with therapist and client AUs overlaid
+3. Generates 4 subplots (2x2) with therapist and client AUs overlaid
 4. Feeds plots into Gemma-3 27b-it for rationale generation
 """
 
@@ -83,13 +83,13 @@ def generate_plot_for_turn(
     au_names: List[str],
     output_path: Path
 ) -> bool:
-    """Generate a 2x3 subplot with therapist and patient AUs overlaid.
+    """Generate a 2x2 subplot with therapist and patient AUs overlaid.
     
     Args:
         therapist_csv: Path to therapist OpenFace CSV
         patient_csv: Path to patient OpenFace CSV
         turn: Speech turn dict with start_ms, end_ms, speaker_id
-        au_names: List of 6 AU names to plot
+        au_names: List of 4 AU names to plot
         output_path: Where to save the plot
     
     Returns:
@@ -110,32 +110,59 @@ def generate_plot_for_turn(
             print(f"⚠️ No data found for turn {turn_index} ({start_ms}-{end_ms}ms)")
             return False
         
-        # Create 2x3 subplot
-        fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+        # Create 2x2 subplot
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         axes = axes.flatten()
         
-        colors_therapist = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E', '#BC4B51']
-        colors_patient = ['#5BB9DB', '#C26BA2', '#FFA531', '#E76D4D', '#9AC97E', '#DC7B81']
+        # CRITICAL: Use DRAMATICALLY different visual styles to prevent VLM confusion
+        # Therapist: THICK SOLID, DARK colors, NO fill
+        # Client: THIN with FILLED AREA, BRIGHT colors
+        colors_therapist = ['#0D47A1', '#6A1B9A', '#E65100', '#1B5E20']  # Dark: blue, purple, orange, green
+        colors_client = ['#FFD54F', '#FF4081', '#00E5FF', '#76FF03']     # Bright: yellow, pink, cyan, lime
         
         for i, au_name in enumerate(au_names):
             ax = axes[i]
             
-            # Plot therapist AU - solid line with thicker linewidth
-            ax.plot(therapist_data['timestamp_ms'], therapist_data[au_name], 
-                   linewidth=3, color=colors_therapist[i], label='Therapist', alpha=0.9)
-            
-            # Plot patient AU - distinct marker style with thinner line
+            # CLIENT: Thin line with prominent filled area (BRIGHT colors)
+            ax.fill_between(patient_data['timestamp_ms'], patient_data[au_name], 
+                           alpha=0.5, color=colors_client[i], zorder=5, 
+                           label='CLIENT (filled area)')
             ax.plot(patient_data['timestamp_ms'], patient_data[au_name], 
-                   linewidth=2, color=colors_patient[i], label='Client', 
-                   alpha=0.7, linestyle=':', marker='o', markersize=3, markevery=5)
+                   linewidth=2, color=colors_client[i], linestyle='--', 
+                   alpha=0.9, zorder=6)
+            
+            # THERAPIST: Very thick solid line, NO fill (DARK colors)
+            ax.plot(therapist_data['timestamp_ms'], therapist_data[au_name], 
+                   linewidth=6, color=colors_therapist[i], label='THERAPIST (thick line)', 
+                   alpha=1.0, linestyle='-', zorder=10)
+            
+            # Add text labels at 3 points along the time axis to clearly mark which is which
+            time_points = [0.25, 0.5, 0.75]
+            for tp in time_points:
+                idx_t = int(len(therapist_data) * tp)
+                idx_c = int(len(patient_data) * tp)
+                if idx_t < len(therapist_data) and idx_c < len(patient_data):
+                    x_pos = therapist_data['timestamp_ms'].iloc[idx_t]
+                    y_therapist = therapist_data[au_name].iloc[idx_t]
+                    y_client = patient_data[au_name].iloc[idx_c]
+                    
+                    # Add labels with background boxes
+                    ax.text(x_pos, y_therapist, 'T', fontsize=9, fontweight='bold',
+                           bbox=dict(boxstyle='circle,pad=0.3', facecolor='white', 
+                                   edgecolor=colors_therapist[i], linewidth=2),
+                           ha='center', va='center', zorder=15)
+                    ax.text(x_pos, y_client, 'C', fontsize=9, fontweight='bold',
+                           bbox=dict(boxstyle='circle,pad=0.3', facecolor='white', 
+                                   edgecolor=colors_client[i], linewidth=2),
+                           ha='center', va='center', zorder=15)
             
             ax.set_title(f"{au_name} - Speaker: {speaker_id.capitalize()}", 
-                        fontsize=11, pad=10, fontweight='bold')
-            ax.set_xlabel("Time (ms)", fontsize=9)
-            ax.set_ylabel("Activation", fontsize=9)
-            ax.grid(True, alpha=0.3, linestyle='--')
-            ax.legend(loc='upper right', fontsize=8)
-            ax.tick_params(labelsize=8)
+                        fontsize=12, pad=10, fontweight='bold')
+            ax.set_xlabel("Time (ms)", fontsize=10)
+            ax.set_ylabel("Activation", fontsize=10)
+            ax.grid(True, alpha=0.25, linestyle='--', linewidth=0.5)
+            ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+            ax.tick_params(labelsize=9)
         
         plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)", 
                     fontsize=14, fontweight='bold', y=0.995)
@@ -153,13 +180,20 @@ def generate_plot_for_turn(
 def generate_rationale_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
     """Generate rationale using the Gemma-3 pipeline."""
     
-    pre_prompt = """You are shown facial Action Unit (AU) activation plots for both therapist and client during a psychotherapy speech turn.
+    pre_prompt = """You are analyzing facial Action Unit (AU) activation plots showing therapist and client during a psychotherapy speech turn.
 
-Describe ONLY the activation patterns for each individual AU shown in the plots. For EACH AU, state very briefly:
-- The activation level (low, moderate, high)
-- How the activation pattern differs between therapist and client
+For each AU, write ONE compact sentence in plain text (no markdown, no asterisks, no bullet points):
+"AU##: Therapist [activation range] [spike_freq], Client [activation range] [spike_freq], [key difference]"
 
-Go through each AU systematically. DO NOT include introductory phrases like "Here's a description" or concluding statements about overall synchrony. ONLY describe what you observe in each AU plot."""
+Where:
+- [activation range] = ymin to ymax 
+- [spike_freq] = no-spikes / few-spikes / many-spikes (transient peaks above baseline)
+- [key difference] = one brief phrase comparing the two patterns
+
+Separate AUs with a period and space. Do NOT use formatting, bullets, headers, or extra whitespace. Do NOT add introductory or concluding statements. Only output your description.
+
+Example: "AU12: Therapist 0.0-2.0, no-spikes, Client 0.0-0.6 many-spikes, client shows frequent high peaks while therapist remains flat. AU06: Therapist 0.0-1.2 few-spikes, Client 0.0-2.2 few-spikes, both show similar spike timing but client has higher baseline."
+"""
     
     au_list = ", ".join(au_names)
     context = f"""Speech Turn {turn['turn_index']}: {turn['speaker_id'].capitalize()} speaking
@@ -181,7 +215,7 @@ Description: """
     try:
         output = pipe(
             text=messages,
-            max_new_tokens=200,
+            max_new_tokens=150,
             do_sample=False,
             temperature=0.1
         )
@@ -195,14 +229,37 @@ Description: """
             "Here is a description",
             "Here is a concise description",
             "Here's what I observe",
+            "Here are the observations",
+            "The patterns are",
         ]
         for prefix in unwanted_prefixes:
             if rationale.lower().startswith(prefix.lower()):
-                # Remove prefix and any following punctuation/whitespace
                 rationale = rationale[len(prefix):].lstrip(':.,; ')
                 break
         
-        # Remove common unwanted conclusions (last sentence patterns)
+        # Remove markdown formatting (bold, bullets, etc)
+        rationale = rationale.replace('**', '')  # Remove bold
+        rationale = rationale.replace('*', '')   # Remove italics
+        rationale = rationale.replace('\n-', '.')  # Convert bullets to periods
+        rationale = rationale.replace('\n•', '.')  # Convert bullets to periods
+        rationale = rationale.replace('\n ', ' ')  # Collapse newlines with spaces
+        rationale = rationale.replace('\n', ' ')   # Remove remaining newlines
+        
+        # Remove redundant phrases within the text
+        redundant_phrases = [
+            'Therapist:',
+            'Client:',
+            'Difference:',
+            '- ',
+        ]
+        for phrase in redundant_phrases:
+            rationale = rationale.replace(phrase, '')
+        
+        # Clean up multiple spaces
+        import re
+        rationale = re.sub(r'\s+', ' ', rationale)
+        
+        # Remove common unwanted conclusions
         unwanted_conclusions = [
             "Overall, the patterns diverge",
             "Overall, the patterns converge",
@@ -367,7 +424,7 @@ def main():
     parser.add_argument(
         "--au_columns",
         nargs="+",
-        default=['AU04_r', 'AU15_r', 'AU06_r', 'AU12_r', 'AU01_r', 'AU07_r'],
+        default=['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r'],
         help="AU columns to analyze"
     )
     
