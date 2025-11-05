@@ -120,13 +120,14 @@ def generate_plot_for_turn(
         for i, au_name in enumerate(au_names):
             ax = axes[i]
             
-            # Plot therapist AU
+            # Plot therapist AU - solid line with thicker linewidth
             ax.plot(therapist_data['timestamp_ms'], therapist_data[au_name], 
-                   linewidth=2, color=colors_therapist[i], label='Therapist', alpha=0.8)
+                   linewidth=3, color=colors_therapist[i], label='Therapist', alpha=0.9)
             
-            # Plot patient AU
+            # Plot patient AU - distinct marker style with thinner line
             ax.plot(patient_data['timestamp_ms'], patient_data[au_name], 
-                   linewidth=2, color=colors_patient[i], label='Client', alpha=0.8, linestyle='--')
+                   linewidth=2, color=colors_patient[i], label='Client', 
+                   alpha=0.7, linestyle=':', marker='o', markersize=3, markevery=5)
             
             ax.set_title(f"{au_name} - Speaker: {speaker_id.capitalize()}", 
                         fontsize=11, pad=10, fontweight='bold')
@@ -154,12 +155,11 @@ def generate_rationale_with_pipeline(pipe, image_path: Path, turn: Dict, au_name
     
     pre_prompt = """You are shown facial Action Unit (AU) activation plots for both therapist and client during a psychotherapy speech turn.
 
-Describe the patterns in 2-3 SHORT sentences. Focus ONLY on:
-- Which AUs show notable activation or variability
-- Differences between therapist and client patterns
-- Overall synchrony or divergence
+Describe ONLY the activation patterns for each individual AU shown in the plots. For EACH AU, state very briefly:
+- The activation level (low, moderate, high)
+- How the activation pattern differs between therapist and client
 
-Be concise. No speculation about emotions or therapeutic implications."""
+Go through each AU systematically. DO NOT include introductory phrases like "Here's a description" or concluding statements about overall synchrony. ONLY describe what you observe in each AU plot."""
     
     au_list = ", ".join(au_names)
     context = f"""Speech Turn {turn['turn_index']}: {turn['speaker_id'].capitalize()} speaking
@@ -181,11 +181,45 @@ Description: """
     try:
         output = pipe(
             text=messages,
-            max_new_tokens=100,
+            max_new_tokens=200,
             do_sample=False,
             temperature=0.1
         )
-        return output[0]["generated_text"][-1]["content"].strip()
+        rationale = output[0]["generated_text"][-1]["content"].strip()
+        
+        # Remove common unwanted prefixes
+        unwanted_prefixes = [
+            "Here's a concise description of the patterns in the provided plots",
+            "Here's a description of the patterns",
+            "Here's a concise description",
+            "Here is a description",
+            "Here is a concise description",
+            "Here's what I observe",
+        ]
+        for prefix in unwanted_prefixes:
+            if rationale.lower().startswith(prefix.lower()):
+                # Remove prefix and any following punctuation/whitespace
+                rationale = rationale[len(prefix):].lstrip(':.,; ')
+                break
+        
+        # Remove common unwanted conclusions (last sentence patterns)
+        unwanted_conclusions = [
+            "Overall, the patterns diverge",
+            "Overall, the patterns converge",
+            "Overall,",
+            "In summary,",
+            "This suggests",
+            "This indicates",
+        ]
+        sentences = rationale.split('.')
+        if len(sentences) > 1:
+            last_sentence = sentences[-1].strip()
+            for conclusion in unwanted_conclusions:
+                if last_sentence.lower().startswith(conclusion.lower()):
+                    rationale = '.'.join(sentences[:-1]) + '.'
+                    break
+        
+        return rationale.strip()
     except Exception as e:
         print(f"❌ Error generating rationale: {e}")
         return f"Error: {str(e)}"
@@ -243,13 +277,17 @@ def process_interview(
     therapist_id = interview['therapist']['therapist_id']
     patient_id = interview['patient']['patient_id']
     
+    # Create .temp directory for plots
+    temp_dir = output_dir / ".temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
     print(f"\nProcessing {patient_id}/{therapist_id} - {interview_type}: {len(turns)} turns")
     
     for turn in tqdm(turns, desc=f"{patient_id} {interview_type}"):
         turn_index = turn['turn_index']
         
-        # Generate plot
-        plot_path = output_dir / f"{patient_id}_{interview_type}_turn{turn_index:03d}.jpg"
+        # Generate plot in .temp directory
+        plot_path = temp_dir / f"{patient_id}_{interview_type}_turn{turn_index:03d}.jpg"
         success = generate_plot_for_turn(therapist_csv, patient_csv, turn, au_names, plot_path)
         
         if not success:
@@ -367,6 +405,7 @@ def main():
     
     # Process all interviews
     all_results = []
+    results_by_dyad_type = {}  # Store results grouped by (patient_id, interview_type)
     
     for interview_idx, interview in enumerate(interviews):
         patient_id = interview['patient']['patient_id']
@@ -386,12 +425,19 @@ def main():
                 max_turns=args.max_turns_per_interview
             )
             all_results.extend(results)
+            
+            # Group by (patient_id, interview_type)
+            key = (patient_id, interview_type)
+            if key not in results_by_dyad_type:
+                results_by_dyad_type[key] = []
+            results_by_dyad_type[key].extend(results)
     
-    # Save all results
-    output_json = args.output_dir / "all_rationales.json"
-    save_results(all_results, output_json)
+    # Save results per dyad and interview type
+    for (dyad_id, interview_type), dyad_results in results_by_dyad_type.items():
+        output_json = args.output_dir / f"{dyad_id}_{interview_type}_rationales.json"
+        save_results(dyad_results, output_json)
     
-    print(f"\n✅ Complete! Generated rationales for {len(all_results)} speech turns")
+    print(f"\n✅ Complete! Generated rationales for {len(all_results)} speech turns across {len(results_by_dyad_type)} dyad-interview combinations")
 
 
 if __name__ == "__main__":
