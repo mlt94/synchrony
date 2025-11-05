@@ -1,10 +1,10 @@
 """
-Refactored script to generate time-series rationales using the Gemma-3 multimodal pipeline.
+Refactored script to generate time-series rationales using the LLaVA multimodal pipeline.
 This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
 3. Generates 6 subplots with therapist and client AUs overlaid
-4. Feeds plots into Gemma-3 27b-it for rationale generation
+4. Feeds plots into LLaVA 7B for rationale generation (optimized for RTX 4070)
 """
 
 import sys
@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from transformers import pipeline
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
+from PIL import Image
 import yaml
 
 # Add OpenTSLM src to path
@@ -150,8 +151,8 @@ def generate_plot_for_turn(
         return False
 
 
-def generate_rationale_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
-    """Generate rationale using the Gemma-3 pipeline."""
+def generate_rationale_with_llava(processor, model, image_path: Path, turn: Dict, au_names: List[str]) -> str:
+    """Generate rationale using the LLaVA model."""
     
     pre_prompt = """You are shown facial Action Unit (AU) activation plots for both therapist and client during a psychotherapy speech turn.
 
@@ -168,24 +169,33 @@ Action Units shown: {au_list}
 
 Description: """
     
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "url": str(image_path)},
-                {"type": "text", "text": f"{pre_prompt}\n\n{context}"}
-            ]
-        }
-    ]
+    prompt = f"[INST] <image>\n{pre_prompt}\n\n{context} [/INST]"
     
     try:
-        output = pipe(
-            text=messages,
-            max_new_tokens=200,
-            do_sample=False,
-            temperature=0.1
-        )
-        rationale = output[0]["generated_text"][-1]["content"].strip()
+        # Load and preprocess image
+        image = Image.open(image_path).convert('RGB')
+        
+        # Correct processor call: text and images as keyword arguments
+        inputs = processor(text=prompt, images=image, return_tensors="pt").to(model.device)
+        
+        # Generate with optimized settings for RTX 4070
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=200,
+                do_sample=False,
+                temperature=None,  # Greedy decoding when do_sample=False
+                pad_token_id=processor.tokenizer.pad_token_id
+            )
+        
+        # Decode and extract response
+        generated_text = processor.decode(output[0], skip_special_tokens=True)
+        
+        # Extract only the assistant's response (after [/INST])
+        if "[/INST]" in generated_text:
+            rationale = generated_text.split("[/INST]")[-1].strip()
+        else:
+            rationale = generated_text.strip()
         
         # Remove common unwanted prefixes
         unwanted_prefixes = [
@@ -228,7 +238,8 @@ Description: """
 def process_interview(
     interview: Dict,
     interview_type: str,
-    pipe,
+    processor,
+    model,
     output_dir: Path,
     au_names: List[str],
     max_turns: int = None
@@ -238,7 +249,8 @@ def process_interview(
     Args:
         interview: Interview dict from data_model.yaml
         interview_type: One of 'bindung', 'personal', 'wunder'
-        pipe: Gemma-3 pipeline
+        processor: LLaVA processor
+        model: LLaVA model
         output_dir: Directory to save plots and results
         au_names: List of AU names to analyze
         max_turns: Maximum number of turns to process (None = all)
@@ -294,7 +306,7 @@ def process_interview(
             continue
         
         # Generate rationale
-        rationale = generate_rationale_with_pipeline(pipe, plot_path, turn, au_names)
+        rationale = generate_rationale_with_llava(processor, model, plot_path, turn, au_names)
         
         # Collect result
         result = {
@@ -332,7 +344,7 @@ def save_results(results: List[Dict[str, Any]], output_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate AU rationales from data_model.yaml using Gemma-3 multimodal pipeline"
+        description="Generate AU rationales from data_model.yaml using LLaVA-NeXT 7B (optimized for RTX 4070)"
     )
     parser.add_argument(
         "--data_model",
@@ -373,7 +385,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting AU rationale generation with Gemma-3 multimodal pipeline")
+    print("🚀 Starting AU rationale generation with LLaVA-NeXT 7B (RTX 4070 optimized)")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
@@ -393,15 +405,24 @@ def main():
     if args.max_interviews:
         interviews = interviews[:args.max_interviews]
     
-    # Initialize Gemma-3 pipeline
-    print(f"\n🔧 Loading Gemma-3-27b-it model...")
-    pipe = pipeline(
-        "image-text-to-text",
-        model="google/gemma-3-27b-it",
-        device=device,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32
+    # Initialize LLaVA model (optimized for RTX 4070)
+    print(f"\n🔧 Loading LLaVA-NeXT 7B model...")
+    model_id = "llava-hf/llava-v1.6-mistral-7b-hf"
+    
+    processor = LlavaNextProcessor.from_pretrained(model_id)
+    model = LlavaNextForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto" if device == "cuda" else None,
+        low_cpu_mem_usage=True
     )
-    print("✅ Model loaded")
+    
+    if device == "cpu":
+        model = model.to(device)
+    
+    print(f"✅ Model loaded on {device}")
+    if device == "cuda":
+        print(f"   GPU Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
     
     # Process all interviews
     all_results = []
@@ -419,7 +440,8 @@ def main():
             results = process_interview(
                 interview,
                 interview_type,
-                pipe,
+                processor,
+                model,
                 args.output_dir,
                 args.au_columns,
                 max_turns=args.max_turns_per_interview
