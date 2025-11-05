@@ -98,7 +98,7 @@ def load_speaker_imbalance_ids(imbalance_file: Path) -> set[str]:
 			line = line.strip()
 			if line and not line.startswith("#"):
 				# Remove 'results_' prefix if present
-				if line.startswith("results_"):
+				if line.startswith("summaries_speaker_turns_results_"):
 					line = line[8:]
 				excluded.add(line.lower())
 	
@@ -197,14 +197,14 @@ def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str
 	prim = _lower_tokens(type_info["primary"])
 	alias = _lower_tokens(type_info["aliases"])
 
-	search_space = transcript_files if transcript_files is not None else list(transcripts_dir.rglob("results_*.json"))
+	search_space = transcript_files if transcript_files is not None else list(transcripts_dir.rglob("summaries_speaker_turns_results_*.json"))
 	
 	# Filter out excluded files
 	if excluded_ids:
 		search_space = [
 			p for p in search_space 
 			if p.name.lower() not in excluded_ids 
-			and p.name.lower().replace("results_", "") not in excluded_ids
+			and p.name.lower().replace("summaries_speaker_turns_results_", "") not in excluded_ids
 		]
 	
 	cands = [p for p in search_space if base_id.lower() in p.name.lower()]
@@ -397,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
 			for p in d.rglob("*.csv"):
 				of_files_set.add(p.resolve())
 	of_files = sorted(of_files_set)
-	transcript_files = list(args.transcripts_dir.rglob("results_*.json")) if args.transcripts_dir.exists() else []
+	transcript_files = list(args.transcripts_dir.rglob("summaries_speaker_turns_results_*.json")) if args.transcripts_dir.exists() else []
 
 	interviews: list[dict] = []
 	for idx, (therapist_id, patient_id) in enumerate(pairs):
