@@ -76,14 +76,46 @@ def extract_au_window(csv_path: Path, start_ms: float, end_ms: float, au_columns
     return window_df
 
 
+def bin_time_series(data: pd.DataFrame, au_name: str, num_bins: int = 8) -> np.ndarray:
+    """Bin time series data into equal temporal bins and compute mean activation per bin.
+    
+    Args:
+        data: DataFrame with timestamp_ms and AU columns
+        au_name: Name of the AU column to bin
+        num_bins: Number of temporal bins
+    
+    Returns:
+        Array of mean activations per bin (length = num_bins)
+    """
+    if len(data) == 0:
+        return np.zeros(num_bins)
+    
+    # Create bin indices for each row
+    bin_indices = np.linspace(0, len(data), num_bins + 1, dtype=int)
+    
+    # Compute mean activation for each bin
+    binned_values = []
+    for i in range(num_bins):
+        start_idx = bin_indices[i]
+        end_idx = bin_indices[i + 1]
+        if end_idx > start_idx:
+            bin_mean = data[au_name].iloc[start_idx:end_idx].mean()
+            binned_values.append(bin_mean)
+        else:
+            binned_values.append(0.0)
+    
+    return np.array(binned_values)
+
+
 def generate_plot_for_turn(
     therapist_csv: Path,
     patient_csv: Path,
     turn: Dict,
     au_names: List[str],
-    output_path: Path
+    output_path: Path,
+    num_bins: int = 8
 ) -> bool:
-    """Generate a 2x2 subplot with therapist and patient AUs overlaid.
+    """Generate heatmap visualization with binned AU activations for therapist and client.
     
     Args:
         therapist_csv: Path to therapist OpenFace CSV
@@ -91,6 +123,7 @@ def generate_plot_for_turn(
         turn: Speech turn dict with start_ms, end_ms, speaker_id
         au_names: List of 4 AU names to plot
         output_path: Where to save the plot
+        num_bins: Number of temporal bins (default 8)
     
     Returns:
         True if successful, False otherwise
@@ -110,63 +143,71 @@ def generate_plot_for_turn(
             print(f"⚠️ No data found for turn {turn_index} ({start_ms}-{end_ms}ms)")
             return False
         
-        # Create 2x2 subplot
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes = axes.flatten()
-        
-        # CRITICAL: Use DRAMATICALLY different visual styles to prevent VLM confusion
-        # Therapist: THICK SOLID, DARK colors, NO fill
-        # Client: THIN with FILLED AREA, BRIGHT colors
-        colors_therapist = ['#0D47A1', '#6A1B9A', '#E65100', '#1B5E20']  # Dark: blue, purple, orange, green
-        colors_client = ['#FFD54F', '#FF4081', '#00E5FF', '#76FF03']     # Bright: yellow, pink, cyan, lime
+        # Create binned heatmaps for each AU
+        therapist_heatmap = np.zeros((len(au_names), num_bins))
+        client_heatmap = np.zeros((len(au_names), num_bins))
         
         for i, au_name in enumerate(au_names):
-            ax = axes[i]
-            
-            # CLIENT: Thin line with prominent filled area (BRIGHT colors)
-            ax.fill_between(patient_data['timestamp_ms'], patient_data[au_name], 
-                           alpha=0.5, color=colors_client[i], zorder=5, 
-                           label='CLIENT (filled area)')
-            ax.plot(patient_data['timestamp_ms'], patient_data[au_name], 
-                   linewidth=2, color=colors_client[i], linestyle='--', 
-                   alpha=0.9, zorder=6)
-            
-            # THERAPIST: Very thick solid line, NO fill (DARK colors)
-            ax.plot(therapist_data['timestamp_ms'], therapist_data[au_name], 
-                   linewidth=6, color=colors_therapist[i], label='THERAPIST (thick line)', 
-                   alpha=1.0, linestyle='-', zorder=10)
-            
-            # Add text labels at 3 points along the time axis to clearly mark which is which
-            time_points = [0.25, 0.5, 0.75]
-            for tp in time_points:
-                idx_t = int(len(therapist_data) * tp)
-                idx_c = int(len(patient_data) * tp)
-                if idx_t < len(therapist_data) and idx_c < len(patient_data):
-                    x_pos = therapist_data['timestamp_ms'].iloc[idx_t]
-                    y_therapist = therapist_data[au_name].iloc[idx_t]
-                    y_client = patient_data[au_name].iloc[idx_c]
-                    
-                    # Add labels with background boxes
-                    ax.text(x_pos, y_therapist, 'T', fontsize=9, fontweight='bold',
-                           bbox=dict(boxstyle='circle,pad=0.3', facecolor='white', 
-                                   edgecolor=colors_therapist[i], linewidth=2),
-                           ha='center', va='center', zorder=15)
-                    ax.text(x_pos, y_client, 'C', fontsize=9, fontweight='bold',
-                           bbox=dict(boxstyle='circle,pad=0.3', facecolor='white', 
-                                   edgecolor=colors_client[i], linewidth=2),
-                           ha='center', va='center', zorder=15)
-            
-            ax.set_title(f"{au_name} - Speaker: {speaker_id.capitalize()}", 
-                        fontsize=12, pad=10, fontweight='bold')
-            ax.set_xlabel("Time (ms)", fontsize=10)
-            ax.set_ylabel("Activation", fontsize=10)
-            ax.grid(True, alpha=0.25, linestyle='--', linewidth=0.5)
-            ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
-            ax.tick_params(labelsize=9)
+            therapist_heatmap[i, :] = bin_time_series(therapist_data, au_name, num_bins)
+            client_heatmap[i, :] = bin_time_series(patient_data, au_name, num_bins)
         
-        plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)", 
-                    fontsize=14, fontweight='bold', y=0.995)
-        plt.tight_layout()
+        # Create figure with two side-by-side heatmaps
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Find global min/max for consistent color scaling
+        vmin = min(therapist_heatmap.min(), client_heatmap.min())
+        vmax = max(therapist_heatmap.max(), client_heatmap.max())
+        
+        # Therapist heatmap (left)
+        im1 = ax1.imshow(therapist_heatmap, aspect='auto', cmap='Blues', 
+                         interpolation='nearest', vmin=vmin, vmax=vmax)
+        ax1.set_title('THERAPIST AU Activation', fontsize=14, fontweight='bold', pad=15)
+        ax1.set_ylabel('Action Unit', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('Time Progression (Start → End)', fontsize=12, fontweight='bold')
+        ax1.set_yticks(range(len(au_names)))
+        ax1.set_yticklabels(au_names, fontsize=11)
+        ax1.set_xticks(range(num_bins))
+        ax1.set_xticklabels(['Start', 'Early', 'Early-Mid', 'Mid', 'Late-Mid', 'Late', 'Very Late', 'End'][:num_bins], 
+                            fontsize=9, rotation=45, ha='right')
+        
+        # Add colorbar for therapist
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label('Activation Level', fontsize=11, fontweight='bold')
+        
+        # Add value annotations on therapist heatmap
+        for i in range(len(au_names)):
+            for j in range(num_bins):
+                text = ax1.text(j, i, f'{therapist_heatmap[i, j]:.2f}',
+                               ha="center", va="center", color="black", fontsize=8)
+        
+        # Client heatmap (right)
+        im2 = ax2.imshow(client_heatmap, aspect='auto', cmap='Oranges', 
+                         interpolation='nearest', vmin=vmin, vmax=vmax)
+        ax2.set_title('CLIENT AU Activation', fontsize=14, fontweight='bold', pad=15)
+        ax2.set_ylabel('Action Unit', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('Time Progression (Start → End)', fontsize=12, fontweight='bold')
+        ax2.set_yticks(range(len(au_names)))
+        ax2.set_yticklabels(au_names, fontsize=11)
+        ax2.set_xticks(range(num_bins))
+        ax2.set_xticklabels(['Start', 'Early', 'Early-Mid', 'Mid', 'Mid-Late', 'Late', 'Late', 'End'][:num_bins], 
+                            fontsize=9, rotation=45, ha='right')
+        
+        # Add colorbar for client
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        cbar2.set_label('Activation Level', fontsize=11, fontweight='bold')
+        
+        # Add value annotations on client heatmap
+        for i in range(len(au_names)):
+            for j in range(num_bins):
+                text = ax2.text(j, i, f'{client_heatmap[i, j]:.2f}',
+                               ha="center", va="center", color="black", fontsize=8)
+        
+        # Overall title
+        plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)\n" + 
+                     f"Heatmap shows mean AU activation across {num_bins} temporal phases", 
+                     fontsize=15, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
         
@@ -180,19 +221,25 @@ def generate_plot_for_turn(
 def generate_rationale_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
     """Generate rationale using the Gemma-3 pipeline."""
     
-    pre_prompt = """You are analyzing facial Action Unit (AU) activation plots showing therapist and client during a psychotherapy speech turn.
+    pre_prompt = """You are analyzing two side-by-side heatmaps showing facial Action Unit (AU) activation during a psychotherapy speech turn.
 
-For each AU, write ONE compact sentence in plain text (no markdown, no asterisks, no bullet points):
-"AU##: Therapist [activation range] [spike_freq], Client [activation range] [spike_freq], [key difference]"
+LEFT HEATMAP = THERAPIST (blue colors)
+RIGHT HEATMAP = CLIENT (orange colors)
+
+Each heatmap shows 4 rows (one per AU) and 8 columns representing temporal progression (Start, Early, Early-Mid, Mid, Mid-Late, Late, Late, End).
+Darker colors = higher activation. Numbers in each cell show the mean activation value.
+
+For each AU (row), write ONE compact sentence comparing therapist vs client:
+"AU##: Therapist [pattern description], Client [pattern description], [key comparison]"
 
 Where:
-- [activation range] = ymin to ymax 
-- [spike_freq] = no-spikes / few-spikes / many-spikes (transient peaks above baseline)
-- [key difference] = one brief phrase comparing the two patterns
+- [pattern description] = describe the general temporal pattern using natural language (e.g., "consistently low throughout", "high in middle phases", "peaks toward end", "steady increase", "starts high then drops")
+- [key comparison] = one brief phrase noting the main difference or similarity
+- Do NOT reference specific bin numbers or column indices
 
-Separate AUs with a period and space. Do NOT use formatting, bullets, headers, or extra whitespace. Do NOT add introductory or concluding statements. Only output your description.
+Separate AUs with a period and space. Do NOT use markdown, bullets, headers, or extra whitespace. Do NOT add introductory or concluding statements.
 
-Example: "AU12: Therapist 0.0-2.0, no-spikes, Client 0.0-0.6 many-spikes, client shows frequent high peaks while therapist remains flat. AU06: Therapist 0.0-1.2 few-spikes, Client 0.0-2.2 few-spikes, both show similar spike timing but client has higher baseline."
+Example: "AU12: Therapist consistently low throughout, Client shows elevation during middle phases, client more activated midway through turn. AU06: Therapist gradual increase from start to end, Client stable high throughout, client maintains higher baseline activation."
 """
     
     au_list = ", ".join(au_names)
