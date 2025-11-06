@@ -8,20 +8,16 @@ The core questions asked the openTSLM pipeline relates to different measures of 
 .
 ├── README.md
 ├── opentslm/
-│   ├── src/
-│   │   ├── time_series_datasets/
+│   ├── synchrony_project/       # Project-specific code for synchrony analysis
+│   │   ├── generate_time_series_rationales.py  # Main pipeline for AU rationale generation
+│   │   └── test_simple_generation.py
+│   ├── src/                     # OpenTSLM core library
+│   │   ├── time_series_datasets/    # Project-specific dataset loaders
+│   │   │   └── psychotherapy_dataset.py
+│   │   ├── model/
 │   │   └── ...
-│   └── evaluation/
-├── source/
-│   ├── scripts_language/
-│   │   ├── language_pipeline.py
-│   │   ├── consistency_check_therapist_client.py
-│   │   └── ...
-│   ├── scripts_source_data_clean/
-│   │   └── ...
-│   ├── scripts_face/
-│   │   ├── local_dataloader.py
-│   │   └── ...
-│   └── plotting/
+│   └── evaluation/              # Evaluation scripts and results
+└── source/                      # Data preprocessing and auxiliary scripts
+```
 
 
