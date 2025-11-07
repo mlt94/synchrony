@@ -1,10 +1,10 @@
 """
-Combine time-series rationales (AU patterns) with transcript summaries (speech content)
+Combine time-series descriptions (AU patterns) with transcript summaries (speech content)
 and BLRI empathy scores using Gemma 7B-it to describe associations.
 
 This script:
 1. Loads data_model.yaml containing interview metadata, transcript paths, and BLRI scores
-2. Loads rationales from ituhpc_timeseries_rationales/*.json (contains "generated_rationale" key)
+2. Loads time-series descriptions from ituhpc_timeseries_rationales/*.json (contains "generated_rationale" key - legacy naming)
 3. Matches entries by patient_id, interview_type, turn_index
 4. Calculates BLRI difference (therapist - client): positive = therapist finds client more empathic
 5. Uses Gemma 7B-it to describe associations between AU patterns, speech content, and BLRI
@@ -62,16 +62,16 @@ def _is_nan_like(x) -> bool:
     return not np.isfinite(xv)
 
 
-def load_rationales(rationales_dir: Path) -> Dict[str, List[Dict]]:
-    """Load all rationale JSON files from directory.
+def load_timeseries_descriptions(descriptions_dir: Path) -> Dict[str, List[Dict]]:
+    """Load all time-series description JSON files from directory.
     
     Returns:
-        Dict mapping (patient_id, interview_type) -> list of rationale entries
+        Dict mapping (patient_id, interview_type) -> list of description entries
     """
-    rationales_by_key = defaultdict(list)
+    descriptions_by_key = defaultdict(list)
     
-    print(f"\n📂 Loading rationales from {rationales_dir}...")
-    json_files = list(rationales_dir.glob("*.json"))
+    print(f"\n📂 Loading time-series descriptions from {descriptions_dir}...")
+    json_files = list(descriptions_dir.glob("*.json"))
     
     for json_file in json_files:
         with open(json_file, 'r', encoding='utf-8') as f:
@@ -81,10 +81,10 @@ def load_rationales(rationales_dir: Path) -> Dict[str, List[Dict]]:
             patient_id = entry['patient_id']
             interview_type = entry['interview_type']
             key = (patient_id, interview_type)
-            rationales_by_key[key].append(entry)
+            descriptions_by_key[key].append(entry)
     
-    print(f"✅ Loaded {len(json_files)} rationale files covering {len(rationales_by_key)} patient-interview combinations")
-    return rationales_by_key
+    print(f"✅ Loaded {len(json_files)} description files covering {len(descriptions_by_key)} patient-interview combinations")
+    return descriptions_by_key
 
 
 def extract_blri_scores(interview_data: Dict, interview_type: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
@@ -125,29 +125,29 @@ def extract_blri_scores(interview_data: Dict, interview_type: str) -> Tuple[Opti
 
 
 def match_entries(
-    rationales: List[Dict],
+    descriptions: List[Dict],
     summaries: List[Dict],
     tolerance_ms: int = 100
 ) -> List[Tuple[Dict, Dict]]:
-    """Match rationale and summary entries by turn_index and time window.
+    """Match time-series description and summary entries by turn_index and time window.
     
     Args:
-        rationales: List of rationale entries
+        descriptions: List of time-series description entries
         summaries: List of summary entries (already extracted from wrapper)
         tolerance_ms: Time window tolerance in milliseconds for matching
     
     Returns:
-        List of (rationale, summary) tuples for matched entries
+        List of (description, summary) tuples for matched entries
     """
     matches = []
     
     # Build lookup by turn_index for summaries
     summaries_by_turn = {s['turn_index']: s for s in summaries}
     
-    for rat in rationales:
-        turn_idx = rat['turn_index']
-        start_ms = rat['start_ms']
-        end_ms = rat['end_ms']
+    for desc in descriptions:
+        turn_idx = desc['turn_index']
+        start_ms = desc['start_ms']
+        end_ms = desc['end_ms']
         
         # Try exact turn index match first
         if turn_idx in summaries_by_turn:
@@ -155,14 +155,14 @@ def match_entries(
             # Verify time windows are close
             if (abs(summ['start_ms'] - start_ms) <= tolerance_ms and
                 abs(summ['end_ms'] - end_ms) <= tolerance_ms):
-                matches.append((rat, summ))
+                matches.append((desc, summ))
                 continue
         
         # Fallback: search by time window
         for summ in summaries:
             if (abs(summ['start_ms'] - start_ms) <= tolerance_ms and
                 abs(summ['end_ms'] - end_ms) <= tolerance_ms):
-                matches.append((rat, summ))
+                matches.append((desc, summ))
                 break
     
     return matches
@@ -178,39 +178,41 @@ def discretize_blri_difference(blri_diff: float) -> str:
     Returns:
         String label for the empathy category: "equal" or "discrepancy"
     """
-    if -4 <= blri_diff <= 4:
+    if -8 <= blri_diff <= 8:
         return "equally empathic"
     else:
         return "discrepancy"
 
 
 def create_combination_prompt(
-    rationale: str, 
+    timeseries_description: str, 
     summary: str, 
     speaker_id: str, 
     blri_diff: Optional[float] = None
 ) -> str:
-    """Create prompt for Gemma to combine rationale, summary, and BLRI scores."""
+    """Create prompt for Gemma to combine time-series description, summary, and BLRI scores."""
     
     # Discretize BLRI difference to get the correct answer
     empathy_category = discretize_blri_difference(blri_diff) if blri_diff is not None else "unknown"
     
     prompt = f"""
-    You are analyzing a speech turn from a psychotherapy session. 
+    You are describing the relational dynamic in a speech turn from a psychotherapy session. 
     Your task is to describe the associations between what was said, the client and therapist's facial expressions, and how that relates to the degree of relational empathy.
 
-Available answer categories are: equally empathic, discrepancy.
+There are two possible answer categories. Either the client and therapist feel equally **empathic** to one another or there is **discrepancy**.
 
 Data for this turn:
 
 Speech content summary: {summary} (spoken by {speaker_id})
 
-Facial Action Unit (AU) patterns: {rationale}
+Facial Action Unit (AU) patterns: {timeseries_description}
 
 Instructions:
-- Begin by describing the speech content — what was said and by whom.
-- Then briefly note any salient facial Action Units (AUs) that stand out — do NOT over-analyze every AU, only mention the most relevant ones.
-- Think step-by-step about how the speech content and facial expressions might relate to the empathy dynamic between therapist and client.
+- Begin by describing the speech content very briefly
+- Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones.
+- Describe how the speech content and facial expressions might relate to the empathy dynamic between therapist and client.
+- Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
+- Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
 - Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
 - Do **not** mention the answer category label until the final sentence.
 - You MUST end your response with "Answer: {empathy_category}"
@@ -224,15 +226,15 @@ def combine_with_gemma(
     tokenizer,
     model,
     device: str,
-    rationale: str,
+    timeseries_description: str,
     summary: str,
     speaker_id: str,
     blri_diff: Optional[float] = None
 ) -> str:
-    """Use Gemma 7B-it to combine rationale, summary, and BLRI into coherent text."""
+    """Use Gemma 7B-it to combine time-series description, summary, and BLRI into coherent text."""
     
     prompt = create_combination_prompt(
-        rationale, summary, speaker_id, blri_diff
+        timeseries_description, summary, speaker_id, blri_diff
     )
     
     # Tokenize with proper chat template (Gemma uses specific format)
@@ -263,28 +265,14 @@ def combine_with_gemma(
     # Decode only the generated tokens (not the input)
     generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
     combined = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-    
-    # Remove common unwanted prefixes that models sometimes add
-    unwanted_prefixes = [
-        "description:",
-        "combined description:",
-        "analysis:",
-        "\n\n",
-    ]
-    
-    combined_lower = combined.lower()
-    for prefix in unwanted_prefixes:
-        if combined_lower.startswith(prefix):
-            combined = combined[len(prefix):].strip()
-            combined_lower = combined.lower()
-    
+      
     return combined
 
 
 def process_patient_interview(
     interview_data: Dict,
     interview_type: str,
-    rationales: List[Dict],
+    timeseries_descriptions: List[Dict],
     tokenizer,
     model,
     device: str,
@@ -295,7 +283,7 @@ def process_patient_interview(
     Args:
         interview_data: Interview data from data_model.yaml
         interview_type: Type of interview (bindung, personal, wunder)
-        rationales: List of rationale entries
+        timeseries_descriptions: List of time-series description entries
         tokenizer: Gemma tokenizer
         model: Gemma model
         device: Device to run on
@@ -328,8 +316,8 @@ def process_patient_interview(
     with open(transcript_path, 'r', encoding='utf-8') as f:
         summaries = json.load(f)
     
-    # Match rationales with summaries
-    matches = match_entries(rationales, summaries)
+    # Match time-series descriptions with summaries
+    matches = match_entries(timeseries_descriptions, summaries)
     
     if not matches:
         print(f"⚠️ No matches found for {patient_id} {interview_type}")
@@ -348,16 +336,16 @@ def process_patient_interview(
     
     skipped_empty = 0
     
-    for rat, summ in tqdm(matches, desc=f"{patient_id} {interview_type}"):
+    for desc, summ in tqdm(matches, desc=f"{patient_id} {interview_type}"):
         try:
-            # Skip if rationale is empty or missing
-            rationale_text = rat.get('generated_rationale', '').strip()
-            if not rationale_text:
+            # Skip if time-series description is empty or missing
+            description_text = desc.get('generated_rationale', '').strip()  # Note: JSON key is legacy 'generated_rationale'
+            if not description_text:
                 skipped_empty += 1
                 continue
             
-            # Skip if rationale is an error message
-            if rationale_text.lower().startswith('error:'):
+            # Skip if description is an error message
+            if description_text.lower().startswith('error:'):
                 skipped_empty += 1
                 continue
             
@@ -374,9 +362,9 @@ def process_patient_interview(
                 tokenizer,
                 model,
                 device,
-                rationale_text,
+                description_text,
                 summary_text,
-                rat['speaker_id'],
+                desc['speaker_id'],
                 blri_diff
             )
             
@@ -384,27 +372,27 @@ def process_patient_interview(
                 "patient_id": patient_id,
                 "therapist_id": therapist_id,
                 "interview_type": interview_type,
-                "turn_index": rat['turn_index'],
-                "speaker_id": rat['speaker_id'],
-                "start_ms": rat['start_ms'],
-                "end_ms": rat['end_ms'],
-                "duration_ms": rat['duration_ms'],
+                "turn_index": desc['turn_index'],
+                "speaker_id": desc['speaker_id'],
+                "start_ms": desc['start_ms'],
+                "end_ms": desc['end_ms'],
+                "duration_ms": desc['duration_ms'],
                 "therapist_blri": therapist_blri,
                 "client_blri": client_blri,
                 "blri_difference": blri_diff,
                 "empathy_category": empathy_category,
-                "original_rationale": rat['generated_rationale'],
+                "original_timeseries_description": desc['generated_rationale'],  # Note: JSON key is legacy 'generated_rationale'
                 "original_summary": summ['summary'],
                 "combined_description": combined
             }
             results.append(result)
             
         except Exception as e:
-            print(f"❌ Error processing turn {rat['turn_index']}: {e}")
+            print(f"❌ Error processing turn {desc['turn_index']}: {e}")
             continue
     
     if skipped_empty > 0:
-        print(f"⚠️  Skipped {skipped_empty} turn(s) with empty rationale or summary")
+        print(f"⚠️  Skipped {skipped_empty} turn(s) with empty description or summary")
     
     return results
 
@@ -420,7 +408,7 @@ def save_results(results: List[Dict[str, Any]], output_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Combine AU rationales with transcript summaries and BLRI scores using Gemma 7B-it"
+        description="Combine time-series descriptions with transcript summaries and BLRI scores using Gemma 7B-it"
     )
     parser.add_argument(
         "--data_model",
@@ -429,15 +417,15 @@ def main():
         help="Path to data_model.yaml"
     )
     parser.add_argument(
-        "--rationales_dir",
+        "--descriptions_dir",
         type=Path,
         default=Path("C:/Users/User/Desktop/martins/data_transfers/ituhpc_timeseries_rationales"),
-        help="Directory containing rationale JSON files"
+        help="Directory containing time-series description JSON files"
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("C:/Users/User/Desktop/martins/results/combined_rationales"),
+        default=Path("C:/Users/User/Desktop/martins/results/combined_descriptions"),
         help="Output directory for combined results"
     )
     parser.add_argument( 
@@ -467,11 +455,11 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting rationale-summary-BLRI combination with Gemma 7B-it")
+    print("🚀 Starting time-series description + summary + BLRI combination with Gemma 7B-it")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
-    print(f"  Rationales dir: {args.rationales_dir}")
+    print(f"  Time-series descriptions dir: {args.descriptions_dir}")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Model: {args.model_name}")
     print(f"  Interview types: {args.interview_types}")
@@ -485,7 +473,7 @@ def main():
     
     # Load data
     data_model = load_data_model(args.data_model)
-    rationales_by_key = load_rationales(args.rationales_dir)
+    descriptions_by_key = load_timeseries_descriptions(args.descriptions_dir)
     
     interviews = data_model['interviews']
     if args.max_interviews:
@@ -523,10 +511,10 @@ def main():
         print(f"{'='*80}")
         
         for interview_type in args.interview_types:
-            # Check if we have rationales for this combination
+            # Check if we have time-series descriptions for this combination
             key = (patient_id, interview_type)
-            if key not in rationales_by_key:
-                print(f"⚠️ No rationales found for {patient_id} {interview_type}, skipping")
+            if key not in descriptions_by_key:
+                print(f"⚠️ No time-series descriptions found for {patient_id} {interview_type}, skipping")
                 continue
             
             # Check if interview type exists in data model
@@ -537,7 +525,7 @@ def main():
             results = process_patient_interview(
                 interview,
                 interview_type,
-                rationales_by_key[key],
+                descriptions_by_key[key],
                 tokenizer,
                 model,
                 device,

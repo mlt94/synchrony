@@ -1,10 +1,10 @@
 """
-Refactored script to generate time-series rationales using the Gemma-3 multimodal pipeline.
+Refactored script to generate time-series descriptions using the Gemma-3 multimodal pipeline.
 This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
 3. Generates 4 subplots (2x2) with therapist and client AUs overlaid
-4. Feeds plots into Gemma-3 27b-it for rationale generation
+4. Feeds plots into Gemma-3 27b-it for description generation
 """
 
 import sys
@@ -218,8 +218,8 @@ def generate_plot_for_turn(
         return False
 
 
-def generate_rationale_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
-    """Generate rationale using the Gemma-3 pipeline."""
+def generate_description_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
+    """Generate time-series description using the Gemma-3 pipeline."""
     
     pre_prompt = """You are analyzing two side-by-side heatmaps showing facial Action Unit (AU) activation during a psychotherapy speech turn.
 
@@ -266,7 +266,7 @@ Description: """
             do_sample=False,
             temperature=0.1
         )
-        rationale = output[0]["generated_text"][-1]["content"].strip()
+        description = output[0]["generated_text"][-1]["content"].strip()
         
         # Remove common unwanted prefixes
         unwanted_prefixes = [
@@ -280,17 +280,17 @@ Description: """
             "The patterns are",
         ]
         for prefix in unwanted_prefixes:
-            if rationale.lower().startswith(prefix.lower()):
-                rationale = rationale[len(prefix):].lstrip(':.,; ')
+            if description.lower().startswith(prefix.lower()):
+                description = description[len(prefix):].lstrip(':.,; ')
                 break
         
         # Remove markdown formatting (bold, bullets, etc)
-        rationale = rationale.replace('**', '')  # Remove bold
-        rationale = rationale.replace('*', '')   # Remove italics
-        rationale = rationale.replace('\n-', '.')  # Convert bullets to periods
-        rationale = rationale.replace('\n•', '.')  # Convert bullets to periods
-        rationale = rationale.replace('\n ', ' ')  # Collapse newlines with spaces
-        rationale = rationale.replace('\n', ' ')   # Remove remaining newlines
+        description = description.replace('**', '')  # Remove bold
+        description = description.replace('*', '')   # Remove italics
+        description = description.replace('\n-', '.')  # Convert bullets to periods
+        description = description.replace('\n•', '.')  # Convert bullets to periods
+        description = description.replace('\n ', ' ')  # Collapse newlines with spaces
+        description = description.replace('\n', ' ')   # Remove remaining newlines
         
         # Remove redundant phrases within the text
         redundant_phrases = [
@@ -300,11 +300,11 @@ Description: """
             '- ',
         ]
         for phrase in redundant_phrases:
-            rationale = rationale.replace(phrase, '')
+            description = description.replace(phrase, '')
         
         # Clean up multiple spaces
         import re
-        rationale = re.sub(r'\s+', ' ', rationale)
+        description = re.sub(r'\s+', ' ', description)
         
         # Remove common unwanted conclusions
         unwanted_conclusions = [
@@ -315,17 +315,17 @@ Description: """
             "This suggests",
             "This indicates",
         ]
-        sentences = rationale.split('.')
+        sentences = description.split('.')
         if len(sentences) > 1:
             last_sentence = sentences[-1].strip()
             for conclusion in unwanted_conclusions:
                 if last_sentence.lower().startswith(conclusion.lower()):
-                    rationale = '.'.join(sentences[:-1]) + '.'
+                    description = '.'.join(sentences[:-1]) + '.'
                     break
         
-        return rationale.strip()
+        return description.strip()
     except Exception as e:
-        print(f"❌ Error generating rationale: {e}")
+        print(f"❌ Error generating description: {e}")
         return f"Error: {str(e)}"
 
 
@@ -337,7 +337,7 @@ def process_interview(
     au_names: List[str],
     max_turns: int = None
 ) -> List[Dict[str, Any]]:
-    """Process a single interview type for rationale generation.
+    """Process a single interview type for description generation.
     
     Args:
         interview: Interview dict from data_model.yaml
@@ -397,8 +397,8 @@ def process_interview(
         if not success:
             continue
         
-        # Generate rationale
-        rationale = generate_rationale_with_pipeline(pipe, plot_path, turn, au_names)
+        # Generate description
+        description = generate_description_with_pipeline(pipe, plot_path, turn, au_names)
         
         # Collect result
         result = {
@@ -410,7 +410,7 @@ def process_interview(
             "start_ms": turn['start_ms'],
             "end_ms": turn['end_ms'],
             "duration_ms": turn['end_ms'] - turn['start_ms'],
-            "generated_rationale": rationale,
+            "generated_rationale": description,  # NOTE: Key name kept as 'generated_rationale' for backward compatibility with existing JSON files
             "plot_path": str(plot_path)
         }
         results.append(result)
@@ -419,7 +419,7 @@ def process_interview(
 
 
 def save_results(results: List[Dict[str, Any]], output_path: Path):
-    """Save the generated rationales to JSON."""
+    """Save the generated time-series descriptions to JSON."""
     print(f"\n💾 Saving {len(results)} results to {output_path}...")
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
@@ -427,16 +427,16 @@ def save_results(results: List[Dict[str, Any]], output_path: Path):
     
     if results:
         avg_duration = np.mean([r['duration_ms'] for r in results])
-        avg_rationale_len = np.mean([len(r['generated_rationale']) for r in results])
+        avg_description_len = np.mean([len(r['generated_rationale']) for r in results])
         print(f"\n📊 Summary:")
         print(f"  Total turns processed: {len(results)}")
         print(f"  Average turn duration: {avg_duration:.0f}ms")
-        print(f"  Average rationale length: {avg_rationale_len:.0f} characters")
+        print(f"  Average description length: {avg_description_len:.0f} characters")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate AU rationales from data_model.yaml using Gemma-3 multimodal pipeline"
+        description="Generate AU time-series descriptions from data_model.yaml using Gemma-3 multimodal pipeline"
     )
     parser.add_argument(
         "--data_model",
@@ -477,7 +477,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting AU rationale generation with Gemma-3 multimodal pipeline")
+    print("🚀 Starting AU time-series description generation with Gemma-3 multimodal pipeline")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
@@ -538,11 +538,12 @@ def main():
     
     # Save results per dyad and interview type
     for (dyad_id, interview_type), dyad_results in results_by_dyad_type.items():
-        output_json = args.output_dir / f"{dyad_id}_{interview_type}_rationales.json"
+        output_json = args.output_dir / f"{dyad_id}_{interview_type}_descriptions.json"
         save_results(dyad_results, output_json)
     
-    print(f"\n✅ Complete! Generated rationales for {len(all_results)} speech turns across {len(results_by_dyad_type)} dyad-interview combinations")
+    print(f"\n✅ Complete! Generated time-series descriptions for {len(all_results)} speech turns across {len(results_by_dyad_type)} dyad-interview combinations")
 
 
 if __name__ == "__main__":
+    print("MARTIN, when you are running this again, please remember to change the rationale key to description for alignment")
     main()
