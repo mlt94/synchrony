@@ -168,41 +168,54 @@ def match_entries(
     return matches
 
 
+def discretize_blri_difference(blri_diff: float) -> str:
+    """
+    Discretize BLRI difference into binary categories.
+    
+    Args:
+        blri_diff: Difference between therapist and client BLRI (therapist - client)
+        
+    Returns:
+        String label for the empathy category: "equal" or "discrepancy"
+    """
+    if -4 <= blri_diff <= 4:
+        return "equally empathic"
+    else:
+        return "discrepancy"
+
+
 def create_combination_prompt(
     rationale: str, 
     summary: str, 
     speaker_id: str, 
-    turn_index: int,
-    therapist_blri: Optional[float] = None,
-    client_blri: Optional[float] = None,
     blri_diff: Optional[float] = None
 ) -> str:
     """Create prompt for Gemma to combine rationale, summary, and BLRI scores."""
     
-    # Build BLRI context
-    blri_context = ""
-    if blri_diff is not None:
-        if blri_diff > 0:
-            blri_interpretation = f"a positive BLRI difference of {blri_diff:.1f}, indicating the therapist perceived the client as more empathic"
-        elif blri_diff < 0:
-            blri_interpretation = f"a negative BLRI difference of {blri_diff:.1f}, indicating the client perceived the therapist as more empathic"
-        else:
-            blri_interpretation = f"equal BLRI scores (difference of 0), indicating mutual empathy perception"
-        
-        blri_context = f"\n3. BLRI empathy scores: {blri_interpretation}."
+    # Discretize BLRI difference to get the correct answer
+    empathy_category = discretize_blri_difference(blri_diff) if blri_diff is not None else "unknown"
     
-    prompt = f"""You are analyzing a psychotherapy session. You have the following information about the same speech turn:
+    prompt = f"""
+    You are analyzing a speech turn from a psychotherapy session. 
+    Your task is to describe the associations between what was said, the client and therapist's facial expressions, and how that relates to the degree of relational empathy.
 
-1. Facial Action Unit (AU) patterns: {rationale}
+Available answer categories are: equally empathic, discrepancy.
 
-2. Speech content summary: {summary}{blri_context}
+Data for this turn:
 
-Describe the ASSOCIATIONS between these three pieces of information in ONE short paragraph. 
-Be specific about each AU (e.g., AU04, AU12, AU15) - state exactly which AU showed what pattern. 
-Then explain how these AU patterns and speech content might relate to the empathy dynamic reflected in the BLRI scores. 
-Start directly with the speech content, describe the specific AU patterns, and conclude with how these relate to the empathy scores. Write in third person past tense.
+Speech content summary: {summary} (spoken by {speaker_id})
 
-Combined description:"""
+Facial Action Unit (AU) patterns: {rationale}
+
+Instructions:
+- Begin by describing the speech content — what was said and by whom.
+- Then briefly note any salient facial Action Units (AUs) that stand out — do NOT over-analyze every AU, only mention the most relevant ones.
+- Think step-by-step about how the speech content and facial expressions might relate to the empathy dynamic between therapist and client.
+- Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
+- Do **not** mention the answer category label until the final sentence.
+- You MUST end your response with "Answer: {empathy_category}"
+
+Description:"""
     
     return prompt
 
@@ -214,16 +227,12 @@ def combine_with_gemma(
     rationale: str,
     summary: str,
     speaker_id: str,
-    turn_index: int,
-    therapist_blri: Optional[float] = None,
-    client_blri: Optional[float] = None,
     blri_diff: Optional[float] = None
 ) -> str:
     """Use Gemma 7B-it to combine rationale, summary, and BLRI into coherent text."""
     
     prompt = create_combination_prompt(
-        rationale, summary, speaker_id, turn_index,
-        therapist_blri, client_blri, blri_diff
+        rationale, summary, speaker_id, blri_diff
     )
     
     # Tokenize with proper chat template (Gemma uses specific format)
@@ -244,43 +253,30 @@ def combine_with_gemma(
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=300,
+            max_new_tokens=350,
             do_sample=False,
             temperature=None,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id
         )
     
-    # Decode and extract only the generated part
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Decode only the generated tokens (not the input)
+    generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+    combined = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
     
-    # Remove the prompt to get only the model's response
-    if "Combined description:" in generated_text:
-        combined = generated_text.split("Combined description:")[-1].strip()
-    else:
-        # Fallback: take everything after the input
-        combined = generated_text[len(formatted_prompt):].strip()
-    
-    # Clean up unwanted introductory phrases
-    unwanted_starts = [
-        f"during turn {turn_index},",
-        f"in turn {turn_index},",
-        f"during this turn,",
-        f"in this turn,",
-        f"turn {turn_index}:",
-        "during the turn,",
-        "in the turn,",
-        "model\n",  # Remove "model\n" prefix if present
+    # Remove common unwanted prefixes that models sometimes add
+    unwanted_prefixes = [
+        "description:",
+        "combined description:",
+        "analysis:",
+        "\n\n",
     ]
     
     combined_lower = combined.lower()
-    for prefix in unwanted_starts:
+    for prefix in unwanted_prefixes:
         if combined_lower.startswith(prefix):
-            # Remove prefix and capitalize the first letter of what remains
             combined = combined[len(prefix):].strip()
-            if combined:
-                combined = combined[0].upper() + combined[1:]
-            break
+            combined_lower = combined.lower()
     
     return combined
 
@@ -371,6 +367,9 @@ def process_patient_interview(
                 skipped_empty += 1
                 continue
             
+            # Discretize BLRI category before calling combine_with_gemma
+            empathy_category = discretize_blri_difference(blri_diff)
+            
             combined = combine_with_gemma(
                 tokenizer,
                 model,
@@ -378,9 +377,6 @@ def process_patient_interview(
                 rationale_text,
                 summary_text,
                 rat['speaker_id'],
-                rat['turn_index'],
-                therapist_blri,
-                client_blri,
                 blri_diff
             )
             
@@ -396,6 +392,7 @@ def process_patient_interview(
                 "therapist_blri": therapist_blri,
                 "client_blri": client_blri,
                 "blri_difference": blri_diff,
+                "empathy_category": empathy_category,
                 "original_rationale": rat['generated_rationale'],
                 "original_summary": summ['summary'],
                 "combined_description": combined
