@@ -1,5 +1,12 @@
 """
-Refactored script to generate time-series descriptions using the Gemma-3 multimodal pipeline.
+Generate time-series descriptions using the Gemma-3 multimodal pipeline.
+This is the first out of two-steps to create comparable "rationales" as the OpenTSLM paper have.
+In this step, we give a Gemma-3 a heatmap of action unit time series, and simply asks it to describe it.
+Its akin to what the opentslm authors did with gpt-4o.
+
+The next step is to combine these descriptions with the transcripts to form coherent rationales or descriptions,
+as I like to call them (see combine_transcripts_with_time_series_descriptions.py for this)
+
 This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
@@ -221,33 +228,16 @@ def generate_plot_for_turn(
 def generate_description_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
     """Generate time-series description using the Gemma-3 pipeline."""
     
-    pre_prompt = """You are analyzing two side-by-side heatmaps showing facial Action Unit (AU) activation during a psychotherapy speech turn.
-
-LEFT HEATMAP = THERAPIST (blue colors)
-RIGHT HEATMAP = CLIENT (orange colors)
-
-Each heatmap shows 4 rows (one per AU) and 8 columns representing temporal progression (Start, Early, Early-Mid, Mid, Mid-Late, Late, Late, End).
-Darker colors = higher activation. Numbers in each cell show the mean activation value.
-
-For each AU (row), write ONE compact sentence comparing therapist vs client:
-"AU##: Therapist [pattern description], Client [pattern description], [key comparison]"
-
-Where:
-- [pattern description] = describe the general temporal pattern using natural language (e.g., "consistently low throughout", "high in middle phases", "peaks toward end", "steady increase", "starts high then drops")
-- [key comparison] = one brief phrase noting the main difference or similarity
-- Do NOT reference specific bin numbers or column indices
-
-Separate AUs with a period and space. Do NOT use markdown, bullets, headers, or extra whitespace. Do NOT add introductory or concluding statements.
-
-Example: "AU12: Therapist consistently low throughout, Client shows elevation during middle phases, client more activated midway through turn. AU06: Therapist gradual increase from start to end, Client stable high throughout, client maintains higher baseline activation."
-"""
+    # Optimized: Much more concise prompt to reduce generation time
+    pre_prompt = """Analyze these AU heatmaps (left=therapist blue, right=client orange). 
+Each row is one AU across 8 time bins. Write one compact sentence per AU comparing patterns.
+Format: "AU##: Therapist [pattern], Client [pattern], [key difference]."
+No markdown, bullets, or headers."""
     
     au_list = ", ".join(au_names)
-    context = f"""Speech Turn {turn['turn_index']}: {turn['speaker_id'].capitalize()} speaking
-Time window: {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
-Action Units shown: {au_list}
-
-Description: """
+    context = f"""Turn {turn['turn_index']} ({turn['speaker_id']}), {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
+AUs: {au_list}
+Description:"""
     
     messages = [
         {
@@ -260,70 +250,28 @@ Description: """
     ]
     
     try:
+        # Optimized: Reduced max_new_tokens from 150 to 80 (4 AUs × ~20 tokens each)
+        # Removed temperature parameter (do_sample=False already ensures deterministic output)
         output = pipe(
             text=messages,
-            max_new_tokens=150,
-            do_sample=False,
-            temperature=0.1
+            max_new_tokens=80,
+            do_sample=False
         )
         description = output[0]["generated_text"][-1]["content"].strip()
         
-        # Remove common unwanted prefixes
-        unwanted_prefixes = [
-            "Here's a concise description of the patterns in the provided plots",
-            "Here's a description of the patterns",
-            "Here's a concise description",
-            "Here is a description",
-            "Here is a concise description",
-            "Here's what I observe",
-            "Here are the observations",
-            "The patterns are",
-        ]
-        for prefix in unwanted_prefixes:
-            if description.lower().startswith(prefix.lower()):
-                description = description[len(prefix):].lstrip(':.,; ')
-                break
+        # Optimized: Minimal post-processing - remove only essential unwanted elements
+        # Remove common prefixes
+        if description.lower().startswith(("here's", "here is", "the patterns")):
+            if ':' in description[:50]:
+                description = description.split(':', 1)[1].lstrip()
         
-        # Remove markdown formatting (bold, bullets, etc)
-        description = description.replace('**', '')  # Remove bold
-        description = description.replace('*', '')   # Remove italics
-        description = description.replace('\n-', '.')  # Convert bullets to periods
-        description = description.replace('\n•', '.')  # Convert bullets to periods
-        description = description.replace('\n ', ' ')  # Collapse newlines with spaces
-        description = description.replace('\n', ' ')   # Remove remaining newlines
-        
-        # Remove redundant phrases within the text
-        redundant_phrases = [
-            'Therapist:',
-            'Client:',
-            'Difference:',
-            '- ',
-        ]
-        for phrase in redundant_phrases:
-            description = description.replace(phrase, '')
-        
-        # Clean up multiple spaces
+        # Remove markdown and normalize whitespace
         import re
-        description = re.sub(r'\s+', ' ', description)
+        description = description.replace('**', '').replace('*', '')
+        description = description.replace('\n', ' ')
+        description = re.sub(r'\s+', ' ', description).strip()
         
-        # Remove common unwanted conclusions
-        unwanted_conclusions = [
-            "Overall, the patterns diverge",
-            "Overall, the patterns converge",
-            "Overall,",
-            "In summary,",
-            "This suggests",
-            "This indicates",
-        ]
-        sentences = description.split('.')
-        if len(sentences) > 1:
-            last_sentence = sentences[-1].strip()
-            for conclusion in unwanted_conclusions:
-                if last_sentence.lower().startswith(conclusion.lower()):
-                    description = '.'.join(sentences[:-1]) + '.'
-                    break
-        
-        return description.strip()
+        return description
     except Exception as e:
         print(f"❌ Error generating description: {e}")
         return f"Error: {str(e)}"
