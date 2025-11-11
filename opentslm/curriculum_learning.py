@@ -20,6 +20,7 @@ from time_series_datasets.m4.M4QADataset import M4QADataset
 from time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
 from time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
 from time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
+from time_series_datasets.psychotherapy.psychotherapyCoTQADataset import PsychotherapyCoTQADataset
 from time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
@@ -69,6 +70,7 @@ CURRICULUM_STAGES = [
     "stage3_cot",
     "stage4_sleep_cot",
     "stage5_ecg_cot",
+    "stage6_synchrony_cot",
 ]
 
 
@@ -115,6 +117,7 @@ class CurriculumTrainer:
         dist_backend: str = "nccl",
         local_rank: int = int(os.environ.get("LOCAL_RANK", 0)),
         llm_id: str = None,
+        skip_previous_stage: bool = False,
     ):
         """
         Initialize the curriculum trainer.
@@ -127,6 +130,7 @@ class CurriculumTrainer:
             dist_backend: Distributed backend
             local_rank: Local GPU rank
             llm_id: LLM model ID (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')
+            skip_previous_stage: Skip loading previous stage weights
         """
         self.model_type = model_type
         self.device = device or self._get_device()
@@ -136,6 +140,7 @@ class CurriculumTrainer:
             )
         self.llm_id = llm_id
         self.llm_id_safe = self._sanitize_llm_id(llm_id)
+        self.skip_previous_stage = skip_previous_stage
 
         # Distributed training parameters
         self.gradient_checkpointing = gradient_checkpointing
@@ -564,15 +569,29 @@ class CurriculumTrainer:
         return None, float("inf")
 
     def _load_previous_stage_model(
-        self, current_stage: str
+        self, current_stage: str, load_from_stage: str = None
     ) -> Optional[Dict[str, Any]]:
-        """Load the best model from the previous stage and return its metrics."""
+        """Load the best model from the previous stage and return its metrics.
+        
+        Args:
+            current_stage: The stage being trained
+            load_from_stage: Optional override to load from a specific stage instead of the previous one
+        """
         try:
-            current_idx = CURRICULUM_STAGES.index(current_stage)
-            if current_idx == 0:
-                # First stage, no previous model to load
-                return None
-            previous_stage = CURRICULUM_STAGES[current_idx - 1]
+            # Determine which stage to load from
+            if load_from_stage:
+                # Use explicitly specified stage
+                previous_stage = load_from_stage
+                if self.rank == 0:
+                    print(f"🔄 Override: Loading from {previous_stage} (instead of previous stage)")
+            else:
+                # Use the immediately previous stage in curriculum
+                current_idx = CURRICULUM_STAGES.index(current_stage)
+                if current_idx == 0:
+                    # First stage, no previous model to load
+                    return None
+                previous_stage = CURRICULUM_STAGES[current_idx - 1]
+            
             metrics_file = os.path.join(
                 self.results_dir, previous_stage, "results", "metrics.json"
             )
@@ -907,6 +926,7 @@ class CurriculumTrainer:
         batch_size: int = None,
         eval_only: bool = False,
         sampler=None,
+        load_from_stage: str = None,  # Optional: override which stage to load from
     ) -> Dict[str, Any]:
         """Generic training function for any stage."""
         epoch = None
@@ -939,7 +959,7 @@ class CurriculumTrainer:
 
         # Load previous stage model and display metrics
         try:
-            previous_stage_info = self._load_previous_stage_model(stage_name)
+            previous_stage_info = self._load_previous_stage_model(stage_name, load_from_stage)
             if previous_stage_info:
                 if self.rank == 0:
                     print(f"📂 Loading best model from {previous_stage_info['stage']}:")
@@ -956,18 +976,26 @@ class CurriculumTrainer:
                             print(f"   {metric}: {value}")
                     print()
             else:
-                # Only allow fresh model for first stage
-                if stage_name != CURRICULUM_STAGES[0]:
+                # Only allow fresh model for first stage or if skip_previous_stage is enabled
+                if stage_name != CURRICULUM_STAGES[0] and not self.skip_previous_stage:
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
                     )
                 if self.rank == 0:
-                    print("🆕 Starting with fresh model (first stage)")
+                    if self.skip_previous_stage:
+                        print("🆕 Starting with fresh model (--skip_previous_stage enabled)")
+                    else:
+                        print("🆕 Starting with fresh model (first stage)")
                     print()
         except Exception as e:
             if self.rank == 0:
                 print(f"❌ Error loading previous stage: {e}")
-            raise Exception(f"Error loading previous stage: {e}")
+            if not self.skip_previous_stage:
+                raise Exception(f"Error loading previous stage: {e}")
+            else:
+                if self.rank == 0:
+                    print("⚠️  Continuing with fresh model (--skip_previous_stage enabled)")
+                    print()
 
         # Check if evaluation was already completed
         evaluation_completed = self._is_evaluation_completed(stage_name)
@@ -1418,6 +1446,34 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
+    def stage6_synchrony_cot(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 6: Chain-of-Thought Reasoning (Psychotherapy Synchrony).
+
+        Configuration:
+        - Epochs: 60
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Test loss only (chain-of-thought reasoning)
+        - Loads from: stage2_captioning (not stage5_ecg_cot)
+        """
+        sampler = None
+        
+        return self._train_stage(
+            stage_name="stage6_synchrony_cot",
+            dataset_class=PsychotherapyCoTQADataset,
+            num_epochs=60,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=None,  # Only test loss for chain-of-thought reasoning
+            batch_size=batch_size,
+            eval_only=eval_only,
+            sampler=sampler,
+            load_from_stage="stage2_captioning",  # Override to load from stage2
+        )
+
     def run_curriculum(
         self, stages: List[str] = None, batch_size: int = None, eval_only: bool = False
     ):
@@ -1493,6 +1549,12 @@ class CurriculumTrainer:
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage5_ecg_cot":
                 stage_results = self.stage5_ecg_cot(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage6_synchrony_cot":
+                stage_results = self.stage6_synchrony_cot(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
@@ -1713,6 +1775,12 @@ def main():
         action="store_true",
         help="Skip training and only run evaluation (requires existing checkpoint)",
     )
+    parser.add_argument(
+        "--skip_previous_stage",
+        default=False,
+        action="store_true",
+        help="Skip loading previous stage weights (for testing or when training individual stages)",
+    )
 
     # Model-specific arguments
     parser.add_argument(
@@ -1765,6 +1833,7 @@ def main():
         dist_backend=args.dist_backend,
         local_rank=args.local_rank,
         llm_id=args.llm_id,
+        skip_previous_stage=args.skip_previous_stage,
     )
 
     # Run curriculum

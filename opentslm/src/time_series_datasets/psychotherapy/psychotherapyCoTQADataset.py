@@ -12,8 +12,24 @@ from time_series_datasets.psychotherapy.psychotherapy_loader import load_psychot
 
 class PsychotherapyCoTQADataset(QADataset):
     """
-    Psychotherapy CoT QA Dataset for therapist-patient facial AU time-series.
-    Follows the same pattern as HARCoTQADataset for multi-feature handling.
+    Psychotherapy CoT QA Dataset for analyzing therapist-patient facial AU time-series.
+    
+    This dataset processes synchronized facial action units (AUs) from therapist and patient
+    during psychotherapy sessions. Each sample represents one speech turn with:
+    - Original transcript summary as context
+    - Synchronized AU time series for therapist and patient
+    - Combined facial description as the target answer
+    
+    The dataset handles variable-length sequences within each turn by applying forward-fill
+    padding to ensure all AU channels have identical length for tensor operations.
+    
+    Args:
+        split: One of "train", "test", or "validation"
+        EOS_TOKEN: End-of-sequence token for the language model
+        format_sample_str: Whether to format samples as strings
+        time_series_format_function: Optional function to format time series
+        max_samples: Maximum number of samples to load (for debugging)
+        feature_columns: List of AU column names to use (e.g., ['AU04_r'] for debugging)
     """
 
     def __init__(self, 
@@ -47,22 +63,17 @@ class PsychotherapyCoTQADataset(QADataset):
 
     def _get_pre_prompt(self, row) -> str:
         """Generate the pre-prompt instruction with transcript summary."""
-        speaker_id = row.get("speaker_id", "unknown")
         start_ms = row.get("start_ms", 0)
         end_ms = row.get("end_ms", 0)
         original_summary = row.get("original_summary", "")
-        
-        # Determine speaker role
-        therapist_id = row.get("therapist_id", "")
-        speaker_role = "therapist" if speaker_id == therapist_id else "patient"
-        
+       
         # Format time in seconds
         start_sec = start_ms / 1000.0
         end_sec = end_ms / 1000.0
         
         prompt = f"""You are given facial action unit data in 17 dimensions for both a therapist and patient during a psychotherapy session.
 
-Context: During this speech turn (from {start_sec:.1f}s to {end_sec:.1f}s), the {speaker_role} said:
+Context: During this speech turn (from {start_sec:.1f}s to {end_sec:.1f}s), the summary of what was said is:
 "{original_summary}"
 
 Your task is to describe the associations between what was said and the facial expressions.
@@ -120,9 +131,25 @@ Instructions:
             all_stds.append(stats["std"])
             all_labels.append(f"patient for {au_name}")
 
-        series = torch.tensor(all_signals, dtype=torch.float32)
+        # Pad sequences to the same length within each speech turn.
+        # This is necessary because therapist and patient AU sequences may have slightly 
+        # different lengths (e.g., 662 vs 659 frames) due to timing differences.
+        # We use forward-fill (repeat last value) to ensure all signals have identical
+        # length for tensor creation while preserving signal characteristics.
+        max_length = max(len(sig) for sig in all_signals)
+        padded_signals = []
+        for signal in all_signals:
+            if len(signal) < max_length:
+                # Pad with the last value (forward fill)
+                padded = signal + [signal[-1]] * (max_length - len(signal))
+            else:
+                padded = signal
+            padded_signals.append(padded)
         
-        # Check for invalid data (from HAR)
+        # Create tensor from padded signals
+        series = torch.tensor(padded_signals, dtype=torch.float32)
+        
+        # Check for invalid data before normalization
         if torch.isnan(series).any() or torch.isinf(series).any():
             print(f"❌ Invalid data detected in Psychotherapy CoT sample")
             print(f"Row keys: {row.keys()}")
@@ -131,7 +158,32 @@ Instructions:
             print(f"Inf positions: {torch.isinf(series).nonzero()}")
             raise ValueError("Invalid data detected")
         
-        # Create prompts (one per AU, properly normalized)
+        # Normalize the tensor using torch operations (matching HAR CoT approach)
+        # Note: We use the pre-computed means and stds from the loader for consistency
+        # with the original (unpadded) data statistics
+        means_tensor = torch.tensor(all_means, dtype=torch.float32).unsqueeze(1)
+        stds_tensor = torch.tensor(all_stds, dtype=torch.float32).unsqueeze(1)
+        
+        # Clamp stds to avoid division by zero (matching HAR CoT)
+        min_std = 1e-8
+        stds_tensor = torch.clamp(stds_tensor, min=min_std)
+        
+        # Normalize: (x - mean) / std
+        series_norm = (series - means_tensor) / stds_tensor
+        
+        # Check for invalid data after normalization
+        if torch.isnan(series_norm).any() or torch.isinf(series_norm).any():
+            print(f"❌ NaN/Inf detected after normalization")
+            print(f"Original series shape: {series.shape}")
+            print(f"Means: {means_tensor.squeeze()}")
+            print(f"Stds: {stds_tensor.squeeze()}")
+            print(f"Normalized series: {series_norm}")
+            print(f"NaN positions: {torch.isnan(series_norm).nonzero()}")
+            print(f"Inf positions: {torch.isinf(series_norm).nonzero()}")
+            raise ValueError("NaN/Inf detected after normalization")
+        
+        # Create prompts (one per AU, using normalized tensor data)
+        # Following HAR CoT pattern: convert normalized tensor to list
         prompts = []
         au_idx = 0
         
@@ -139,12 +191,9 @@ Instructions:
         for au_name in au_cols:
             mean = all_means[au_idx]
             std = all_stds[au_idx]
-            time_series = all_signals[au_idx]
+            normalized_series = series_norm[au_idx].tolist()  # Convert tensor to list
             
-            # Normalize: (x - mean) / std
-            normalized_series = [(val - mean) / (std + 1e-8) for val in time_series]
-            
-            text_prompt = f"Facial AU activation for {au_name} (therapist)"
+            text_prompt = f"Facial AU activation for {au_name} (therapist), it has mean {mean:.4f} and std {std:.4f}:"
             prompts.append(TextTimeSeriesPrompt(text_prompt, normalized_series))
             au_idx += 1
         
@@ -152,12 +201,9 @@ Instructions:
         for au_name in au_cols:
             mean = all_means[au_idx]
             std = all_stds[au_idx]
-            time_series = all_signals[au_idx]
+            normalized_series = series_norm[au_idx].tolist()  # Convert tensor to list
             
-            # Normalize: (x - mean) / std
-            normalized_series = [(val - mean) / (std + 1e-8) for val in time_series]
-            
-            text_prompt = f"Facial AU activation for {au_name} (patient)"
+            text_prompt = f"Facial AU activation for {au_name} (patient), it has mean {mean:.4f} and std {std:.4f}:"
             prompts.append(TextTimeSeriesPrompt(text_prompt, normalized_series))
             au_idx += 1
         
@@ -179,12 +225,8 @@ Instructions:
 
 # Test the dataset
 if __name__ == "__main__":
-    dataset = PsychotherapyCoTQADataset(split="train", EOS_TOKEN=";", max_samples=5)
-    dataset_val = PsychotherapyCoTQADataset(split="validation", EOS_TOKEN=";", max_samples=5)
-    dataset_test = PsychotherapyCoTQADataset(split="test", EOS_TOKEN=";", max_samples=5)
-    
-    print(f"Dataset sizes: Train: {len(dataset)}, Validation: {len(dataset_val)}, Test: {len(dataset_test)}")
-    
+    dataset = PsychotherapyCoTQADataset(split="train", EOS_TOKEN=";", max_samples=5)    
+    print(len(dataset))
     # Show sample data
     if len(dataset) > 0:
         print("\n" + "="*50 + "\n")
@@ -196,5 +238,9 @@ if __name__ == "__main__":
         print("Interview type:", sample.get("interview_type"))
         print("Window:", f"{sample.get('window_start'):.2f}s - {sample.get('window_end'):.2f}s")
         print("Answer", sample.get("answer"))
-        print(sample["time_series_text"])
-        #print(sample["time_series"][0])
+        print(sample["time_series_text"][0])
+        print(sample["time_series"][0])
+        print(sample["time_series_text"][1])
+        print(sample["time_series"][1])
+  
+

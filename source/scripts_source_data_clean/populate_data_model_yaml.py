@@ -292,7 +292,7 @@ def pick_answer_for_type(base_id: str, answers_dir: Path, type_name: str, *, ans
 			n,
 		)
 
-	# Tiered filtering
+	# Tiered filtering - require type-specific match
 	tier1 = [p for p in cands if any(t in p.name.lower() for t in prim)]
 	if tier1:
 		return sorted(tier1, key=score, reverse=True)[0]
@@ -300,8 +300,9 @@ def pick_answer_for_type(base_id: str, answers_dir: Path, type_name: str, *, ans
 	if tier2:
 		return sorted(tier2, key=score, reverse=True)[0]
 	
-	# If no type-specific match, return first match with base_id
-	return cands[0] if cands else None
+	# CRITICAL: Do NOT return a fallback answer from wrong interview type
+	# Return None if no type-specific match found to avoid data corruption
+	return None
 
 
 def extract_labels_for_row(df: pd.DataFrame, row_idx: int) -> dict:
@@ -388,15 +389,20 @@ def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_di
 		if answers_dir and answers_dir.exists():
 			t_answer = pick_answer_for_type(patient_id, answers_dir, tname, answer_files=answer_files)
 		
-		# Only include this interview type if all three paths are populated
-		if t_of_in and t_of_pr and t_json:
+		# Only include this interview type if all required paths are populated
+		# If answers_dir is provided, answer is required (not optional)
+		required_files = [t_of_in, t_of_pr, t_json]
+		if answers_dir and answers_dir.exists():
+			required_files.append(t_answer)
+		
+		if all(required_files):
 			entry["types"][tname] = {
 				"therapist_openface": str(t_of_in),
 				"patient_openface": str(t_of_pr),
 				"transcript": str(t_json),
 				"labels": labels_map[tname],
 			}
-			# Add answer if found
+			# Add answer (guaranteed to exist at this point if answers_dir provided)
 			if t_answer:
 				entry["types"][tname]["answer"] = str(t_answer)
 
