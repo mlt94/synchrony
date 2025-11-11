@@ -10,8 +10,6 @@ from prompt.text_time_series_prompt import TextTimeSeriesPrompt
 from time_series_datasets.QADataset import QADataset
 from time_series_datasets.psychotherapy.psychotherapy_loader import load_psychotherapy_cot_splits
 
-from IPython import embed
-
 class PsychotherapyCoTQADataset(QADataset):
     """
     Psychotherapy CoT QA Dataset for therapist-patient facial AU time-series.
@@ -44,18 +42,39 @@ class PsychotherapyCoTQADataset(QADataset):
         return train_list, val_list, test_list
 
     def _get_answer(self, row) -> str:
-        """Get the rationale (answer) for the sample."""
-        return row.get("rationale", "")
+        """Get the answer from the answer JSON file (combined_description)."""
+        return row.get("answer", "")
 
     def _get_pre_prompt(self, row) -> str:
-        """Generate the pre-prompt instruction."""
-        return """You are shown a plot of facial Action Unit (AU) activation over time.
+        """Generate the pre-prompt instruction with transcript summary."""
+        speaker_id = row.get("speaker_id", "unknown")
+        start_ms = row.get("start_ms", 0)
+        end_ms = row.get("end_ms", 0)
+        original_summary = row.get("original_summary", "")
+        
+        # Determine speaker role
+        therapist_id = row.get("therapist_id", "")
+        speaker_role = "therapist" if speaker_id == therapist_id else "patient"
+        
+        # Format time in seconds
+        start_sec = start_ms / 1000.0
+        end_sec = end_ms / 1000.0
+        
+        prompt = f"""You are given facial action unit data in 17 dimensions for both a therapist and patient during a psychotherapy session.
 
-Describe the pattern in 1-2 SHORT sentences. Focus ONLY on:
-- Overall variability (flat/stable vs. dynamic/variable)
-- Spike timing (early, middle, late, or distributed)
-- Be specific as to which AU show which specific pattern.
-Be concise. No explanations or speculation."""
+Context: During this speech turn (from {start_sec:.1f}s to {end_sec:.1f}s), the {speaker_role} said:
+"{original_summary}"
+
+Your task is to describe the associations between what was said and the facial expressions.
+Instructions:
+- Begin by describing the speech content very briefly
+- Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones, and dont write what facial movement the AU references.
+- Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
+- Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
+- Write your description as a single, natural paragraph — do not use bullet points, numbered steps, new lines or section headings.
+
+"""
+        return prompt
 
     def _get_post_prompt(self, row) -> str:
         """Generate the post-prompt."""
@@ -64,7 +83,7 @@ Be concise. No explanations or speculation."""
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         """
         Convert the time series data into a list of TextTimeSeriesPrompt objects.
-        Creates one prompt per AU for both therapist and patient, following HAR pattern.
+        Creates one prompt per AU sequence for both therapist and patient, following HAR pattern.
         """
         # Get AU column names
         au_cols = row.get("au_columns", [])
@@ -112,13 +131,35 @@ Be concise. No explanations or speculation."""
             print(f"Inf positions: {torch.isinf(series).nonzero()}")
             raise ValueError("Invalid data detected")
         
-        # Create prompts (one per AU, already normalized in loader)
+        # Create prompts (one per AU, properly normalized)
         prompts = []
-        for label, time_series, mean, std in zip(all_labels, series.tolist(), all_means, all_stds):
-            # Simplified text prompt focusing only on role and AU name
-            role = "therapist" if "therapist" in label else "patient"
-            text_prompt = f"Facial AU activation for {au_cols[0]} ({role})"
-            prompts.append(TextTimeSeriesPrompt(text_prompt, time_series))
+        au_idx = 0
+        
+        # Therapist AUs
+        for au_name in au_cols:
+            mean = all_means[au_idx]
+            std = all_stds[au_idx]
+            time_series = all_signals[au_idx]
+            
+            # Normalize: (x - mean) / std
+            normalized_series = [(val - mean) / (std + 1e-8) for val in time_series]
+            
+            text_prompt = f"Facial AU activation for {au_name} (therapist)"
+            prompts.append(TextTimeSeriesPrompt(text_prompt, normalized_series))
+            au_idx += 1
+        
+        # Patient AUs
+        for au_name in au_cols:
+            mean = all_means[au_idx]
+            std = all_stds[au_idx]
+            time_series = all_signals[au_idx]
+            
+            # Normalize: (x - mean) / std
+            normalized_series = [(val - mean) / (std + 1e-8) for val in time_series]
+            
+            text_prompt = f"Facial AU activation for {au_name} (patient)"
+            prompts.append(TextTimeSeriesPrompt(text_prompt, normalized_series))
+            au_idx += 1
         
         return prompts
 
@@ -132,6 +173,7 @@ Be concise. No explanations or speculation."""
         sample["window_end"] = row["window_end"]
         sample["labels"] = row.get("labels", {})
         sample["baseline"] = row.get("baseline", {})
+        sample["answer"] = row.get("answer", {})
         return sample
 
 
@@ -153,5 +195,6 @@ if __name__ == "__main__":
         print("Therapist ID:", sample.get("therapist_id"))
         print("Interview type:", sample.get("interview_type"))
         print("Window:", f"{sample.get('window_start'):.2f}s - {sample.get('window_end'):.2f}s")
+        print("Answer", sample.get("answer"))
         print(sample["time_series_text"])
         #print(sample["time_series"][0])

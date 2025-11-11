@@ -82,11 +82,16 @@ LABELS_COLUMNS_TO_DROP = [
 ]
 
 
-def load_speaker_imbalance_ids(imbalance_file: Path) -> set[str]:
+def load_speaker_imbalance_ids(imbalance_file: Path, transcript_prefix: Optional[str] = None) -> set[str]:
 	"""Load speaker imbalance file IDs to exclude from transcripts.
 	
 	Returns a set of filenames (e.g., 'A4IK_2024-02-27_Bindung_geschnitten.json')
 	that should be excluded from the data model.
+	
+	Args:
+		imbalance_file: Path to the speaker imbalance file
+		transcript_prefix: Optional prefix used for transcript files (e.g., 'summaries_speaker_turns_results_').
+		                   If provided, strips this prefix from entries in the file.
 	"""
 	if not imbalance_file.exists():
 		print(f"[populate] Warning: speaker imbalance file not found: {imbalance_file}")
@@ -97,9 +102,9 @@ def load_speaker_imbalance_ids(imbalance_file: Path) -> set[str]:
 		for line in f:
 			line = line.strip()
 			if line and not line.startswith("#"):
-				# Remove 'results_' prefix if present
-				if line.startswith("summaries_speaker_turns_results_"):
-					line = line[8:]
+				# Remove transcript prefix if present and specified
+				if transcript_prefix and line.startswith(transcript_prefix):
+					line = line[len(transcript_prefix):]
 				excluded.add(line.lower())
 	
 	print(f"[populate] Loaded {len(excluded)} speaker-imbalanced transcript IDs to exclude")
@@ -181,7 +186,7 @@ def _lower_tokens(tokens: Iterable[str]) -> list[str]:
 	return [t.lower() for t in tokens]
 
 
-def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str, *, transcript_files: Optional[list[Path]] = None, excluded_ids: Optional[set[str]] = None) -> Optional[Path]:
+def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str, *, transcript_files: Optional[list[Path]] = None, excluded_ids: Optional[set[str]] = None, transcript_prefix: Optional[str] = None) -> Optional[Path]:
 	"""Pick the best transcript JSON for a type.
 
 	Priority tiers within files that already contain the base_id:
@@ -192,20 +197,33 @@ def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str
 	
 	Args:
 		excluded_ids: Set of lowercase filenames to exclude (speaker imbalance files)
+		transcript_prefix: Optional prefix pattern for transcript files (e.g., 'summaries_speaker_turns_results_'). 
+		               If None, searches for all .json files.
 	"""
 	type_info = TYPE_TOKEN_MAP[type_name]
 	prim = _lower_tokens(type_info["primary"])
 	alias = _lower_tokens(type_info["aliases"])
 
-	search_space = transcript_files if transcript_files is not None else list(transcripts_dir.rglob("summaries_speaker_turns_results_*.json"))
+	if transcript_files is not None:
+		search_space = transcript_files
+	elif transcript_prefix:
+		search_space = list(transcripts_dir.rglob(f"{transcript_prefix}*.json"))
+	else:
+		search_space = list(transcripts_dir.rglob("*.json"))
 	
 	# Filter out excluded files
 	if excluded_ids:
-		search_space = [
-			p for p in search_space 
-			if p.name.lower() not in excluded_ids 
-			and p.name.lower().replace("summaries_speaker_turns_results_", "") not in excluded_ids
-		]
+		if transcript_prefix:
+			search_space = [
+				p for p in search_space 
+				if p.name.lower() not in excluded_ids 
+				and p.name.lower().replace(transcript_prefix, "") not in excluded_ids
+			]
+		else:
+			search_space = [
+				p for p in search_space 
+				if p.name.lower() not in excluded_ids
+			]
 	
 	cands = [p for p in search_space if base_id.lower() in p.name.lower()]
 	if not cands:
@@ -238,6 +256,52 @@ def pick_transcript_for_type(base_id: str, transcripts_dir: Path, type_name: str
 		return sorted(tier3, key=score, reverse=True)[0]
 	# No fallback: if no type-specific match found, return None
 	return None
+
+
+def pick_answer_for_type(base_id: str, answers_dir: Path, type_name: str, *, answer_files: Optional[list[Path]] = None) -> Optional[Path]:
+	"""Pick the best answer JSON for a type.
+
+	Similar logic to pick_transcript_for_type but for answer files.
+	Searches for files containing the base_id and type tokens.
+	
+	Args:
+		base_id: Patient or therapist ID to search for
+		answers_dir: Directory containing answer JSON files
+		type_name: Interview type (bindung/personal/wunder)
+		answer_files: Pre-indexed list of answer files (optional)
+	"""
+	type_info = TYPE_TOKEN_MAP[type_name]
+	prim = _lower_tokens(type_info["primary"])
+	alias = _lower_tokens(type_info["aliases"])
+
+	search_space = answer_files if answer_files is not None else list(answers_dir.rglob("*.json"))
+	
+	cands = [p for p in search_space if base_id.lower() in p.name.lower()]
+	if not cands:
+		return None
+
+	def score(p: Path) -> tuple[int, int, int, str]:
+		n = p.name.lower()
+		has_id = base_id.lower() in n
+		prim_hits = sum(t in n for t in prim)
+		alias_hits = sum(t in n for t in alias)
+		return (
+			prim_hits,
+			alias_hits,
+			len(n),
+			n,
+		)
+
+	# Tiered filtering
+	tier1 = [p for p in cands if any(t in p.name.lower() for t in prim)]
+	if tier1:
+		return sorted(tier1, key=score, reverse=True)[0]
+	tier2 = [p for p in cands if any(t in p.name.lower() for t in alias)]
+	if tier2:
+		return sorted(tier2, key=score, reverse=True)[0]
+	
+	# If no type-specific match, return first match with base_id
+	return cands[0] if cands else None
 
 
 def extract_labels_for_row(df: pd.DataFrame, row_idx: int) -> dict:
@@ -293,7 +357,7 @@ def extract_labels_for_row(df: pd.DataFrame, row_idx: int) -> dict:
 	}
 
 
-def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_dir: Path, labels_dict: dict, *, of_files: Optional[list[Path]] = None, transcript_files: Optional[list[Path]] = None, excluded_ids: Optional[set[str]] = None) -> dict:
+def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_dir: Path, labels_dict: dict, *, of_files: Optional[list[Path]] = None, transcript_files: Optional[list[Path]] = None, excluded_ids: Optional[set[str]] = None, transcript_prefix: Optional[str] = None, answers_dir: Optional[Path] = None, answer_files: Optional[list[Path]] = None) -> dict:
 	# The base identifier commonly shared across both roles; prefer patient_id for transcripts per user instruction
 	base_id = patient_id if patient_id else therapist_id
 
@@ -317,7 +381,12 @@ def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_di
 
 	for tname in ("bindung", "personal", "wunder"):
 		t_of_in, t_of_pr = pick_openface_for_type(base_id, of_dir, tname, of_files=of_files)
-		t_json = pick_transcript_for_type(patient_id, transcripts_dir, tname, transcript_files=transcript_files, excluded_ids=excluded_ids)
+		t_json = pick_transcript_for_type(patient_id, transcripts_dir, tname, transcript_files=transcript_files, excluded_ids=excluded_ids, transcript_prefix=transcript_prefix)
+		
+		# Pick answer file if answers_dir is provided
+		t_answer = None
+		if answers_dir and answers_dir.exists():
+			t_answer = pick_answer_for_type(patient_id, answers_dir, tname, answer_files=answer_files)
 		
 		# Only include this interview type if all three paths are populated
 		if t_of_in and t_of_pr and t_json:
@@ -327,6 +396,9 @@ def build_entry(therapist_id: str, patient_id: str, of_dir: Path, transcripts_di
 				"transcript": str(t_json),
 				"labels": labels_map[tname],
 			}
+			# Add answer if found
+			if t_answer:
+				entry["types"][tname]["answer"] = str(t_answer)
 
 	return entry
 
@@ -350,7 +422,19 @@ def main(argv: list[str] | None = None) -> int:
 		"--transcripts_dir",
 		type=Path,
 		default=Path("C:/Users/User/Desktop/martins/output_files"),
-		help="Directory containing results_*.json transcripts (searched recursively)",
+		help="Directory containing transcript JSON files (searched recursively)",
+	)
+	parser.add_argument(
+		"--transcript_prefix",
+		type=str,
+		default=None,
+		help="Optional prefix pattern for transcript JSON files (e.g., 'summaries_speaker_turns_results_'). If not provided, searches for all .json files.",
+	)
+	parser.add_argument(
+		"--answer_dir",
+		type=Path,
+		default=None,
+		help="Optional directory containing answer JSON files. If provided, answer files will be matched and added to each interview type.",
 	)
 	parser.add_argument(
 		"--output_yaml",
@@ -378,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
 		return 1
 
 	# Load speaker imbalance IDs to exclude
-	excluded_ids = load_speaker_imbalance_ids(args.speaker_imbalance_file)
+	excluded_ids = load_speaker_imbalance_ids(args.speaker_imbalance_file, args.transcript_prefix)
 
 	# Resolve OpenFace directories list
 	of_dirs: list[Path] = []
@@ -397,7 +481,19 @@ def main(argv: list[str] | None = None) -> int:
 			for p in d.rglob("*.csv"):
 				of_files_set.add(p.resolve())
 	of_files = sorted(of_files_set)
-	transcript_files = list(args.transcripts_dir.rglob("summaries_speaker_turns_results_*.json")) if args.transcripts_dir.exists() else []
+	if args.transcripts_dir.exists():
+		if args.transcript_prefix:
+			transcript_files = list(args.transcripts_dir.rglob(f"{args.transcript_prefix}*.json"))
+		else:
+			transcript_files = list(args.transcripts_dir.rglob("*.json"))
+	else:
+		transcript_files = []
+	
+	# Pre-index answer files if answer_dir is provided
+	answer_files = []
+	if args.answer_dir and args.answer_dir.exists():
+		answer_files = list(args.answer_dir.rglob("*.json"))
+		print(f"[populate] Found {len(answer_files)} answer files in {args.answer_dir}")
 
 	interviews: list[dict] = []
 	for idx, (therapist_id, patient_id) in enumerate(pairs):
@@ -413,6 +509,9 @@ def main(argv: list[str] | None = None) -> int:
 			of_files=of_files,
 			transcript_files=transcript_files,
 			excluded_ids=excluded_ids,
+			transcript_prefix=args.transcript_prefix,
+			answers_dir=args.answer_dir,
+			answer_files=answer_files if answer_files else None,
 		)
 		interviews.append(entry)
 
