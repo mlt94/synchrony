@@ -254,7 +254,9 @@ def generate_description_with_llava(model, processor, device, image_path: Path, 
     pre_prompt = """Describe these AU heatmaps (left=therapist blue, right=client orange). 
 Each row is one AU across 8 time bins. Write one compact sentence per AU, commenting on therapist and client pattern, including notable differences.
 Format: "AU##: therapist [pattern], client [pattern], [key difference]."
-No markdown, bullets, or headers. ONLY output your description."""
+No markdown, bullets, or headers. ONLY output your description. 
+Make sure to comment on BOTH therapist and client, highligting the salient pattern for each. 	
+"""
     
     au_list = ", ".join(au_names)
     context = f"""Turn {turn['turn_index']} ({turn['speaker_id']}), {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
