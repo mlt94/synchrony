@@ -196,7 +196,7 @@ def generate_plot_for_turn(
         ax2.set_yticks(range(len(au_names)))
         ax2.set_yticklabels(au_names, fontsize=11)
         ax2.set_xticks(range(num_bins))
-        ax2.set_xticklabels(['Start', 'Early', 'Early-Mid', 'Mid', 'Mid-Late', 'Late', 'Late', 'End'][:num_bins], 
+        ax2.set_xticklabels(['Start', 'Early', 'Early-Mid', 'Mid', 'Mid-Late', 'Late', 'Very Late', 'End'][:num_bins], 
                             fontsize=9, rotation=45, ha='right')
         
         # Add colorbar for client
@@ -228,11 +228,10 @@ def generate_plot_for_turn(
 def generate_description_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
     """Generate time-series description using the Gemma-3 pipeline."""
     
-    # Optimized: Much more concise prompt to reduce generation time
-    pre_prompt = """Analyze these AU heatmaps (left=therapist blue, right=client orange). 
+    pre_prompt = """Describe these AU heatmaps (left=therapist blue, right=client orange). 
 Each row is one AU across 8 time bins. Write one compact sentence per AU comparing patterns.
-Format: "AU##: Therapist [pattern], Client [pattern], [key difference]."
-No markdown, bullets, or headers."""
+Format: "AU##: therapist [pattern], client [pattern], [key difference]."
+No markdown, bullets, or headers. ONLY output your description."""
     
     au_list = ", ".join(au_names)
     context = f"""Turn {turn['turn_index']} ({turn['speaker_id']}), {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
@@ -358,7 +357,7 @@ def process_interview(
             "start_ms": turn['start_ms'],
             "end_ms": turn['end_ms'],
             "duration_ms": turn['end_ms'] - turn['start_ms'],
-            "generated_rationale": description,  # NOTE: Key name kept as 'generated_rationale' for backward compatibility with existing JSON files
+            "generated_descriptions": description,  
             "plot_path": str(plot_path)
         }
         results.append(result)
@@ -493,5 +492,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print("MARTIN, when you are running this again, please remember to change the rationale key to description for alignment")
     main()

@@ -740,7 +740,7 @@ class CurriculumTrainer:
         test_loss = 0.0
 
         # Set higher max_tokens for generation during evaluation
-        max_new_tokens = 2000
+        max_new_tokens = 250
 
         # Prepare per-rank streaming writer for test predictions
         results_file_rank = os.path.join(
@@ -780,13 +780,25 @@ class CurriculumTrainer:
 
                     # Collect results
                     for sample, pred in zip(batch, predictions):
-                        result = {
-                            "pre_prompt": sample["pre_prompt"],
-                            "time_series_text": sample["time_series_text"],
-                            "post_prompt": sample["post_prompt"],
-                            "generated": pred,
-                            "gold": sample["answer"],
-                        }
+                        # For stage6_synchrony_cot, also display some metadata
+                        if stage == "stage6_synchrony_cot":
+                            result = {
+                                "patient_id": sample.get("patient_id"),
+                                "therapist_id": sample.get("therapist_id"),
+                                "interview_type": sample.get("interview_type"),
+                                "turn_index": sample.get("turn_index"),
+                                "generated": pred,
+                                "gold": sample["answer"]
+                            }
+                        else:
+                            # For other stages, keep the original format
+                            result = {
+                                "generated": pred,
+                                "gold": sample["answer"],
+                                "pre_prompt": sample["pre_prompt"],
+                                "time_series_text": sample["time_series_text"],
+                                "post_prompt": sample["post_prompt"]
+                            }
 
                         # Add time series ID for stage2 captioning
                         if stage == "stage2_captioning" and "id" in sample:
@@ -1161,6 +1173,11 @@ class CurriculumTrainer:
                     scheduler.step()
 
                     running_loss += loss.item()
+                    
+                    # Clear cache periodically to prevent memory fragmentation
+                    if i % 100 == 0:
+                        torch.cuda.empty_cache()
+                    
                     if self.rank == 0:
                         prog.set_postfix(
                             loss=f"{loss.item():.4f}",
@@ -1452,7 +1469,7 @@ class CurriculumTrainer:
         """Stage 6: Chain-of-Thought Reasoning (Psychotherapy Synchrony).
 
         Configuration:
-        - Epochs: 60
+        - Epochs: 30
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Test loss only (chain-of-thought reasoning)
@@ -1463,7 +1480,7 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage6_synchrony_cot",
             dataset_class=PsychotherapyCoTQADataset,
-            num_epochs=60,
+            num_epochs=30,
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,

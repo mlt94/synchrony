@@ -551,6 +551,37 @@ def _extract_single_window(
         print(f"[error] Failed to extract patient AUs for {desc_entry['patient_id']} ({desc_entry['interview_type']}): {e}")
         return None
     
+    # Check time series length and truncate if necessary to maintain model compatibility
+    # Max patches = 10400, so max time series length = 10400
+    MAX_SUPPORTED_LENGTH = 10400
+    
+    # Get the length of the first AU (all AUs should have same length)
+    sample_au = list(therapist_au_vectors.values())[0] if therapist_au_vectors else []
+    actual_length = len(sample_au)
+    
+    if actual_length > MAX_SUPPORTED_LENGTH:
+        print(f"⚠️  WARNING: Time series length {actual_length} exceeds maximum {MAX_SUPPORTED_LENGTH}")
+        print(f"   Patient: {desc_entry['patient_id']}, Therapist: {desc_entry['therapist_id']}")
+        print(f"   Interview: {desc_entry['interview_type']}, Turn: {desc_entry['turn_index']}")
+        print(f"   Time window: {desc_entry['start_ms']}ms - {desc_entry['end_ms']}ms ({(desc_entry['end_ms'] - desc_entry['start_ms'])/1000:.1f}s)")
+        print(f"   Truncating all AU vectors to {MAX_SUPPORTED_LENGTH} frames")
+        
+        # Truncate all therapist AU vectors
+        for au_col in therapist_au_vectors:
+            therapist_au_vectors[au_col] = therapist_au_vectors[au_col][:MAX_SUPPORTED_LENGTH]
+            # Recalculate stats on truncated data
+            truncated_signal = np.array(therapist_au_vectors[au_col])
+            therapist_au_stats[au_col]["mean"] = float(truncated_signal.mean())
+            therapist_au_stats[au_col]["std"] = float(truncated_signal.std())
+        
+        # Truncate all patient AU vectors
+        for au_col in patient_au_vectors:
+            patient_au_vectors[au_col] = patient_au_vectors[au_col][:MAX_SUPPORTED_LENGTH]
+            # Recalculate stats on truncated data
+            truncated_signal = np.array(patient_au_vectors[au_col])
+            patient_au_stats[au_col]["mean"] = float(truncated_signal.mean())
+            patient_au_stats[au_col]["std"] = float(truncated_signal.std())
+    
     # Get the transcript summary from the turn description
     # This provides context about what was said during this speech turn
     original_summary = desc_entry.get('original_summary', desc_entry.get('summary', ''))

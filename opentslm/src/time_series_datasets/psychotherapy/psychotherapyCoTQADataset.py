@@ -66,12 +66,16 @@ class PsychotherapyCoTQADataset(QADataset):
         start_ms = row.get("start_ms", 0)
         end_ms = row.get("end_ms", 0)
         original_summary = row.get("original_summary", "")
+        au_cols = row.get("au_columns", [])
        
         # Format time in seconds
         start_sec = start_ms / 1000.0
         end_sec = end_ms / 1000.0
         
-        prompt = f"""You are given facial action unit data in 17 dimensions for both a therapist and patient during a psychotherapy session.
+        # Create a list of available AUs for the model to reference
+        au_list = ", ".join(au_cols)
+        
+        prompt = f"""You are given facial action unit time-series data for both a therapist and patient during a psychotherapy session. The following {len(au_cols)} Action Units are provided as input: {au_list}.
 
 Context: During this speech turn (from {start_sec:.1f}s to {end_sec:.1f}s), the summary of what was said is:
 "{original_summary}"
@@ -79,7 +83,8 @@ Context: During this speech turn (from {start_sec:.1f}s to {end_sec:.1f}s), the 
 Your task is to describe the associations between what was said and the facial expressions.
 Instructions:
 - Begin by describing the speech content very briefly
-- Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones, and dont write what facial movement the AU references.
+- Then briefly note any salient facial Action Units (AUs) that stand out — you may reference any of the {len(au_cols)} available AUs in the time-series data, but only mention the most relevant ones (typically 3-6 AUs)
+- Do not write what facial movement each AU references, just note the AU number and its pattern
 - Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
 - Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
 - Write your description as a single, natural paragraph — do not use bullet points, numbered steps, new lines or section headings.
@@ -136,7 +141,9 @@ Instructions:
         # different lengths (e.g., 662 vs 659 frames) due to timing differences.
         # We use forward-fill (repeat last value) to ensure all signals have identical
         # length for tensor creation while preserving signal characteristics.
+        # Note: Length check and truncation for MAX_SUPPORTED_LENGTH happens in the loader
         max_length = max(len(sig) for sig in all_signals)
+        
         padded_signals = []
         for signal in all_signals:
             if len(signal) < max_length:
@@ -215,6 +222,7 @@ Instructions:
         sample["patient_id"] = row["patient_id"]
         sample["therapist_id"] = row["therapist_id"]
         sample["interview_type"] = row["interview_type"]
+        sample["turn_index"] = row.get("turn_index")
         sample["window_start"] = row["window_start"]
         sample["window_end"] = row["window_end"]
         sample["labels"] = row.get("labels", {})
