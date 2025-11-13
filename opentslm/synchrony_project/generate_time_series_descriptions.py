@@ -1,17 +1,27 @@
 """
-Generate time-series descriptions using the Gemma-3 multimodal pipeline.
+Generate time-series descriptions using LLaVA multimodal model (optimized for RTX 4070 12GB).
 This is the first out of two-steps to create comparable "rationales" as the OpenTSLM paper have.
-In this step, we give a Gemma-3 a heatmap of action unit time series, and simply asks it to describe it.
+In this step, we give LLaVA a heatmap of action unit time series, and simply asks it to describe it.
 Its akin to what the opentslm authors did with gpt-4o.
 
 The next step is to combine these descriptions with the transcripts to form coherent rationales or descriptions,
 as I like to call them (see combine_transcripts_with_time_series_descriptions.py for this)
 
+MODEL CHOICE for RTX 4070 (12GB VRAM):
+- Using: llava-hf/llava-1.5-13b-hf (~13B params, ~10-11GB VRAM, better quality)
+- Alternative options if needed:
+  * llava-hf/llava-1.5-7b-hf (7B params, ~8-9GB VRAM, more headroom)
+  * llava-hf/bakllava-v1-hf (7B params, similar to 1.5-7b)
+- NOT recommended for 12GB: Models >13B will cause OOM errors
+
+INSTALLATION:
+pip install transformers torch torchvision pillow accelerate
+
 This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
 3. Generates 4 subplots (2x2) with therapist and client AUs overlaid
-4. Feeds plots into Gemma-3 27b-it for description generation
+4. Feeds plots into LLaVA-1.5-7B for description generation (fits in 12GB VRAM)
 """
 
 import sys
@@ -26,7 +36,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from transformers import pipeline
+from transformers import AutoProcessor, LlavaForConditionalGeneration
+from PIL import Image
 import yaml
 
 # Add OpenTSLM src to path
@@ -225,11 +236,23 @@ def generate_plot_for_turn(
         return False
 
 
-def generate_description_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
-    """Generate time-series description using the Gemma-3 pipeline."""
+def generate_description_with_llava(model, processor, device, image_path: Path, turn: Dict, au_names: List[str]) -> str:
+    """Generate time-series description using LLaVA model.
+    
+    Args:
+        model: LLaVA model
+        processor: LLaVA processor for image/text
+        device: torch device
+        image_path: Path to the heatmap image
+        turn: Turn dict with metadata
+        au_names: List of AU names being analyzed
+    
+    Returns:
+        Generated description text
+    """
     
     pre_prompt = """Describe these AU heatmaps (left=therapist blue, right=client orange). 
-Each row is one AU across 8 time bins. Write one compact sentence per AU comparing patterns.
+Each row is one AU across 8 time bins. Write one compact sentence per AU, commenting on therapist and client pattern, including notable differences.
 Format: "AU##: therapist [pattern], client [pattern], [key difference]."
 No markdown, bullets, or headers. ONLY output your description."""
     
@@ -238,39 +261,43 @@ No markdown, bullets, or headers. ONLY output your description."""
 AUs: {au_list}
 Description:"""
     
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "url": str(image_path)},
-                {"type": "text", "text": f"{pre_prompt}\n\n{context}"}
-            ]
-        }
-    ]
+    # Construct LLaVA prompt format
+    prompt = f"USER: <image>\n{pre_prompt}\n\n{context}\nASSISTANT:"
     
     try:
-        # Optimized: Reduced max_new_tokens from 150 to 80 (4 AUs × ~20 tokens each)
-        # Removed temperature parameter (do_sample=False already ensures deterministic output)
-        output = pipe(
-            text=messages,
-            max_new_tokens=80,
-            do_sample=False
-        )
-        description = output[0]["generated_text"][-1]["content"].strip()
+        # Load and process image
+        image = Image.open(image_path).convert('RGB')
         
-        # Optimized: Minimal post-processing - remove only essential unwanted elements
-        # Remove common prefixes
-        if description.lower().startswith(("here's", "here is", "the patterns")):
-            if ':' in description[:50]:
-                description = description.split(':', 1)[1].lstrip()
+        # Process inputs
+        inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
         
-        # Remove markdown and normalize whitespace
+        # Generate with optimized settings for 4070
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=100,
+                do_sample=False,
+                temperature=None,
+                top_p=None
+            )
+        
+        # Decode output
+        output_text = processor.decode(output_ids[0], skip_special_tokens=True)
+        
+        # Extract only the assistant's response (after "ASSISTANT:")
+        if "ASSISTANT:" in output_text:
+            description = output_text.split("ASSISTANT:")[-1].strip()
+        else:
+            description = output_text.strip()
+        
+        # Clean up formatting
         import re
         description = description.replace('**', '').replace('*', '')
         description = description.replace('\n', ' ')
         description = re.sub(r'\s+', ' ', description).strip()
         
         return description
+        
     except Exception as e:
         print(f"❌ Error generating description: {e}")
         return f"Error: {str(e)}"
@@ -279,7 +306,9 @@ Description:"""
 def process_interview(
     interview: Dict,
     interview_type: str,
-    pipe,
+    model,
+    processor,
+    device,
     output_dir: Path,
     au_names: List[str],
     max_turns: int = None
@@ -289,7 +318,9 @@ def process_interview(
     Args:
         interview: Interview dict from data_model.yaml
         interview_type: One of 'bindung', 'personal', 'wunder'
-        pipe: Gemma-3 pipeline
+        model: LLaVA model
+        processor: LLaVA processor
+        device: torch device
         output_dir: Directory to save plots and results
         au_names: List of AU names to analyze
         max_turns: Maximum number of turns to process (None = all)
@@ -345,7 +376,7 @@ def process_interview(
             continue
         
         # Generate description
-        description = generate_description_with_pipeline(pipe, plot_path, turn, au_names)
+        description = generate_description_with_llava(model, processor, device, plot_path, turn, au_names)
         
         # Collect result
         result = {
@@ -365,20 +396,34 @@ def process_interview(
     return results
 
 
-def save_results(results: List[Dict[str, Any]], output_path: Path):
-    """Save the generated time-series descriptions to JSON."""
-    print(f"\n💾 Saving {len(results)} results to {output_path}...")
-    with open(output_path, 'w') as f:
+def save_results(results: List[Dict[str, Any]], output_path: Path, append: bool = False):
+    """Save the generated time-series descriptions to JSON.
+    
+    Args:
+        results: List of result dicts to save
+        output_path: Path to output JSON file
+        append: If True, append to existing file; if False, overwrite
+    """
+    if append and output_path.exists():
+        # Load existing data and append new results
+        with open(output_path, 'r', encoding='utf-8') as f:
+            existing_results = json.load(f)
+        results = existing_results + results
+        print(f"\n💾 Appending {len(results) - len(existing_results)} new results to {output_path}...")
+    else:
+        print(f"\n💾 Saving {len(results)} results to {output_path}...")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2)
-    print(f"✅ Results saved")
+    print(f"✅ Results saved (total: {len(results)} turns)")
     
     if results:
         avg_duration = np.mean([r['duration_ms'] for r in results])
-        avg_description_len = np.mean([len(r['generated_rationale']) for r in results])
-        print(f"\n📊 Summary:")
-        print(f"  Total turns processed: {len(results)}")
-        print(f"  Average turn duration: {avg_duration:.0f}ms")
-        print(f"  Average description length: {avg_description_len:.0f} characters")
+        avg_description_len = np.mean([len(r['generated_descriptions']) for r in results])
+        print(f"📊 Summary:")
+        print(f"  Total turns: {len(results)}")
+        print(f"  Avg duration: {avg_duration:.0f}ms")
+        print(f"  Avg description length: {avg_description_len:.0f} chars")
 
 
 def main():
@@ -424,7 +469,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting AU time-series description generation with Gemma-3 multimodal pipeline")
+    print("🚀 Starting AU time-series description generation with LLaVA-1.5-13B")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
@@ -444,19 +489,27 @@ def main():
     if args.max_interviews:
         interviews = interviews[:args.max_interviews]
     
-    # Initialize Gemma-3 pipeline
-    print(f"\n🔧 Loading Gemma-3-27b-it model...")
-    pipe = pipeline(
-        "image-text-to-text",
-        model="google/gemma-3-27b-it",
-        device=device,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32
+    # Initialize LLaVA model (optimized for RTX 4070 12GB)
+    print(f"\n🔧 Loading LLaVA-1.5-13B model (optimized for 12GB VRAM)...")
+    model_id = "llava-hf/llava-1.5-13b-hf"
+    
+    # Load model with memory optimization
+    model = LlavaForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        device_map="auto",
+        low_cpu_mem_usage=True
     )
-    print("✅ Model loaded")
+    
+    processor = AutoProcessor.from_pretrained(model_id)
+    
+    print("✅ Model loaded successfully")
+    print(f"   Model size: ~13B parameters")
+    print(f"   VRAM usage: ~10-11GB (fits in 12GB with ~1-2GB headroom)")
+    print(f"   Quality: Better than 7B model for complex vision-language tasks")
     
     # Process all interviews
     all_results = []
-    results_by_dyad_type = {}  # Store results grouped by (patient_id, interview_type)
     
     for interview_idx, interview in enumerate(interviews):
         patient_id = interview['patient']['patient_id']
@@ -470,25 +523,25 @@ def main():
             results = process_interview(
                 interview,
                 interview_type,
-                pipe,
+                model,
+                processor,
+                device,
                 args.output_dir,
                 args.au_columns,
                 max_turns=args.max_turns_per_interview
             )
-            all_results.extend(results)
             
-            # Group by (patient_id, interview_type)
-            key = (patient_id, interview_type)
-            if key not in results_by_dyad_type:
-                results_by_dyad_type[key] = []
-            results_by_dyad_type[key].extend(results)
+            # Save immediately after processing this interview type
+            if results:
+                output_json = args.output_dir / f"{patient_id}_{interview_type}_descriptions.json"
+                save_results(results, output_json, append=False)
+                all_results.extend(results)
+            else:
+                print(f"⚠️ No results generated for {patient_id} {interview_type}")
     
-    # Save results per dyad and interview type
-    for (dyad_id, interview_type), dyad_results in results_by_dyad_type.items():
-        output_json = args.output_dir / f"{dyad_id}_{interview_type}_descriptions.json"
-        save_results(dyad_results, output_json)
-    
-    print(f"\n✅ Complete! Generated time-series descriptions for {len(all_results)} speech turns across {len(results_by_dyad_type)} dyad-interview combinations")
+    print(f"\n{'='*80}")
+    print(f"✅ Complete! Generated time-series descriptions for {len(all_results)} speech turns")
+    print(f"{'='*80}")
 
 
 if __name__ == "__main__":
