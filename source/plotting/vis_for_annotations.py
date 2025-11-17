@@ -172,12 +172,18 @@ def generate_heatmap_figure(
         therapist_heatmap[i, :] = bin_time_series(therapist_data, au_name, num_bins)
         client_heatmap[i, :] = bin_time_series(patient_data, au_name, num_bins)
     
-    # Create figure - stacked vertically for landscape layout
-    height = max(36, len(au_names) * 0.5)  # Scale height with number of AUs
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(32, height))  # Stacked vertically, wider
+
+    height = max(55.2, len(au_names) * 10)  # Scale height with number of AUs
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(48, height))  # Stacked vertically, wider
     
     vmin = min(therapist_heatmap.min(), client_heatmap.min())
     vmax = max(therapist_heatmap.max(), client_heatmap.max())
+    
+    # Calculate time bin labels (in seconds, absolute time from recording start)
+    start_s = start_ms / 1000.0
+    end_s = end_ms / 1000.0
+    bin_edges_abs_s = np.linspace(start_s, end_s, num_bins + 1)
+    bin_labels = [f"{bin_edges_abs_s[i]:.0f}-{bin_edges_abs_s[i+1]:.0f}s" for i in range(num_bins)]
     
     # Therapist heatmap (TOP)
     im1 = ax1.imshow(therapist_heatmap, aspect='auto', cmap='Blues', 
@@ -188,8 +194,7 @@ def generate_heatmap_figure(
     ax1.set_yticks(range(len(au_names)))
     ax1.set_yticklabels(au_names, fontsize=fontsize)
     ax1.set_xticks(range(num_bins))
-    ax1.set_xticklabels(['Start', 'Early', 'Early Mid', 'Mid', 'Late Mid', 'Late', 'Very Late', 'End'][:num_bins], 
-                        fontsize=fontsize, rotation=45, ha='right')
+    ax1.set_xticklabels(bin_labels, fontsize=fontsize, rotation=45, ha='right')
     
     cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.03, pad=0.04)
     cbar1.ax.tick_params(labelsize=fontsize) 
@@ -210,8 +215,7 @@ def generate_heatmap_figure(
     ax2.set_yticks(range(len(au_names)))
     ax2.set_yticklabels(au_names, fontsize=fontsize)
     ax2.set_xticks(range(num_bins))
-    ax2.set_xticklabels(['Start', 'Early', 'Early Mid', 'Mid', 'Late Mid', 'Late', 'Very Late', 'End'][:num_bins], 
-                        fontsize=fontsize, rotation=45, ha='right')
+    ax2.set_xticklabels(bin_labels, fontsize=fontsize, rotation=45, ha='right')
     
     cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.03, pad=0.04)
     cbar2.ax.tick_params(labelsize=fontsize) 
@@ -221,11 +225,11 @@ def generate_heatmap_figure(
     for i in range(len(au_names)):
         for j in range(num_bins):
             ax2.text(j, i, f'{client_heatmap[i, j]:.2f}',
-                    ha="center", va="center", color="black", fontsize=30)
+                    ha="center", va="center", color="black", fontsize=fontsize)
     
     # Title
     plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)", 
-                 fontsize=17, fontweight='bold', y=0.995)
+                 fontsize=fontsize, fontweight='bold', y=0.995)
     
     plt.tight_layout(rect=[0, 0, 1, 0.99])
     
@@ -254,8 +258,8 @@ def create_annotation_pdf(
         patient_id: Patient ID
         therapist_id: Therapist ID
         interview_type: Interview type
-        turn: Turn dict from transcript
-        prediction: Prediction dict with 'generated' and 'gold' fields
+        turn: Turn dict from transcript (includes 'summary' field)
+        prediction: Prediction dict with 'generated' field
         therapist_csv: Path to therapist OpenFace CSV
         patient_csv: Path to patient OpenFace CSV
         au_names: List of AU names
@@ -292,7 +296,7 @@ def create_annotation_pdf(
         ax_heatmap.axis('off')
         
         # Generate heatmap as separate figure
-        heatmap_fig = generate_heatmap_figure(therapist_csv, patient_csv, turn, au_names, fontsize=40)
+        heatmap_fig = generate_heatmap_figure(therapist_csv, patient_csv, turn, au_names, fontsize=65)
         
         # Convert heatmap figure to image and display in main figure
         import io
@@ -310,7 +314,8 @@ def create_annotation_pdf(
         ax_text = fig.add_subplot(gs[1, 1])
         ax_text.axis('off')
         
-        ground_truth = prediction.get('gold', 'N/A')
+        # Use the summary from the transcript turn as ground truth
+        ground_truth = turn.get('summary', 'N/A')
         model_output = prediction.get('generated', 'N/A')
         
         # Wrap text for readability (shorter width for side column)
