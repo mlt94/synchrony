@@ -209,24 +209,26 @@ Now analyze the AU12 data and write your description:"""
         ts_prompts = []
         
         for au_col in au_columns:
-            # Therapist AU
+            # Therapist AU - match exact training format
             if au_col in therapist_au_vectors:
                 series = therapist_au_vectors[au_col]
                 series = truncate_time_series(series)
                 normalized, mean, std = normalize_time_series(series)
                 
-                ts_text = f"Therapist {au_col.replace('_r', '')} (mean={mean:.3f}, std={std:.3f})"
+                # Use EXACT format from training: "Facial AU activation for {au_name} (therapist), it has mean {mean:.4f} and std {std:.4f}:"
+                ts_text = f"Facial AU activation for {au_col} (therapist), it has mean {mean:.4f} and std {std:.4f}:"
                 ts_prompts.append(TextTimeSeriesPrompt(ts_text, normalized.tolist()))
             else:
                 print(f"⚠️ Missing therapist data for {au_col} in turn {turn['turn_index']}")
             
-            # Patient AU
+            # Patient AU - match exact training format
             if au_col in patient_au_vectors:
                 series = patient_au_vectors[au_col]
                 series = truncate_time_series(series)
                 normalized, mean, std = normalize_time_series(series)
                 
-                ts_text = f"Patient {au_col.replace('_r', '')} (mean={mean:.3f}, std={std:.3f})"
+                # Use EXACT format from training: "Facial AU activation for {au_name} (patient), it has mean {mean:.4f} and std {std:.4f}:"
+                ts_text = f"Facial AU activation for {au_col} (patient), it has mean {mean:.4f} and std {std:.4f}:"
                 ts_prompts.append(TextTimeSeriesPrompt(ts_text, normalized.tolist()))
             else:
                 print(f"⚠️ Missing patient data for {au_col} in turn {turn['turn_index']}")
@@ -244,7 +246,7 @@ Now analyze the AU12 data and write your description:"""
 
         # Generate description with stricter parameters for better instruction following
         # Reduce max_new_tokens to encourage concise output
-        description = model.eval_prompt(prompt, max_new_tokens=100, temperature=0.7)
+        description = model.eval_prompt(prompt, max_new_tokens=100)
         
         # Clean up the output
         description = description.strip()
