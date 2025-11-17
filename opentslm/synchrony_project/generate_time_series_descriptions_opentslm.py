@@ -439,11 +439,10 @@ def main():
     if args.max_interviews:
         interviews = interviews[:args.max_interviews]
     
-    # Load trained OpenTSLM model with gemma_3_270m backbone (same as training)
-    print(f"\n🔧 Loading trained OpenTSLM model with gemma_3_270m backbone...")
+    print(f"\n🔧 Loading trained OpenTSLM model with Llama-3.2-1B backbone...")
     model = OpenTSLMFlamingo(
         device=device,
-        llm_id="google/gemma-3-270m"  # Must match the backbone used during training
+        llm_id="meta-llama/Llama-3.2-1B"  # Must match the backbone used during training
     )
     
     if not args.model_path.exists():
