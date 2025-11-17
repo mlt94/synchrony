@@ -178,19 +178,29 @@ def generate_description_with_opentslm(
         Generated description text
     """
     try:
-        # Build the prompt matching the LLaVA format for consistency
+        # Build the prompt with clear structure and example
         pre_prompt_text = """You are an expert in analyzing facial Action Units (AUs) from psychotherapy sessions. 
-You will receive time series data for AU12 (smile/lip corner puller) from both therapist and patient during a speech turn.
+You will receive time series data for AU12 (smile/lip corner puller) from both therapist and patient.
 
-Describe the AU12 activation patterns. Write one compact sentence commenting on therapist and patient patterns, including notable differences.
-Format: "AU12: therapist [pattern], patient [pattern], [key difference]."
-ONLY output your description. Make sure to comment on BOTH therapist and patient."""
+Task: Describe the AU12 activation pattern in ONE sentence following this EXACT format:
+"AU12: therapist [describe pattern], patient [describe pattern], [note key difference]."
+
+Example: "AU12: therapist shows high activation peaking mid-turn, patient remains consistently low, therapist substantially more activated."
+
+IMPORTANT: 
+- Start with "AU12:"
+- Comment on BOTH therapist and patient
+- Mention temporal patterns (e.g., increasing, decreasing, peaking, stable, high, low)
+- Note the key difference between them
+- ONE sentence only"""
         
         au_list = ", ".join([au.replace('_r', '') for au in au_columns])
         
-        post_prompt_text = f"""Turn {turn['turn_index']} ({turn['speaker_id']}), {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
-AUs: {au_list}
-Description:"""
+        post_prompt_text = f"""
+Speech Turn {turn['turn_index']}: {turn['speaker_id']} speaking
+Time: {turn['start_ms']/1000:.1f}s - {turn['end_ms']/1000:.1f}s
+
+Now analyze the AU12 data and write your description:"""
         
         pre_prompt = TextPrompt(pre_prompt_text)
         post_prompt = TextPrompt(post_prompt_text)
@@ -230,22 +240,33 @@ Description:"""
             print(f"  Pre-prompt length: {len(pre_prompt_text)} chars")
             print(f"  Number of time series: {len(ts_prompts)} (expected: {len(au_columns) * 2})")
             print(f"  Post-prompt: {post_prompt_text[:100]}...")
-            for i, ts_prompt in enumerate(ts_prompts):
-                print(f"  TS {i}: {ts_prompt.text[:80]}...")
-        
-        # Generate description with explicit max_new_tokens
-        # Using 500 tokens which should be ~350-400 words
-        description = model.eval_prompt(prompt, max_new_tokens=500)
+
+
+        # Generate description with stricter parameters for better instruction following
+        # Reduce max_new_tokens to encourage concise output
+        description = model.eval_prompt(prompt, max_new_tokens=100, temperature=0.7)
         
         # Clean up the output
         description = description.strip()
+        
+        # Post-process to ensure format compliance
+        if not description.startswith("AU12:"):
+            # Try to extract AU12 description if model added extra text
+            if "AU12:" in description:
+                description = "AU12:" + description.split("AU12:", 1)[1].split("\n")[0].strip()
+            else:
+                # Prepend AU12: if missing
+                description = f"AU12: {description}"
+        
+        # Take only first sentence if multiple sentences generated
+        if ". " in description:
+            description = description.split(". ")[0] + "."
         
         # Debug: print first generation to check output
         if turn['turn_index'] == 0:
             print(f"\n[DEBUG] Sample generation for turn 0:")
             print(f"  Generated text length: {len(description)} chars")
             print(f"  Full output: '{description}'")
-            print(f"  First 500 chars: {description[:500]}")
         
         return description
         
