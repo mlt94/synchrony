@@ -43,8 +43,8 @@ ALL_AU_COLUMNS = [
     'AU20_r', 'AU23_r', 'AU25_r', 'AU26_r', 'AU45_r'
 ]
 
-# TEST: Use only 4 AUs to match training data (same as LLaVA heatmaps)
-TEST_AU_COLUMNS = ['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r']
+# TEST: Use only 1 AU for maximum simplicity
+TEST_AU_COLUMNS = ['AU12_r']  # Lip corner puller (smile)
 
 
 def setup_device():
@@ -144,7 +144,7 @@ def normalize_time_series(series: np.ndarray) -> tuple[np.ndarray, float, float]
     """
     mean = float(series.mean())
     std = float(series.std())
-    if std > 0:
+    if std > 1e-8:  # Use small epsilon to avoid division by near-zero
         normalized = (series - mean) / std
     else:
         normalized = series - mean
@@ -180,11 +180,11 @@ def generate_description_with_opentslm(
     try:
         # Build the prompt matching the LLaVA format for consistency
         pre_prompt_text = """You are an expert in analyzing facial Action Units (AUs) from psychotherapy sessions. 
-You will receive time series data for AUs from both therapist and patient during a speech turn.
+You will receive time series data for AU12 (smile/lip corner puller) from both therapist and patient during a speech turn.
 
-Describe the AU patterns. Write one compact sentence per AU, commenting on therapist and client pattern, including notable differences.
-Format: "AU##: therapist [pattern], client [pattern], [key difference]."
-ONLY output your description. Make sure to comment on BOTH therapist and client, highlighting the salient pattern for each."""
+Describe the AU12 activation patterns. Write one compact sentence commenting on therapist and patient patterns, including notable differences.
+Format: "AU12: therapist [pattern], patient [pattern], [key difference]."
+ONLY output your description. Make sure to comment on BOTH therapist and patient."""
         
         au_list = ", ".join([au.replace('_r', '') for au in au_columns])
         
@@ -205,8 +205,10 @@ Description:"""
                 series = truncate_time_series(series)
                 normalized, mean, std = normalize_time_series(series)
                 
-                ts_text = f"Therapist {au_col.replace('_r', '')} (mean={mean:.3f}, std={std:.3f}):"
+                ts_text = f"Therapist {au_col.replace('_r', '')} (mean={mean:.3f}, std={std:.3f})"
                 ts_prompts.append(TextTimeSeriesPrompt(ts_text, normalized.tolist()))
+            else:
+                print(f"⚠️ Missing therapist data for {au_col} in turn {turn['turn_index']}")
             
             # Patient AU
             if au_col in patient_au_vectors:
@@ -214,8 +216,10 @@ Description:"""
                 series = truncate_time_series(series)
                 normalized, mean, std = normalize_time_series(series)
                 
-                ts_text = f"Patient {au_col.replace('_r', '')} (mean={mean:.3f}, std={std:.3f}):"
+                ts_text = f"Patient {au_col.replace('_r', '')} (mean={mean:.3f}, std={std:.3f})"
                 ts_prompts.append(TextTimeSeriesPrompt(ts_text, normalized.tolist()))
+            else:
+                print(f"⚠️ Missing patient data for {au_col} in turn {turn['turn_index']}")
         
         # Build full prompt
         prompt = FullPrompt(pre_prompt, ts_prompts, post_prompt)
@@ -224,8 +228,10 @@ Description:"""
         if turn['turn_index'] == 0:
             print(f"\n[DEBUG] Prompt structure for turn 0:")
             print(f"  Pre-prompt length: {len(pre_prompt_text)} chars")
-            print(f"  Number of time series: {len(ts_prompts)}")
+            print(f"  Number of time series: {len(ts_prompts)} (expected: {len(au_columns) * 2})")
             print(f"  Post-prompt: {post_prompt_text[:100]}...")
+            for i, ts_prompt in enumerate(ts_prompts):
+                print(f"  TS {i}: {ts_prompt.text[:80]}...")
         
         # Generate description with explicit max_new_tokens
         # Using 500 tokens which should be ~350-400 words
