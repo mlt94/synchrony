@@ -8,7 +8,7 @@ from huggingface_hub import hf_hub_download
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "opentslm", "src")))
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from src.model.encoder.CNNTokenizer import CNNTokenizer
+from model.encoder.CNNTokenizer import CNNTokenizer
 from src.prompt.full_prompt import FullPrompt
 from src.prompt.text_prompt import TextPrompt
 
