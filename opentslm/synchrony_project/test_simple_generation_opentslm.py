@@ -164,6 +164,11 @@ def main():
         default=Path("/home/mlut/synchrony/data_model.yaml"),
         help="Path to data_model.yaml"
     )
+    parser.add_argument(
+        "--use_synthetic",
+        action="store_true",
+        help="Use synthetic sine wave instead of real AU12 data"
+    )
     
     args = parser.parse_args()
     
@@ -174,7 +179,10 @@ def main():
     print(f"  Model path: {args.model_path}")
     print(f"  LLM backbone: {args.llm_id}")
     print(f"  Data model: {args.data_model}")
-    print(f"  Test case: A3EY, Bindung, Turn 0, AU12_r (therapist)")
+    if args.use_synthetic:
+        print(f"  Test case: SYNTHETIC sine wave")
+    else:
+        print(f"  Test case: A3EY, Bindung, Turn 0, AU12_r (therapist)")
     print()
     
     # Setup device
@@ -191,65 +199,87 @@ def main():
     model.load_from_file(str(args.model_path))
     print("✅ Model loaded successfully")
     
-    # Load data model
-    data_model = load_data_model(args.data_model)
-    
-    # Find A3EY dyad
-    a3ey_interview = None
-    for interview in data_model['interviews']:
-        if interview['patient']['patient_id'] == 'A3EY':
-            a3ey_interview = interview
-            break
-    
-    if not a3ey_interview:
-        print("❌ Could not find A3EY in data_model.yaml")
-        return 1
-    
-    print(f"\n📋 Found dyad:")
-    print(f"  Patient: {a3ey_interview['patient']['patient_id']}")
-    print(f"  Therapist: {a3ey_interview['therapist']['therapist_id']}")
-    
-    # Get Bindung interview data
-    if 'bindung' not in a3ey_interview['types']:
-        print("❌ Bindung interview not found for A3EY")
-        return 1
-    
-    bindung_data = a3ey_interview['types']['bindung']
-    therapist_csv = Path(bindung_data['therapist_openface'])
-    transcript_json = Path(bindung_data['transcript'])
-    
-    print(f"\n📂 Data paths:")
-    print(f"  Therapist OpenFace: {therapist_csv}")
-    print(f"  Transcript: {transcript_json}")
-    
-    # Load transcript and get turn 0
-    turns = load_speech_turns(transcript_json)
-    if len(turns) == 0:
-        print("❌ No turns found in transcript")
-        return 1
-    
-    turn_0 = turns[0]
-    print(f"\n📝 Turn 0 details:")
-    print(f"  Speaker: {turn_0['speaker_id']}")
-    print(f"  Start: {turn_0['start_ms']:.0f}ms")
-    print(f"  End: {turn_0['end_ms']:.0f}ms")
-    print(f"  Duration: {turn_0['end_ms'] - turn_0['start_ms']:.0f}ms")
-    
-    # Extract AU12_r for therapist
-    print(f"\n⏳ Extracting AU12_r from therapist...")
-    au_series = extract_au_window(
-        therapist_csv,
-        turn_0['start_ms'],
-        turn_0['end_ms'],
-        'AU12_r'
-    )
-    
-    if au_series is None:
-        print("❌ Failed to extract AU12_r data")
-        return 1
-    
-    print(f"✅ Extracted {len(au_series)} frames")
-    print(f"  Raw data range: [{au_series.min():.3f}, {au_series.max():.3f}]")
+    # Generate or load time series data
+    if args.use_synthetic:
+        # Generate simple sine wave
+        print(f"\n🌊 Generating synthetic sine wave...")
+        num_points = 500
+        x = np.linspace(0, 4 * np.pi, num_points)  # 2 complete cycles
+        au_series = np.sin(x).astype(np.float32)
+        
+        print(f"✅ Generated {len(au_series)} points")
+        print(f"  Pattern: Simple sine wave (2 complete cycles)")
+        print(f"  Raw data range: [{au_series.min():.3f}, {au_series.max():.3f}]")
+        
+        # Metadata for prompt
+        turn_info = {
+            'turn_index': 0,
+            'speaker_id': 'synthetic',
+            'start_ms': 0,
+            'end_ms': num_points * 33.33  # ~30fps
+        }
+    else:
+        # Load data model and extract real AU data
+        data_model = load_data_model(args.data_model)
+        
+        # Find A3EY dyad
+        a3ey_interview = None
+        for interview in data_model['interviews']:
+            if interview['patient']['patient_id'] == 'A3EY':
+                a3ey_interview = interview
+                break
+        
+        if not a3ey_interview:
+            print("❌ Could not find A3EY in data_model.yaml")
+            return 1
+        
+        print(f"\n📋 Found dyad:")
+        print(f"  Patient: {a3ey_interview['patient']['patient_id']}")
+        print(f"  Therapist: {a3ey_interview['therapist']['therapist_id']}")
+        
+        # Get Bindung interview data
+        if 'bindung' not in a3ey_interview['types']:
+            print("❌ Bindung interview not found for A3EY")
+            return 1
+        
+        bindung_data = a3ey_interview['types']['bindung']
+        therapist_csv = Path(bindung_data['therapist_openface'])
+        transcript_json = Path(bindung_data['transcript'])
+        
+        print(f"\n📂 Data paths:")
+        print(f"  Therapist OpenFace: {therapist_csv}")
+        print(f"  Transcript: {transcript_json}")
+        
+        # Load transcript and get turn 0
+        turns = load_speech_turns(transcript_json)
+        if len(turns) == 0:
+            print("❌ No turns found in transcript")
+            return 1
+        
+        turn_0 = turns[0]
+        print(f"\n📝 Turn 0 details:")
+        print(f"  Speaker: {turn_0['speaker_id']}")
+        print(f"  Start: {turn_0['start_ms']:.0f}ms")
+        print(f"  End: {turn_0['end_ms']:.0f}ms")
+        print(f"  Duration: {turn_0['end_ms'] - turn_0['start_ms']:.0f}ms")
+        
+        # Extract AU12_r for therapist
+        print(f"\n⏳ Extracting AU12_r from therapist...")
+        au_series = extract_au_window(
+            therapist_csv,
+            turn_0['start_ms'],
+            turn_0['end_ms'],
+            'AU12_r'
+        )
+        
+        if au_series is None:
+            print("❌ Failed to extract AU12_r data")
+            return 1
+        
+        print(f"✅ Extracted {len(au_series)} frames")
+        print(f"  Raw data range: [{au_series.min():.3f}, {au_series.max():.3f}]")
+        
+        turn_info = turn_0
     
     # Truncate if needed
     au_series = truncate_time_series(au_series)
@@ -262,14 +292,25 @@ def main():
     # Build prompt following EXACT OpenTSLM training format
     print(f"\n🎯 Building prompt...")
     
-    pre_prompt_text = """You are an expert in analyzing facial Action Units (AUs) from psychotherapy sessions.
+    if args.use_synthetic:
+        pre_prompt_text = """You are an expert in analyzing time series patterns.
+You will receive a simple sine wave time series.
+
+Task: Describe the pattern you observe in the time series."""
+        
+        post_prompt_text = f"""
+The time series spans {len(normalized)} data points.
+
+Now describe the pattern:"""
+    else:
+        pre_prompt_text = """You are an expert in analyzing facial Action Units (AUs) from psychotherapy sessions.
 You will receive time series data for AU12 (smile/lip corner puller) from the therapist.
 
 Task: Describe the AU12 activation pattern briefly."""
-    
-    post_prompt_text = f"""
-Speech Turn {turn_0['turn_index']}: {turn_0['speaker_id']} speaking
-Time: {turn_0['start_ms']/1000:.1f}s - {turn_0['end_ms']/1000:.1f}s
+        
+        post_prompt_text = f"""
+Speech Turn {turn_info['turn_index']}: {turn_info['speaker_id']} speaking
+Time: {turn_info['start_ms']/1000:.1f}s - {turn_info['end_ms']/1000:.1f}s
 
 Now describe the AU12 activation pattern:"""
     
@@ -278,7 +319,10 @@ Now describe the AU12 activation pattern:"""
     
     # Create time series prompt with EXACT format from training
     # Format: "Facial AU activation for {au_name} (therapist), it has mean {mean:.4f} and std {std:.4f}:"
-    ts_text = f"Facial AU activation for AU12_r (therapist), it has mean {mean:.4f} and std {std:.4f}:"
+    if args.use_synthetic:
+        ts_text = f"Sine wave time series, it has mean {mean:.4f} and std {std:.4f}:"
+    else:
+        ts_text = f"Facial AU activation for AU12_r (therapist), it has mean {mean:.4f} and std {std:.4f}:"
     ts_prompt = TextTimeSeriesPrompt(ts_text, normalized.tolist())
     
     # Build full prompt
