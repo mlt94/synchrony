@@ -1,13 +1,13 @@
 """
 Combine time-series descriptions (AU patterns) with transcript summaries (speech content)
-and BLRI empathy scores using Gemma 7B-it to describe associations.
+and BLRI empathy scores using Gemma 2 27B-it to describe associations.
 
 This script:
 1. Loads data_model.yaml containing interview metadata, transcript paths, and BLRI scores
 2. Loads time-series descriptions from ituhpc_timeseries_rationales/*.json (contains "generated_rationale" key - legacy naming)
 3. Matches entries by patient_id, interview_type, turn_index
 4. Calculates BLRI difference (therapist - client): positive = therapist finds client more empathic
-5. Uses Gemma 7B-it to describe associations between AU patterns, speech content, and BLRI
+5. Uses Gemma 2 27B-it to describe associations between AU patterns, speech content, and BLRI
 6. Saves combined results to output JSON files
 """
 
@@ -210,7 +210,7 @@ Facial Action Unit (AU) patterns: {timeseries_description}
 Instructions:
 - Begin by describing the speech content very briefly
 - Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones.
-- Describe how the speech content and facial expressions might relate to the empathy dynamic between therapist and client.
+- Describe how the speech content and facial expressions might relate to the dynamic between therapist and client.
 - Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
 - Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
 - Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
@@ -431,8 +431,8 @@ def main():
     parser.add_argument( 
         "--model_name",
         type=str,
-        default="google/gemma-7b-it",
-        help="Gemma model to use (default: google/gemma-7b-it)"
+        default="google/gemma-2-27b-it",
+        help="Gemma model to use (default: google/gemma-2-27b-it)"
     )
     parser.add_argument(
         "--max_interviews",
@@ -455,7 +455,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting time-series description + summary + BLRI combination with Gemma 7B-it")
+    print("🚀 Starting time-series description + summary + BLRI combination with Gemma 2 27B-it")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
