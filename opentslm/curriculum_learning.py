@@ -939,6 +939,7 @@ class CurriculumTrainer:
         eval_only: bool = False,
         sampler=None,
         load_from_stage: str = None,  # Optional: override which stage to load from
+        dataset_kwargs: dict = None,  # Optional: additional kwargs for dataset instantiation
     ) -> Dict[str, Any]:
         """Generic training function for any stage."""
         epoch = None
@@ -1039,6 +1040,10 @@ class CurriculumTrainer:
         # Initialize optimizer and scheduler
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
 
+        # Prepare dataset kwargs
+        if dataset_kwargs is None:
+            dataset_kwargs = {}
+
         # Create data loaders
         if sampler is not None:
             if self.world_size > 1:
@@ -1048,7 +1053,9 @@ class CurriculumTrainer:
                 train_loader = self._merge_data_loaders(
                     [
                         dataset_class(
-                            "train", EOS_TOKEN=self._get_model().get_eos_token()
+                            "train", 
+                            EOS_TOKEN=self._get_model().get_eos_token(),
+                            **dataset_kwargs
                         )
                     ],
                     shuffle=True,
@@ -1058,7 +1065,9 @@ class CurriculumTrainer:
                 )
             else:
                 train_dataset = dataset_class(
-                    "train", EOS_TOKEN=self._get_model().get_eos_token()
+                    "train", 
+                    EOS_TOKEN=self._get_model().get_eos_token(),
+                    **dataset_kwargs
                 )
                 train_loader = DataLoader(
                     train_dataset,
@@ -1069,7 +1078,7 @@ class CurriculumTrainer:
                 )
         else:
             train_loader = self._merge_data_loaders(
-                [dataset_class("train", EOS_TOKEN=self._get_model().get_eos_token())],
+                [dataset_class("train", EOS_TOKEN=self._get_model().get_eos_token(), **dataset_kwargs)],
                 shuffle=True,
                 batch_size=batch_size,
                 patch_size=PATCH_SIZE,
@@ -1077,7 +1086,7 @@ class CurriculumTrainer:
             )
 
         val_loader = self._merge_data_loaders(
-            [dataset_class("validation", EOS_TOKEN=self._get_model().get_eos_token())],
+            [dataset_class("validation", EOS_TOKEN=self._get_model().get_eos_token(), **dataset_kwargs)],
             shuffle=False,
             batch_size=1,
             patch_size=PATCH_SIZE,
@@ -1085,7 +1094,7 @@ class CurriculumTrainer:
         )
 
         test_loader = self._merge_data_loaders(
-            [dataset_class("test", EOS_TOKEN=self._get_model().get_eos_token())],
+            [dataset_class("test", EOS_TOKEN=self._get_model().get_eos_token(), **dataset_kwargs)],
             shuffle=False,
             batch_size=1,
             patch_size=PATCH_SIZE,
@@ -1474,6 +1483,7 @@ class CurriculumTrainer:
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Test loss only (chain-of-thought reasoning)
         - Loads from: stage2_captioning (not stage5_ecg_cot)
+        - Features: Only 4 AUs (AU12_r, AU06_r, AU04_r, AU15_r)
         """
         sampler = None
         
@@ -1489,6 +1499,7 @@ class CurriculumTrainer:
             eval_only=eval_only,
             sampler=sampler,
             load_from_stage="stage2_captioning",  # Override to load from stage2
+            dataset_kwargs={'feature_columns': ['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r']}
         )
 
     def run_curriculum(

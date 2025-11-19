@@ -178,7 +178,7 @@ def discretize_blri_difference(blri_diff: float) -> str:
     Returns:
         String label for the empathy category: "equal" or "discrepancy"
     """
-    if -8 <= blri_diff <= 8:
+    if -6 <= blri_diff <= 6:
         return "equally empathic"
     else:
         return "discrepancy"
