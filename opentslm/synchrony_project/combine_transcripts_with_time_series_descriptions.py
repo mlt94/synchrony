@@ -481,22 +481,24 @@ def main():
     
     print(f"\n📊 Processing {len(interviews)} interviews")
     
-    # Load Gemma model
-    print(f"\n🔧 Loading {args.model_name}...")
+    # Load Gemma model with 8-bit quantization to fit in 40GB
+    print(f"\n🔧 Loading {args.model_name} with 8-bit quantization...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto" if device == "cuda" else None,
+        load_in_8bit=True if device == "cuda" else False,  # 8-bit quantization for A100 40GB
         low_cpu_mem_usage=True
     )
     
     if device == "cpu":
         model = model.to(device)
     
-    print(f"✅ Model loaded on {device}")
+    print(f"✅ Model loaded on {device} with 8-bit quantization")
     if device == "cuda":
         print(f"   GPU Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print(f"   Quantization reduces memory from ~54GB to ~27GB")
     
     # Process all interviews
     all_results = []
