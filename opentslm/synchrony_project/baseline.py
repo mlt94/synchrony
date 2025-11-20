@@ -2,12 +2,17 @@
 NO-LEAKAGE Baseline for Stage6 Synchrony Experiments.
 
 This baseline ensures NO label leakage by:
-1. Stage 1: Using Gemma 27B to generate AU descriptions from raw OpenFace data
-   (exactly like generate_time_series_descriptions.py but text-based)
-2. Stage 2: Using Gemma 7B to predict empathy label from AU description + transcript
-   (without ever seeing the ground truth label)
+1. Stage 1: Generate heatmap plots from raw OpenFace AU data → Gemma 3 27B VLM describes them
+   (exactly like generate_time_series_descriptions.py)
+2. Stage 2: Gemma 7B predicts empathy label from AU description + transcript summary
+   (exactly like combine_transcripts_with_time_series_descriptions.py BUT without including the answer label)
 
-This matches the training pipeline but evaluates generalization of text-only models.
+Key differences from training data generation:
+- generate_time_series_descriptions.py: Creates AU descriptions (Stage 1) ✓ REPLICATED
+- combine_transcripts_with_time_series_descriptions.py: Combines AU + transcript BUT includes "Answer: {label}" ✗ EXCLUDED
+- This baseline: Does Stage 1 + Stage 2 but NEVER shows the ground truth label to the model
+
+This ensures fair evaluation: the model predicts without seeing answers.
 """
 
 import sys
@@ -24,6 +29,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from collections import defaultdict
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+import matplotlib.pyplot as plt
+from transformers import pipeline
 import re
 
 
@@ -37,9 +44,9 @@ def setup_device():
     return device
 
 
-def load_model(model_name: str, device: str):
-    """Load Gemma model and tokenizer."""
-    print(f"\n📦 Loading model: {model_name}...")
+def load_text_model(model_name: str, device: str):
+    """Load Gemma text-only model and tokenizer (for Stage 2)."""
+    print(f"\n📦 Loading text model: {model_name}...")
     
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
@@ -65,6 +72,21 @@ def load_model(model_name: str, device: str):
     print(f"✅ Model loaded successfully")
     
     return tokenizer, model
+
+
+def load_vlm_pipeline(model_name: str, device: str):
+    """Load vision-language model pipeline (for Stage 1)."""
+    print(f"\n📦 Loading VLM pipeline: {model_name}...")
+    
+    pipe = pipeline(
+        "image-text-to-text",
+        model=model_name,
+        device=device,
+        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32
+    )
+    
+    print(f"✅ VLM pipeline loaded successfully")
+    return pipe
 
 
 def load_data_model(yaml_path: Path) -> Dict:
@@ -116,31 +138,31 @@ def bin_time_series(data: pd.DataFrame, au_name: str, num_bins: int = 8) -> np.n
     return np.array(binned_values)
 
 
-def generate_heatmap_description(
+def generate_heatmap_plot(
     therapist_csv: Path,
     patient_csv: Path,
     turn: Dict,
     au_names: List[str],
-    tokenizer_27b,
-    model_27b,
-    device: str,
+    output_path: Path,
     num_bins: int = 8
-) -> str:
-    """Generate AU pattern description from raw data using Gemma 27B (Stage 1).
+) -> bool:
+    """Generate heatmap visualization (exactly like generate_time_series_descriptions.py).
     
-    This replicates generate_time_series_descriptions.py but uses text-based Gemma 
-    instead of vision models, describing the heatmap data directly.
+    Returns:
+        True if successful, False otherwise
     """
     try:
         start_ms = turn['start_ms']
         end_ms = turn['end_ms']
+        speaker_id = turn['speaker_id']
+        turn_index = turn['turn_index']
         
         # Extract AU data
         therapist_data = extract_au_window(therapist_csv, start_ms, end_ms, au_names)
         patient_data = extract_au_window(patient_csv, start_ms, end_ms, au_names)
         
         if therapist_data.empty or patient_data.empty:
-            return "Error: No AU data found"
+            return False
         
         # Create binned heatmaps
         therapist_heatmap = np.zeros((len(au_names), num_bins))
@@ -150,53 +172,116 @@ def generate_heatmap_description(
             therapist_heatmap[i, :] = bin_time_series(therapist_data, au_name, num_bins)
             client_heatmap[i, :] = bin_time_series(patient_data, au_name, num_bins)
         
-        # Create text representation of heatmap data
-        time_labels = ['Start', 'Early', 'Early-Mid', 'Mid', 'Mid-Late', 'Late', 'Very Late', 'End'][:num_bins]
+        # Create figure with two side-by-side heatmaps
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
         
-        heatmap_text = "AU Activation Heatmap Data:\n\n"
-        for i, au_name in enumerate(au_names):
-            heatmap_text += f"{au_name}:\n"
-            heatmap_text += f"  Therapist: {', '.join([f'{time_labels[j]}={therapist_heatmap[i,j]:.2f}' for j in range(num_bins)])}\n"
-            heatmap_text += f"  Client: {', '.join([f'{time_labels[j]}={client_heatmap[i,j]:.2f}' for j in range(num_bins)])}\n"
+        # Find global min/max for consistent color scaling
+        vmin = min(therapist_heatmap.min(), client_heatmap.min())
+        vmax = max(therapist_heatmap.max(), client_heatmap.max())
         
-        # Use Gemma 27B to describe the patterns (matches generate_time_series_descriptions.py prompt)
-        prompt = f"""Describe these AU activation patterns across 8 time bins (therapist vs client).
-Each AU shows mean activation from Start to End of the speech turn.
-Write one compact sentence per AU, commenting on therapist and client patterns, including notable differences.
+        # Therapist heatmap (left)
+        im1 = ax1.imshow(therapist_heatmap, aspect='auto', cmap='Blues', 
+                         interpolation='nearest', vmin=vmin, vmax=vmax)
+        ax1.set_title('THERAPIST AU Activation', fontsize=14, fontweight='bold', pad=15)
+        ax1.set_ylabel('Action Unit', fontsize=12, fontweight='bold')
+        ax1.set_xlabel('Time Progression (Start → End)', fontsize=12, fontweight='bold')
+        ax1.set_yticks(range(len(au_names)))
+        ax1.set_yticklabels(au_names, fontsize=11)
+        ax1.set_xticks(range(num_bins))
+        ax1.set_xticklabels(['Start', 'Early', 'Early-Mid', 'Mid', 'Late-Mid', 'Late', 'Very Late', 'End'][:num_bins], 
+                            fontsize=9, rotation=45, ha='right')
+        
+        # Add colorbar for therapist
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label('Activation Level', fontsize=11, fontweight='bold')
+        
+        # Add value annotations on therapist heatmap
+        for i in range(len(au_names)):
+            for j in range(num_bins):
+                ax1.text(j, i, f'{therapist_heatmap[i, j]:.2f}',
+                        ha="center", va="center", color="black", fontsize=8)
+        
+        # Client heatmap (right)
+        im2 = ax2.imshow(client_heatmap, aspect='auto', cmap='Oranges', 
+                         interpolation='nearest', vmin=vmin, vmax=vmax)
+        ax2.set_title('CLIENT AU Activation', fontsize=14, fontweight='bold', pad=15)
+        ax2.set_ylabel('Action Unit', fontsize=12, fontweight='bold')
+        ax2.set_xlabel('Time Progression (Start → End)', fontsize=12, fontweight='bold')
+        ax2.set_yticks(range(len(au_names)))
+        ax2.set_yticklabels(au_names, fontsize=11)
+        ax2.set_xticks(range(num_bins))
+        ax2.set_xticklabels(['Start', 'Early', 'Early-Mid', 'Mid', 'Mid-Late', 'Late', 'Very Late', 'End'][:num_bins], 
+                            fontsize=9, rotation=45, ha='right')
+        
+        # Add colorbar for client
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        cbar2.set_label('Activation Level', fontsize=11, fontweight='bold')
+        
+        # Add value annotations on client heatmap
+        for i in range(len(au_names)):
+            for j in range(num_bins):
+                ax2.text(j, i, f'{client_heatmap[i, j]:.2f}',
+                        ha="center", va="center", color="black", fontsize=8)
+        
+        # Overall title
+        plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)\n" + 
+                     f"Heatmap shows mean AU activation across {num_bins} temporal phases", 
+                     fontsize=15, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error generating plot: {e}")
+        return False
+
+
+def generate_heatmap_description(
+    vlm_pipe,
+    plot_path: Path,
+    turn: Dict,
+    au_names: List[str]
+) -> str:
+    """Generate AU pattern description from heatmap image using Gemma 3 27B VLM (Stage 1).
+    
+    This exactly replicates generate_time_series_descriptions.py approach.
+    """
+    try:
+        pre_prompt = """Describe these AU heatmaps (left=therapist blue, right=client orange). 
+Each row is one AU across 8 time bins. Write one compact sentence per AU comparing patterns.
 Format: "AU##: therapist [pattern], client [pattern], [key difference]."
-No markdown, bullets, or headers. ONLY output your description.
-Make sure to comment on BOTH therapist and client, highlighting the salient pattern for each.
-
-{heatmap_text}
-
+No markdown, bullets, or headers. ONLY output your description."""
+        
+        au_list = ", ".join(au_names)
+        context = f"""Turn {turn['turn_index']} ({turn['speaker_id']}), {turn['start_ms']:.0f}-{turn['end_ms']:.0f}ms
+AUs: {au_list}
 Description:"""
         
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "url": str(plot_path)},
+                    {"type": "text", "text": f"{pre_prompt}\n\n{context}"}
+                ]
+            }
+        ]
         
-        if hasattr(tokenizer_27b, "apply_chat_template"):
-            formatted_prompt = tokenizer_27b.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-        else:
-            formatted_prompt = prompt
+        output = vlm_pipe(
+            text=messages,
+            max_new_tokens=80,
+            do_sample=False
+        )
+        description = output[0]["generated_text"][-1]["content"].strip()
         
-        inputs = tokenizer_27b(formatted_prompt, return_tensors="pt").to(device)
+        # Clean formatting (minimal post-processing)
+        if description.lower().startswith(("here's", "here is", "the patterns")):
+            if ':' in description[:50]:
+                description = description.split(':', 1)[1].lstrip()
         
-        with torch.inference_mode():
-            outputs = model_27b.generate(
-                **inputs,
-                max_new_tokens=300,
-                do_sample=False,
-                pad_token_id=tokenizer_27b.pad_token_id,
-                eos_token_id=tokenizer_27b.eos_token_id
-            )
-        
-        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-        description = tokenizer_27b.decode(generated_tokens, skip_special_tokens=True).strip()
-        
-        # Clean formatting
         description = description.replace('**', '').replace('*', '')
         description = description.replace('\n', ' ')
         description = re.sub(r'\s+', ' ', description).strip()
@@ -311,6 +396,45 @@ def _is_nan_like(x) -> bool:
     return not np.isfinite(xv)
 
 
+def extract_blri_scores(interview_data: Dict, interview_type: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Extract BLRI scores for therapist and client from interview data.
+    
+    This matches combine_transcripts_with_time_series_descriptions.py exactly.
+    
+    Returns:
+        Tuple of (therapist_blri, client_blri, blri_difference)
+        blri_difference = therapist - client (positive = therapist finds client more empathic)
+        Returns (None, None, None) if either score is missing or NaN-like
+    """
+    if interview_type not in interview_data.get('types', {}):
+        return None, None, None
+    
+    type_data = interview_data['types'][interview_type]
+    labels = type_data.get('labels', {})
+    
+    # Find BLRI keys (they vary by interview type: T3, T5, T7)
+    therapist_blri = None
+    client_blri = None
+    
+    for key, value in labels.items():
+        if 'BLRI_ges_In' in key:  # Interviewer/Therapist
+            therapist_blri = value
+        elif 'BLRI_ges_Pr' in key:  # Patient/Client
+            client_blri = value
+    
+    # Skip if either score is missing or NaN-like
+    if therapist_blri is None or client_blri is None:
+        return None, None, None
+    if _is_nan_like(therapist_blri) or _is_nan_like(client_blri):
+        return None, None, None
+    
+    # Calculate difference using numeric values
+    therapist_val = float(therapist_blri)
+    client_val = float(client_blri)
+    blri_diff = therapist_val - client_val
+    return therapist_val, client_val, blri_diff
+
+
 def discretize_blri_difference(blri_diff: Optional[float]) -> str:
     """Convert BLRI difference to binary empathy category."""
     if blri_diff is None or _is_nan_like(blri_diff):
@@ -349,14 +473,13 @@ def load_interview_data_with_splits(
         patient_id = interview['patient']['patient_id']
         
         for interview_type, type_data in interview.get('types', {}).items():
-            # Get BLRI scores and discretize
-            therapist_blri = type_data.get('therapist_blri')
-            client_blri = type_data.get('client_blri')
+            # Extract BLRI scores using the same method as combine_transcripts
+            therapist_blri, client_blri, blri_diff = extract_blri_scores(interview, interview_type)
             
-            if _is_nan_like(therapist_blri) or _is_nan_like(client_blri):
-                continue  # Skip interviews without valid BLRI
+            # Skip if BLRI scores are missing or NaN
+            if blri_diff is None:
+                continue
             
-            blri_diff = float(therapist_blri) - float(client_blri)
             empathy_category = discretize_blri_difference(blri_diff)
             
             if empathy_category == "unknown":
@@ -412,12 +535,12 @@ def load_interview_data_with_splits(
 
 def evaluate_split(
     entries: List[Dict],
-    tokenizer_27b,
-    model_27b,
+    vlm_pipe,
     tokenizer_7b,
     model_7b,
     device: str,
     split_name: str,
+    temp_dir: Path,
     max_samples: Optional[int] = None,
     save_predictions: bool = False,
     output_dir: Optional[Path] = None
@@ -429,24 +552,40 @@ def evaluate_split(
         print(f"ℹ️  Limited to {max_samples} samples for {split_name}")
     
     print(f"\n🔬 Evaluating {split_name} set ({len(entries)} samples)...")
-    print(f"   Stage 1: Gemma 27B generates AU descriptions from raw data")
+    print(f"   Stage 1: Generate heatmap plots → Gemma 3 27B VLM describes them")
     print(f"   Stage 2: Gemma 7B predicts empathy from AU description + transcript")
     
     predictions = []
     ground_truths = []
     full_responses = []
     
+    # Create temp directory for plots
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
     for entry in tqdm(entries, desc=f"Predicting {split_name}"):
         try:
-            # Stage 1: Generate AU description from raw data (Gemma 27B)
-            au_description = generate_heatmap_description(
+            # Stage 1a: Generate heatmap plot
+            plot_path = temp_dir / f"{entry['patient_id']}_{entry['interview_type']}_turn{entry['turn_index']:03d}.jpg"
+            
+            plot_success = generate_heatmap_plot(
                 entry['therapist_csv'],
                 entry['patient_csv'],
                 entry,
                 entry['au_names'],
-                tokenizer_27b,
-                model_27b,
-                device
+                plot_path
+            )
+            
+            if not plot_success:
+                predictions.append("unknown")
+                ground_truths.append(entry['empathy_category'])
+                continue
+            
+            # Stage 1b: VLM describes the heatmap
+            au_description = generate_heatmap_description(
+                vlm_pipe,
+                plot_path,
+                entry,
+                entry['au_names']
             )
             
             # Stage 2: Predict empathy category (Gemma 7B)
@@ -474,7 +613,8 @@ def evaluate_split(
                 "au_description": au_description,  # Stage 1 output
                 "full_response": response,  # Stage 2 output
                 "blri_difference": entry['blri_difference'],
-                "transcript_summary": entry['summary']
+                "transcript_summary": entry['summary'],
+                "plot_path": str(plot_path)
             })
             
         except Exception as e:
@@ -654,14 +794,14 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("./baseline_results_no_leakage"),
+        default=Path("./baseline_results"),
         help="Output directory for results"
     )
     parser.add_argument(
-        "--model_27b",
+        "--model_vlm",
         type=str,
         default="google/gemma-3-27b-it",
-        help="Gemma 27B model for AU description generation"
+        help="Gemma 3 27B vision-language model for AU description generation"
     )
     parser.add_argument(
         "--model_7b",
@@ -702,14 +842,14 @@ def main():
     
     # Load models
     print("\n" + "="*60)
-    print("STAGE 1: Loading Gemma 27B for AU description generation")
+    print("STAGE 1: Loading Gemma 3 27B VLM for AU description generation")
     print("="*60)
-    tokenizer_27b, model_27b = load_model(args.model_27b, device)
+    vlm_pipe = load_vlm_pipeline(args.model_vlm, device)
     
     print("\n" + "="*60)
     print("STAGE 2: Loading Gemma 7B for empathy prediction")
     print("="*60)
-    tokenizer_7b, model_7b = load_model(args.model_7b, device)
+    tokenizer_7b, model_7b = load_text_model(args.model_7b, device)
     
     # Load data
     data_model = load_data_model(args.data_model)
@@ -721,12 +861,15 @@ def main():
         print("❌ No data loaded. Check your paths.")
         return
     
+    # Create temp directory for plots
+    temp_dir = args.output_dir / ".temp"
+    
     # Evaluate requested splits
     all_metrics = {}
     
     if args.eval_split in ["train", "all"]:
         train_metrics = evaluate_split(
-            train_list, tokenizer_27b, model_27b, tokenizer_7b, model_7b, device, "train",
+            train_list, vlm_pipe, tokenizer_7b, model_7b, device, "train", temp_dir,
             max_samples=args.max_samples,
             save_predictions=args.save_predictions,
             output_dir=args.output_dir
@@ -735,7 +878,7 @@ def main():
     
     if args.eval_split in ["val", "all"]:
         val_metrics = evaluate_split(
-            val_list, tokenizer_27b, model_27b, tokenizer_7b, model_7b, device, "val",
+            val_list, vlm_pipe, tokenizer_7b, model_7b, device, "val", temp_dir,
             max_samples=args.max_samples,
             save_predictions=args.save_predictions,
             output_dir=args.output_dir
@@ -744,7 +887,7 @@ def main():
     
     if args.eval_split in ["test", "all"]:
         test_metrics = evaluate_split(
-            test_list, tokenizer_27b, model_27b, tokenizer_7b, model_7b, device, "test",
+            test_list, vlm_pipe, tokenizer_7b, model_7b, device, "test", temp_dir,
             max_samples=args.max_samples,
             save_predictions=args.save_predictions,
             output_dir=args.output_dir
@@ -761,8 +904,9 @@ def main():
     print("\n✅ NO-LEAKAGE Baseline evaluation complete!")
     print("="*60)
     print("This baseline ensures ZERO label leakage:")
-    print("  Stage 1: Gemma 27B describes AUs from raw OpenFace data")
+    print("  Stage 1: Generate heatmap plots → Gemma 3 27B VLM describes them")
     print("  Stage 2: Gemma 7B predicts from description + transcript only")
+    print(f"\nPlots saved in: {temp_dir}")
     print("="*60)
 
 
