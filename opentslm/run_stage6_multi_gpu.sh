@@ -30,17 +30,36 @@ echo "=========================================="
 
 # RECOMMENDED: torchrun handles all distributed setup automatically
 echo "Running Stage 6 on 2 A100s with torchrun..."
-torchrun \
-  --nproc_per_node=2 \
-  --nnodes=1 \
-  --rdzv_backend=c10d \
-  --rdzv_endpoint=localhost:0 \
-  curriculum_learning.py \
-  --model OpenTSLMFlamingo \
-  --llm_id meta-llama/Llama-3.2-1B \
-  --stages stage6_synchrony_cot \
-  --batch_size 4 \
-  --gradient_checkpointing
+
+# Try torchrun first (PyTorch 1.9+)
+if command -v torchrun &> /dev/null; then
+    echo "Using torchrun (PyTorch 1.9+)"
+    torchrun \
+      --nproc_per_node=2 \
+      --nnodes=1 \
+      --rdzv_backend=c10d \
+      --rdzv_endpoint=localhost:0 \
+      curriculum_learning.py \
+      --model OpenTSLMFlamingo \
+      --llm_id meta-llama/Llama-3.2-1B \
+      --stages stage6_synchrony_cot \
+      --batch_size 4 \
+      --gradient_checkpointing
+else
+    # Fallback to python -m torch.distributed.launch (older PyTorch)
+    echo "torchrun not found, using torch.distributed.launch (older PyTorch)"
+    python -m torch.distributed.launch \
+      --nproc_per_node=2 \
+      --nnodes=1 \
+      --master_addr=localhost \
+      --master_port=0 \
+      curriculum_learning.py \
+      --model OpenTSLMFlamingo \
+      --llm_id meta-llama/Llama-3.2-1B \
+      --stages stage6_synchrony_cot \
+      --batch_size 4 \
+      --gradient_checkpointing
+fi
 
 # Effective batch size: 2 GPUs × 4 batch × 2 accum = 16
 
