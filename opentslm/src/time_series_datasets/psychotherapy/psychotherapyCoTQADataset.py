@@ -63,31 +63,26 @@ class PsychotherapyCoTQADataset(QADataset):
 
     def _get_pre_prompt(self, row) -> str:
         """Generate the pre-prompt instruction with transcript summary."""
-        start_ms = row.get("start_ms", 0)
-        end_ms = row.get("end_ms", 0)
         original_summary = row.get("original_summary", "")
-        au_cols = row.get("au_columns", [])
-       
-        # Format time in seconds
-        start_sec = start_ms / 1000.0
-        end_sec = end_ms / 1000.0
+        speaker_id = row.get("speaker_id", "unknown")
         
-        # Create a list of available AUs for the model to reference
-        au_list = ", ".join(au_cols)
-        
-        prompt = f"""You are given facial action unit time-series data for both a therapist and patient during a psychotherapy session. The following {len(au_cols)} Action Units are provided as input: {au_list}.
+        prompt = f"""You are describing the relational dynamic in a speech turn from a psychotherapy session. 
+Your task is to describe the associations between what was said, the client and therapist's facial expressions, and how that relates to the degree of relational empathy.
 
-Context: During this speech turn (from {start_sec:.1f}s to {end_sec:.1f}s), the summary of what was said is:
-"{original_summary}"
+There are two possible answer categories. Either the client and therapist feel equally **empathic** to one another or there is **discrepancy**.
 
-Your task is to describe the associations between what was said and the facial expressions.
+Data for this turn:
+
+Speech content summary: {original_summary} (spoken by {speaker_id})
+
 Instructions:
 - Begin by describing the speech content very briefly
-- Then briefly note any salient facial Action Units (AUs) that stand out — you may reference any of the {len(au_cols)} available AUs in the time-series data, but only mention the most relevant ones (typically 3-6 AUs)
-- Do not write what facial movement each AU references, just note the AU number and its pattern
+- Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones.
 - Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
 - Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
-- Write your description as a single, natural paragraph — do not use bullet points, numbered steps, new lines or section headings.
+- Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
+- Do **not** mention the answer category label until the final sentence.
+- You MUST end your response with "Answer: [equally empathic OR discrepancy]"
 
 """
         return prompt
