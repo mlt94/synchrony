@@ -31,9 +31,25 @@ echo "=========================================="
 # RECOMMENDED: torchrun handles all distributed setup automatically
 echo "Running Stage 6 on 2 A100s with torchrun..."
 
-# Try torchrun first (PyTorch 1.9+)
-if command -v torchrun &> /dev/null; then
-    echo "Using torchrun (PyTorch 1.9+)"
+# Try torchrun as python module first (most reliable for PyTorch 2.x)
+if python -c "import torch.distributed.run" &> /dev/null; then
+    echo "Using python -m torch.distributed.run (PyTorch 2.x torchrun)"
+    python -m torch.distributed.run \
+      --nproc_per_node=2 \
+      --nnodes=1 \
+      --rdzv_backend=c10d \
+      --rdzv_endpoint=localhost:0 \
+      curriculum_learning.py \
+      --model OpenTSLMFlamingo \
+      --llm_id meta-llama/Llama-3.2-1B \
+      --stages stage6_synchrony_cot \
+      --batch_size 4 \
+      --gradient_accumulation_steps 2 \
+      --mixed_precision \
+      --gradient_checkpointing
+# Try torchrun command (if in PATH)
+elif command -v torchrun &> /dev/null; then
+    echo "Using torchrun command"
     torchrun \
       --nproc_per_node=2 \
       --nnodes=1 \
@@ -44,11 +60,14 @@ if command -v torchrun &> /dev/null; then
       --llm_id meta-llama/Llama-3.2-1B \
       --stages stage6_synchrony_cot \
       --batch_size 4 \
+      --gradient_accumulation_steps 2 \
+      --mixed_precision \
       --gradient_checkpointing
 else
-    # Fallback to python -m torch.distributed.launch (older PyTorch)
-    echo "torchrun not found, using torch.distributed.launch (older PyTorch)"
+    # Fallback to old torch.distributed.launch
+    echo "Using torch.distributed.launch (fallback)"
     python -m torch.distributed.launch \
+      --use-env \
       --nproc_per_node=2 \
       --nnodes=1 \
       --master_addr=localhost \
@@ -58,6 +77,8 @@ else
       --llm_id meta-llama/Llama-3.2-1B \
       --stages stage6_synchrony_cot \
       --batch_size 4 \
+      --gradient_accumulation_steps 2 \
+      --mixed_precision \
       --gradient_checkpointing
 fi
 
