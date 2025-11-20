@@ -1,15 +1,13 @@
 """
-Baseline for Stage6 Synchrony Experiments using Gemma 7B.
+NO-LEAKAGE Baseline for Stage6 Synchrony Experiments.
 
-This baseline:
-1. Loads combined descriptions (transcript summary + AU descriptions) WITHOUT ground truth labels
-2. Uses Gemma 7B to predict empathy category (equally empathic vs discrepancy)
-3. Evaluates predictions against ground truth BLRI-derived labels
-4. Supports train/val/test splits matching the stage6 dataset
+This baseline ensures NO label leakage by:
+1. Stage 1: Using Gemma 27B to generate AU descriptions from raw OpenFace data
+   (exactly like generate_time_series_descriptions.py but text-based)
+2. Stage 2: Using Gemma 7B to predict empathy label from AU description + transcript
+   (without ever seeing the ground truth label)
 
-The key difference from stage6 training:
-- Stage6: OpenTSLMFlamingo learns from raw AU time series + transcript
-- Baseline: Gemma 7B predicts from text descriptions only (no raw time series)
+This matches the training pipeline but evaluates generalization of text-only models.
 """
 
 import sys
@@ -19,6 +17,7 @@ import json
 import argparse
 import yaml
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
@@ -49,7 +48,6 @@ def load_model(model_name: str, device: str):
     
     # Load model with appropriate precision
     if device == "cuda":
-        # Use bfloat16 for better performance on modern GPUs
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -78,49 +76,8 @@ def load_data_model(yaml_path: Path) -> Dict:
     return data
 
 
-def load_combined_descriptions(answer_dir: Path, data_model: Dict) -> List[Dict]:
-    """Load combined descriptions from answer JSON files.
-    
-    These files contain:
-    - combined_description: The generated text (transcript + AU description)
-    - empathy_category: Ground truth label derived from BLRI
-    - blri_difference: Numeric BLRI score difference
-    """
-    all_entries = []
-    
-    print(f"\n📂 Loading combined descriptions from {answer_dir}...")
-    
-    for interview in data_model['interviews']:
-        for interview_type, type_data in interview.get('types', {}).items():
-            answer_path = type_data.get('answer')
-            if not answer_path:
-                continue
-            
-            answer_path = Path(answer_path)
-            if not answer_path.exists():
-                print(f"⚠️  Answer file not found: {answer_path}")
-                continue
-            
-            with open(answer_path, 'r', encoding='utf-8') as f:
-                entries = json.load(f)
-            
-            for entry in entries:
-                # Skip entries without combined_description or empathy_category
-                if not entry.get('combined_description') or not entry.get('empathy_category'):
-                    continue
-                
-                all_entries.append(entry)
-    
-    print(f"✅ Loaded {len(all_entries)} entries with combined descriptions")
-    return all_entries
-
-
 def load_config_splits(config_path: Path) -> Dict[str, List[str]]:
-    """Load therapist splits from config_opentslm.yaml.
-    
-    Returns:
-        Dict with keys 'train', 'val', 'test' containing therapist IDs
-    """
+    """Load therapist splits from config_opentslm.yaml."""
     print(f"\n📂 Loading splits from {config_path}...")
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -131,70 +88,141 @@ def load_config_splits(config_path: Path) -> Dict[str, List[str]]:
     return splits
 
 
-def create_therapist_splits(entries: List[Dict], config_path: Path) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-    """Split data by therapist using predefined splits from config_opentslm.yaml.
-    
-    Args:
-        entries: List of all entries
-        config_path: Path to config_opentslm.yaml
-        
-    Returns:
-        Tuple of (train_list, val_list, test_list)
-    """
-    # Load predefined splits
-    splits_config = load_config_splits(config_path)
-    
-    train_therapists = splits_config['train']
-    val_therapists = splits_config['val']
-    test_therapists = splits_config['test']
-    
-    # Group entries by therapist
-    therapist_entries = defaultdict(list)
-    for entry in entries:
-        therapist_id = entry['therapist_id']
-        therapist_entries[therapist_id].append(entry)
-    
-    # Assign entries to splits based on predefined therapist IDs
-    train_list = []
-    val_list = []
-    test_list = []
-    
-    for tid in train_therapists:
-        if tid in therapist_entries:
-            train_list.extend(therapist_entries[tid])
-    
-    for tid in val_therapists:
-        if tid in therapist_entries:
-            val_list.extend(therapist_entries[tid])
-    
-    for tid in test_therapists:
-        if tid in therapist_entries:
-            test_list.extend(therapist_entries[tid])
-    
-    # Check for unassigned therapists
-    all_split_therapists = set(train_therapists + val_therapists + test_therapists)
-    all_data_therapists = set(therapist_entries.keys())
-    unassigned = all_data_therapists - all_split_therapists
-    
-    if unassigned:
-        print(f"⚠️  Warning: {len(unassigned)} therapists not in config splits: {unassigned}")
-    
-    print(f"\n📊 Split statistics:")
-    print(f"   Train: {len(train_list)} samples from {len([t for t in train_therapists if t in therapist_entries])} therapists")
-    print(f"   Val: {len(val_list)} samples from {len([t for t in val_therapists if t in therapist_entries])} therapists")
-    print(f"   Test: {len(test_list)} samples from {len([t for t in test_therapists if t in therapist_entries])} therapists")
-    
-    return train_list, val_list, test_list
+def extract_au_window(csv_path: Path, start_ms: float, end_ms: float, au_columns: List[str]) -> pd.DataFrame:
+    """Extract AU data from OpenFace CSV for a specific time window."""
+    df = pd.read_csv(csv_path, skipinitialspace=True)
+    df['timestamp_ms'] = df['timestamp'] * 1000
+    mask = (df['timestamp_ms'] >= start_ms) & (df['timestamp_ms'] <= end_ms)
+    window_df = df.loc[mask, ['timestamp_ms'] + au_columns].copy()
+    return window_df
 
 
-def create_baseline_prompt(
-    combined_description: str,
-    speaker_id: str,
-    original_summary: str
+def bin_time_series(data: pd.DataFrame, au_name: str, num_bins: int = 8) -> np.ndarray:
+    """Bin time series data into equal temporal bins."""
+    if len(data) == 0:
+        return np.zeros(num_bins)
+    
+    bin_indices = np.linspace(0, len(data), num_bins + 1, dtype=int)
+    binned_values = []
+    for i in range(num_bins):
+        start_idx = bin_indices[i]
+        end_idx = bin_indices[i + 1]
+        if end_idx > start_idx:
+            bin_mean = data[au_name].iloc[start_idx:end_idx].mean()
+            binned_values.append(bin_mean)
+        else:
+            binned_values.append(0.0)
+    
+    return np.array(binned_values)
+
+
+def generate_heatmap_description(
+    therapist_csv: Path,
+    patient_csv: Path,
+    turn: Dict,
+    au_names: List[str],
+    tokenizer_27b,
+    model_27b,
+    device: str,
+    num_bins: int = 8
 ) -> str:
-    """Create prompt for Gemma to predict empathy category.
+    """Generate AU pattern description from raw data using Gemma 27B (Stage 1).
     
-    Key difference from training: We REMOVE the ground truth answer and ask Gemma to predict.
+    This replicates generate_time_series_descriptions.py but uses text-based Gemma 
+    instead of vision models, describing the heatmap data directly.
+    """
+    try:
+        start_ms = turn['start_ms']
+        end_ms = turn['end_ms']
+        
+        # Extract AU data
+        therapist_data = extract_au_window(therapist_csv, start_ms, end_ms, au_names)
+        patient_data = extract_au_window(patient_csv, start_ms, end_ms, au_names)
+        
+        if therapist_data.empty or patient_data.empty:
+            return "Error: No AU data found"
+        
+        # Create binned heatmaps
+        therapist_heatmap = np.zeros((len(au_names), num_bins))
+        client_heatmap = np.zeros((len(au_names), num_bins))
+        
+        for i, au_name in enumerate(au_names):
+            therapist_heatmap[i, :] = bin_time_series(therapist_data, au_name, num_bins)
+            client_heatmap[i, :] = bin_time_series(patient_data, au_name, num_bins)
+        
+        # Create text representation of heatmap data
+        time_labels = ['Start', 'Early', 'Early-Mid', 'Mid', 'Mid-Late', 'Late', 'Very Late', 'End'][:num_bins]
+        
+        heatmap_text = "AU Activation Heatmap Data:\n\n"
+        for i, au_name in enumerate(au_names):
+            heatmap_text += f"{au_name}:\n"
+            heatmap_text += f"  Therapist: {', '.join([f'{time_labels[j]}={therapist_heatmap[i,j]:.2f}' for j in range(num_bins)])}\n"
+            heatmap_text += f"  Client: {', '.join([f'{time_labels[j]}={client_heatmap[i,j]:.2f}' for j in range(num_bins)])}\n"
+        
+        # Use Gemma 27B to describe the patterns (matches generate_time_series_descriptions.py prompt)
+        prompt = f"""Describe these AU activation patterns across 8 time bins (therapist vs client).
+Each AU shows mean activation from Start to End of the speech turn.
+Write one compact sentence per AU, commenting on therapist and client patterns, including notable differences.
+Format: "AU##: therapist [pattern], client [pattern], [key difference]."
+No markdown, bullets, or headers. ONLY output your description.
+Make sure to comment on BOTH therapist and client, highlighting the salient pattern for each.
+
+{heatmap_text}
+
+Description:"""
+        
+        messages = [{"role": "user", "content": prompt}]
+        
+        if hasattr(tokenizer_27b, "apply_chat_template"):
+            formatted_prompt = tokenizer_27b.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        else:
+            formatted_prompt = prompt
+        
+        inputs = tokenizer_27b(formatted_prompt, return_tensors="pt").to(device)
+        
+        with torch.inference_mode():
+            outputs = model_27b.generate(
+                **inputs,
+                max_new_tokens=300,
+                do_sample=False,
+                pad_token_id=tokenizer_27b.pad_token_id,
+                eos_token_id=tokenizer_27b.eos_token_id
+            )
+        
+        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+        description = tokenizer_27b.decode(generated_tokens, skip_special_tokens=True).strip()
+        
+        # Clean formatting
+        description = description.replace('**', '').replace('*', '')
+        description = description.replace('\n', ' ')
+        description = re.sub(r'\s+', ' ', description).strip()
+        
+        return description
+        
+    except Exception as e:
+        print(f"❌ Error generating heatmap description: {e}")
+        return f"Error: {str(e)}"
+
+
+def predict_empathy_category(
+    au_description: str,
+    transcript_summary: str,
+    speaker_id: str,
+    tokenizer_7b,
+    model_7b,
+    device: str
+) -> Tuple[str, str]:
+    """Predict empathy category using Gemma 7B from AU description + transcript (Stage 2).
+    
+    NO LABEL LEAKAGE - The model only sees:
+    - AU pattern description (from Stage 1)
+    - Transcript summary
+    
+    It does NOT see the ground truth label.
     """
     
     prompt = f"""You are analyzing a speech turn from a psychotherapy session.
@@ -206,9 +234,9 @@ There are two possible categories:
 
 Data for this turn:
 
-Speech content summary: {original_summary} (spoken by {speaker_id})
+Speech content summary: {transcript_summary} (spoken by {speaker_id})
 
-Combined description: {combined_description}
+Facial Action Unit (AU) patterns: {au_description}
 
 Based on the above information, predict the empathy category.
 
@@ -217,30 +245,10 @@ You MUST end your response with exactly one of these two phrases:
 
 Your prediction:"""
     
-    return prompt
-
-
-def predict_with_gemma(
-    tokenizer,
-    model,
-    device: str,
-    combined_description: str,
-    speaker_id: str,
-    original_summary: str
-) -> str:
-    """Use Gemma to predict empathy category from combined description.
-    
-    Returns:
-        Predicted category: "equally empathic" or "discrepancy"
-    """
-    
-    prompt = create_baseline_prompt(combined_description, speaker_id, original_summary)
-    
-    # Format as chat if available
     messages = [{"role": "user", "content": prompt}]
     
-    if hasattr(tokenizer, "apply_chat_template"):
-        formatted_prompt = tokenizer.apply_chat_template(
+    if hasattr(tokenizer_7b, "apply_chat_template"):
+        formatted_prompt = tokenizer_7b.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
@@ -248,36 +256,28 @@ def predict_with_gemma(
     else:
         formatted_prompt = prompt
     
-    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(device)
+    inputs = tokenizer_7b(formatted_prompt, return_tensors="pt").to(device)
     
     with torch.inference_mode():
-        outputs = model.generate(
+        outputs = model_7b.generate(
             **inputs,
             max_new_tokens=200,
-            do_sample=False,  # Greedy decoding for consistency
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            do_sample=False,
+            pad_token_id=tokenizer_7b.pad_token_id,
+            eos_token_id=tokenizer_7b.eos_token_id
         )
     
-    # Decode only the generated tokens
     generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-    response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    response = tokenizer_7b.decode(generated_tokens, skip_special_tokens=True).strip()
     
-    # Extract prediction from response
+    # Extract prediction
     prediction = extract_prediction(response)
     
     return prediction, response
 
 
 def extract_prediction(response: str) -> str:
-    """Extract empathy category from model response.
-    
-    Args:
-        response: Model's generated text
-        
-    Returns:
-        "equally empathic" or "discrepancy" or "unknown"
-    """
+    """Extract empathy category from model response."""
     response_lower = response.lower()
     
     # Look for explicit "Answer: X" pattern first
@@ -285,47 +285,152 @@ def extract_prediction(response: str) -> str:
     if answer_match:
         return answer_match.group(1)
     
-    # Look for the phrases anywhere in the response (last occurrence wins)
+    # Look for the phrases anywhere in the response
     if "discrepancy" in response_lower:
         return "discrepancy"
     if "equally empathic" in response_lower or "equal empathy" in response_lower:
         return "equally empathic"
     
-    # Default to unknown if neither found
     return "unknown"
+
+
+def _is_nan_like(x) -> bool:
+    """Return True if x is None or cannot be interpreted as a finite number."""
+    if x is None:
+        return True
+    if isinstance(x, str):
+        try:
+            xv = float(x)
+        except Exception:
+            return True
+        return not np.isfinite(xv)
+    try:
+        xv = float(x)
+    except Exception:
+        return True
+    return not np.isfinite(xv)
+
+
+def discretize_blri_difference(blri_diff: Optional[float]) -> str:
+    """Convert BLRI difference to binary empathy category."""
+    if blri_diff is None or _is_nan_like(blri_diff):
+        return "unknown"
+    if -6 <= blri_diff <= 6:
+        return "equally empathic"
+    else:
+        return "discrepancy"
+
+
+def load_interview_data_with_splits(
+    data_model: Dict,
+    config_path: Path,
+    au_names: List[str]
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """Load and split interview data by therapist.
+    
+    Returns:
+        Tuple of (train_list, val_list, test_list) where each entry contains
+        interview metadata and turn information.
+    """
+    splits_config = load_config_splits(config_path)
+    
+    train_therapists = splits_config['train']
+    val_therapists = splits_config['val']
+    test_therapists = splits_config['test']
+    
+    train_list = []
+    val_list = []
+    test_list = []
+    
+    print(f"\n📊 Loading interview data...")
+    
+    for interview in data_model['interviews']:
+        therapist_id = interview['therapist']['therapist_id']
+        patient_id = interview['patient']['patient_id']
+        
+        for interview_type, type_data in interview.get('types', {}).items():
+            # Get BLRI scores and discretize
+            therapist_blri = type_data.get('therapist_blri')
+            client_blri = type_data.get('client_blri')
+            
+            if _is_nan_like(therapist_blri) or _is_nan_like(client_blri):
+                continue  # Skip interviews without valid BLRI
+            
+            blri_diff = float(therapist_blri) - float(client_blri)
+            empathy_category = discretize_blri_difference(blri_diff)
+            
+            if empathy_category == "unknown":
+                continue
+            
+            # Load transcript
+            transcript_path = Path(type_data.get('transcript', ''))
+            if not transcript_path.exists():
+                continue
+            
+            with open(transcript_path, 'r', encoding='utf-8') as f:
+                turns = json.load(f)
+            
+            # Get OpenFace CSVs
+            therapist_csv = Path(type_data.get('therapist_openface', ''))
+            patient_csv = Path(type_data.get('patient_openface', ''))
+            
+            if not therapist_csv.exists() or not patient_csv.exists():
+                continue
+            
+            # Add each turn
+            for turn in turns:
+                entry = {
+                    'patient_id': patient_id,
+                    'therapist_id': therapist_id,
+                    'interview_type': interview_type,
+                    'turn_index': turn['turn_index'],
+                    'speaker_id': turn['speaker_id'],
+                    'start_ms': turn['start_ms'],
+                    'end_ms': turn['end_ms'],
+                    'summary': turn.get('summary', ''),
+                    'therapist_csv': therapist_csv,
+                    'patient_csv': patient_csv,
+                    'blri_difference': blri_diff,
+                    'empathy_category': empathy_category,
+                    'au_names': au_names
+                }
+                
+                # Assign to split based on therapist
+                if therapist_id in train_therapists:
+                    train_list.append(entry)
+                elif therapist_id in val_therapists:
+                    val_list.append(entry)
+                elif therapist_id in test_therapists:
+                    test_list.append(entry)
+    
+    print(f"   Train: {len(train_list)} turns")
+    print(f"   Val: {len(val_list)} turns")
+    print(f"   Test: {len(test_list)} turns")
+    
+    return train_list, val_list, test_list
 
 
 def evaluate_split(
     entries: List[Dict],
-    tokenizer,
-    model,
+    tokenizer_27b,
+    model_27b,
+    tokenizer_7b,
+    model_7b,
     device: str,
     split_name: str,
     max_samples: Optional[int] = None,
     save_predictions: bool = False,
     output_dir: Optional[Path] = None
 ) -> Dict[str, Any]:
-    """Evaluate model on a data split.
-    
-    Args:
-        entries: List of data entries
-        tokenizer: Model tokenizer
-        model: Model
-        device: Device to run on
-        split_name: Name of split (train/val/test)
-        max_samples: Maximum samples to evaluate (None = all)
-        save_predictions: Whether to save predictions to file
-        output_dir: Directory to save predictions
-        
-    Returns:
-        Dictionary of evaluation metrics
-    """
+    """Evaluate model on a data split using the two-stage pipeline."""
     
     if max_samples is not None and len(entries) > max_samples:
         entries = entries[:max_samples]
         print(f"ℹ️  Limited to {max_samples} samples for {split_name}")
     
     print(f"\n🔬 Evaluating {split_name} set ({len(entries)} samples)...")
+    print(f"   Stage 1: Gemma 27B generates AU descriptions from raw data")
+    print(f"   Stage 2: Gemma 7B predicts empathy from AU description + transcript")
     
     predictions = []
     ground_truths = []
@@ -333,27 +438,27 @@ def evaluate_split(
     
     for entry in tqdm(entries, desc=f"Predicting {split_name}"):
         try:
-            # Get combined description WITHOUT ground truth label
-            combined_desc = entry['combined_description']
-            
-            # Remove any "Answer: X" from the combined description if present
-            # (to ensure we're not giving the model the answer)
-            combined_desc_clean = re.sub(r'Answer:\s*(equally empathic|discrepancy)', '', combined_desc, flags=re.IGNORECASE).strip()
-            
-            speaker_id = entry['speaker_id']
-            original_summary = entry.get('original_summary', '')
-            
-            # Predict
-            prediction, response = predict_with_gemma(
-                tokenizer,
-                model,
-                device,
-                combined_desc_clean,
-                speaker_id,
-                original_summary
+            # Stage 1: Generate AU description from raw data (Gemma 27B)
+            au_description = generate_heatmap_description(
+                entry['therapist_csv'],
+                entry['patient_csv'],
+                entry,
+                entry['au_names'],
+                tokenizer_27b,
+                model_27b,
+                device
             )
             
-            # Get ground truth
+            # Stage 2: Predict empathy category (Gemma 7B)
+            prediction, response = predict_empathy_category(
+                au_description,
+                entry['summary'],
+                entry['speaker_id'],
+                tokenizer_7b,
+                model_7b,
+                device
+            )
+            
             ground_truth = entry['empathy_category']
             
             predictions.append(prediction)
@@ -363,11 +468,13 @@ def evaluate_split(
                 "therapist_id": entry['therapist_id'],
                 "interview_type": entry['interview_type'],
                 "turn_index": entry['turn_index'],
+                "speaker_id": entry['speaker_id'],
                 "prediction": prediction,
                 "ground_truth": ground_truth,
-                "full_response": response,
-                "blri_difference": entry.get('blri_difference'),
-                "combined_description": entry['combined_description']  # Include original with label
+                "au_description": au_description,  # Stage 1 output
+                "full_response": response,  # Stage 2 output
+                "blri_difference": entry['blri_difference'],
+                "transcript_summary": entry['summary']
             })
             
         except Exception as e:
@@ -379,7 +486,7 @@ def evaluate_split(
     # Calculate turn-level metrics
     turn_metrics = calculate_metrics(predictions, ground_truths, split_name, level="turn")
     
-    # Calculate interview-level metrics (majority vote aggregation)
+    # Calculate interview-level metrics
     interview_metrics = calculate_interview_level_metrics(full_responses, split_name)
     
     # Combine metrics
@@ -400,26 +507,14 @@ def evaluate_split(
 
 
 def calculate_interview_level_metrics(responses: List[Dict], split_name: str) -> Dict[str, Any]:
-    """Calculate metrics at interview level using majority voting.
-    
-    Since BLRI scores are per interview, we aggregate turn-level predictions
-    using majority voting and compare against interview-level ground truth.
-    
-    Args:
-        responses: List of response dictionaries with predictions and metadata
-        split_name: Name of split (for display)
-        
-    Returns:
-        Dictionary of interview-level metrics
-    """
-    # Group responses by interview (patient_id, therapist_id, interview_type)
+    """Calculate metrics at interview level using majority voting."""
+    # Group responses by interview
     interview_groups = defaultdict(list)
     for resp in responses:
-        if resp['prediction'] != 'unknown':  # Skip unknown predictions
+        if resp['prediction'] != 'unknown':
             key = (resp['patient_id'], resp['therapist_id'], resp['interview_type'])
             interview_groups[key].append(resp)
     
-    # Aggregate predictions per interview using majority vote
     interview_predictions = []
     interview_ground_truths = []
     interview_details = []
@@ -430,10 +525,8 @@ def calculate_interview_level_metrics(responses: List[Dict], split_name: str) ->
         for turn in turns:
             pred_counts[turn['prediction']] += 1
         
-        # Majority vote (tie goes to first alphabetically)
+        # Majority vote
         majority_pred = max(pred_counts.items(), key=lambda x: (x[1], x[0]))[0]
-        
-        # Ground truth should be the same for all turns in the interview
         ground_truth = turns[0]['ground_truth']
         blri_diff = turns[0]['blri_difference']
         
@@ -450,7 +543,6 @@ def calculate_interview_level_metrics(responses: List[Dict], split_name: str) ->
             'blri_difference': blri_diff
         })
     
-    # Calculate metrics
     if not interview_predictions:
         print(f"❌ No valid interview predictions for {split_name}!")
         return {"error": "No valid predictions"}
@@ -463,7 +555,6 @@ def calculate_interview_level_metrics(responses: List[Dict], split_name: str) ->
         zero_division=0
     )
     
-    # Confusion matrix
     cm = confusion_matrix(interview_ground_truths, interview_predictions, 
                           labels=["equally empathic", "discrepancy"])
     
@@ -477,7 +568,6 @@ def calculate_interview_level_metrics(responses: List[Dict], split_name: str) ->
         "interview_details": interview_details
     }
     
-    # Print results
     print(f"\n📊 {split_name.upper()} Interview-Level Results (Majority Vote):")
     print(f"   Total interviews: {len(interview_predictions)}")
     print(f"   Accuracy: {accuracy:.4f}")
@@ -494,19 +584,8 @@ def calculate_interview_level_metrics(responses: List[Dict], split_name: str) ->
 
 
 def calculate_metrics(predictions: List[str], ground_truths: List[str], split_name: str, level: str = "turn") -> Dict[str, Any]:
-    """Calculate evaluation metrics at turn level.
-    
-    Args:
-        predictions: List of predicted categories
-        ground_truths: List of ground truth categories
-        split_name: Name of split (for display)
-        level: Level of evaluation ("turn" or "interview")
-        
-    Returns:
-        Dictionary of metrics
-    """
-    
-    # Filter out "unknown" predictions for fair evaluation
+    """Calculate evaluation metrics at turn level."""
+    # Filter out "unknown" predictions
     valid_indices = [i for i, p in enumerate(predictions) if p != "unknown"]
     
     if not valid_indices:
@@ -516,7 +595,6 @@ def calculate_metrics(predictions: List[str], ground_truths: List[str], split_na
     filtered_preds = [predictions[i] for i in valid_indices]
     filtered_truths = [ground_truths[i] for i in valid_indices]
     
-    # Calculate metrics
     accuracy = accuracy_score(filtered_truths, filtered_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(
         filtered_truths, 
@@ -525,10 +603,7 @@ def calculate_metrics(predictions: List[str], ground_truths: List[str], split_na
         zero_division=0
     )
     
-    # Confusion matrix
     cm = confusion_matrix(filtered_truths, filtered_preds, labels=["equally empathic", "discrepancy"])
-    
-    # Count unknowns
     n_unknown = len(predictions) - len(valid_indices)
     
     metrics = {
@@ -543,7 +618,6 @@ def calculate_metrics(predictions: List[str], ground_truths: List[str], split_na
         "confusion_matrix": cm.tolist()
     }
     
-    # Print results
     print(f"\n📊 {split_name.upper()} Turn-Level Results:")
     print(f"   Total turns: {len(predictions)}")
     print(f"   Valid predictions: {len(valid_indices)} ({100*len(valid_indices)/len(predictions):.1f}%)")
@@ -563,7 +637,7 @@ def calculate_metrics(predictions: List[str], ground_truths: List[str], split_na
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Baseline evaluation for Stage6 using Gemma 7B"
+        description="NO-LEAKAGE Baseline: Two-stage Gemma pipeline (27B + 7B)"
     )
     parser.add_argument(
         "--data_model",
@@ -575,68 +649,84 @@ def main():
         "--config",
         type=Path,
         default=Path("../config_opentslm.yaml"),
-        help="Path to config_opentslm.yaml with therapist splits (default: ../config_opentslm.yaml)"
-    )
-    parser.add_argument(
-        "--answer_dir",
-        type=Path,
-        required=True,
-        help="Directory containing answer JSON files (with combined descriptions)"
+        help="Path to config_opentslm.yaml with therapist splits"
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
-        default=Path("./baseline_results"),
-        help="Output directory for results and predictions"
+        default=Path("./baseline_results_no_leakage"),
+        help="Output directory for results"
     )
     parser.add_argument(
-        "--model_name",
+        "--model_27b",
+        type=str,
+        default="google/gemma-2-27b-it",
+        help="Gemma 27B model for AU description generation"
+    )
+    parser.add_argument(
+        "--model_7b",
         type=str,
         default="google/gemma-7b-it",
-        help="Model to use (default: google/gemma-7b-it)"
+        help="Gemma 7B model for empathy prediction"
+    )
+    parser.add_argument(
+        "--au_names",
+        type=str,
+        nargs='+',
+        default=["AU12_r", "AU06_r", "AU04_r", "AU15_r"],
+        help="AU column names to analyze"
     )
     parser.add_argument(
         "--max_samples",
         type=int,
         default=None,
-        help="Maximum samples per split (None = all, useful for debugging)"
+        help="Maximum samples per split (debug)"
     )
     parser.add_argument(
         "--eval_split",
         type=str,
         choices=["train", "val", "test", "all"],
-        default="all",
-        help="Which split to evaluate (default: all)"
+        default="test",
+        help="Which split to evaluate"
     )
     parser.add_argument(
         "--save_predictions",
         action="store_true",
-        help="Save individual predictions to JSON files"
+        help="Save individual predictions"
     )
     
     args = parser.parse_args()
     
     # Setup
     device = setup_device()
-    tokenizer, model = load_model(args.model_name, device)
+    
+    # Load models
+    print("\n" + "="*60)
+    print("STAGE 1: Loading Gemma 27B for AU description generation")
+    print("="*60)
+    tokenizer_27b, model_27b = load_model(args.model_27b, device)
+    
+    print("\n" + "="*60)
+    print("STAGE 2: Loading Gemma 7B for empathy prediction")
+    print("="*60)
+    tokenizer_7b, model_7b = load_model(args.model_7b, device)
     
     # Load data
     data_model = load_data_model(args.data_model)
-    entries = load_combined_descriptions(args.answer_dir, data_model)
+    train_list, val_list, test_list = load_interview_data_with_splits(
+        data_model, args.config, args.au_names
+    )
     
-    if not entries:
-        print("❌ No entries loaded. Check your data paths.")
+    if not (train_list or val_list or test_list):
+        print("❌ No data loaded. Check your paths.")
         return
-    
-    # Create splits using config file
-    train_list, val_list, test_list = create_therapist_splits(entries, args.config)
     
     # Evaluate requested splits
     all_metrics = {}
     
     if args.eval_split in ["train", "all"]:
         train_metrics = evaluate_split(
-            train_list, tokenizer, model, device, "train",
+            train_list, tokenizer_27b, model_27b, tokenizer_7b, model_7b, device, "train",
             max_samples=args.max_samples,
             save_predictions=args.save_predictions,
             output_dir=args.output_dir
@@ -645,7 +735,7 @@ def main():
     
     if args.eval_split in ["val", "all"]:
         val_metrics = evaluate_split(
-            val_list, tokenizer, model, device, "val",
+            val_list, tokenizer_27b, model_27b, tokenizer_7b, model_7b, device, "val",
             max_samples=args.max_samples,
             save_predictions=args.save_predictions,
             output_dir=args.output_dir
@@ -654,7 +744,7 @@ def main():
     
     if args.eval_split in ["test", "all"]:
         test_metrics = evaluate_split(
-            test_list, tokenizer, model, device, "test",
+            test_list, tokenizer_27b, model_27b, tokenizer_7b, model_7b, device, "test",
             max_samples=args.max_samples,
             save_predictions=args.save_predictions,
             output_dir=args.output_dir
@@ -668,7 +758,12 @@ def main():
         json.dump(all_metrics, f, indent=2)
     print(f"\n💾 Overall metrics saved to {metrics_file}")
     
-    print("\n✅ Baseline evaluation complete!")
+    print("\n✅ NO-LEAKAGE Baseline evaluation complete!")
+    print("="*60)
+    print("This baseline ensures ZERO label leakage:")
+    print("  Stage 1: Gemma 27B describes AUs from raw OpenFace data")
+    print("  Stage 2: Gemma 7B predicts from description + transcript only")
+    print("="*60)
 
 
 if __name__ == "__main__":
