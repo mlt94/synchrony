@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=stage6_sync
-#SBATCH --output=home/mlut/PsyTSLM/.garbage/stage6.out
-#SBATCH --error=home/mlut/PsyTSLM/.garbage/stage6.err
+#SBATCH --output=/home/mlut/PsyTSLM/.garbage/stage6.out
+#SBATCH --error=/home/mlut/PsyTSLM/.garbage/stage6.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=120G
 #SBATCH --time=2-00:00:00
 #SBATCH --partition=acltr
@@ -41,8 +41,6 @@ srun python curriculum_learning.py \
   --llm_id meta-llama/Llama-3.2-1B \
   --stages stage6_synchrony_cot \
   --batch_size 4 \
-  --gradient_accumulation_steps 2 \
-  --mixed_precision \
   --gradient_checkpointing
 
 # Option 2: Conservative - Standard multi-GPU without mixed precision
