@@ -7,8 +7,8 @@ from typing import List, Dict, Tuple
 
 
 def load_psychotherapy_cot_splits(
-    config_path: str = r"C:\Users\User\Desktop\martins\synchrony\opentslm\config_opentslm.yaml",
-    data_model_path: str = r'C:\Users\User\Desktop\martins\synchrony\data_model.yaml',
+    config_path: str = r"/home/mlut/PsyTSLM/opentslm/config_opentslm.yaml",
+    data_model_path: str = r'/home/mlut/PsyTSLM/data_model.yaml',
     interview_types: List[str] = None,
     max_samples: int = None,
     feature_columns: List[str] = None

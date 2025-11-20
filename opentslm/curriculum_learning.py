@@ -1482,7 +1482,7 @@ class CurriculumTrainer:
         - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Test loss only (chain-of-thought reasoning)
-        - Loads from: stage3_cot (best model after stages 1→2→3)
+        - Loads from: stage2_captioning (not stage5_ecg_cot)
         - Features: Only 4 AUs (AU12_r, AU06_r, AU04_r, AU15_r)
         """
         sampler = None
@@ -1498,7 +1498,7 @@ class CurriculumTrainer:
             batch_size=batch_size,
             eval_only=eval_only,
             sampler=sampler,
-            load_from_stage="stage3_cot",  # Override to load from stage3 (your best checkpoint)
+            load_from_stage="stage2_captioning",  # Override to load from stage2
             dataset_kwargs={'feature_columns': ['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r']}
         )
 
