@@ -366,7 +366,8 @@ def evaluate_split(
                 "prediction": prediction,
                 "ground_truth": ground_truth,
                 "full_response": response,
-                "blri_difference": entry.get('blri_difference')
+                "blri_difference": entry.get('blri_difference'),
+                "combined_description": entry['combined_description']  # Include original with label
             })
             
         except Exception as e:
@@ -375,8 +376,17 @@ def evaluate_split(
             ground_truths.append(entry.get('empathy_category', 'unknown'))
             continue
     
-    # Calculate metrics
-    metrics = calculate_metrics(predictions, ground_truths, split_name)
+    # Calculate turn-level metrics
+    turn_metrics = calculate_metrics(predictions, ground_truths, split_name, level="turn")
+    
+    # Calculate interview-level metrics (majority vote aggregation)
+    interview_metrics = calculate_interview_level_metrics(full_responses, split_name)
+    
+    # Combine metrics
+    metrics = {
+        "turn_level": turn_metrics,
+        "interview_level": interview_metrics
+    }
     
     # Save predictions if requested
     if save_predictions and output_dir:
@@ -389,13 +399,108 @@ def evaluate_split(
     return metrics
 
 
-def calculate_metrics(predictions: List[str], ground_truths: List[str], split_name: str) -> Dict[str, Any]:
-    """Calculate evaluation metrics.
+def calculate_interview_level_metrics(responses: List[Dict], split_name: str) -> Dict[str, Any]:
+    """Calculate metrics at interview level using majority voting.
+    
+    Since BLRI scores are per interview, we aggregate turn-level predictions
+    using majority voting and compare against interview-level ground truth.
+    
+    Args:
+        responses: List of response dictionaries with predictions and metadata
+        split_name: Name of split (for display)
+        
+    Returns:
+        Dictionary of interview-level metrics
+    """
+    # Group responses by interview (patient_id, therapist_id, interview_type)
+    interview_groups = defaultdict(list)
+    for resp in responses:
+        if resp['prediction'] != 'unknown':  # Skip unknown predictions
+            key = (resp['patient_id'], resp['therapist_id'], resp['interview_type'])
+            interview_groups[key].append(resp)
+    
+    # Aggregate predictions per interview using majority vote
+    interview_predictions = []
+    interview_ground_truths = []
+    interview_details = []
+    
+    for interview_key, turns in interview_groups.items():
+        # Count predictions
+        pred_counts = defaultdict(int)
+        for turn in turns:
+            pred_counts[turn['prediction']] += 1
+        
+        # Majority vote (tie goes to first alphabetically)
+        majority_pred = max(pred_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        # Ground truth should be the same for all turns in the interview
+        ground_truth = turns[0]['ground_truth']
+        blri_diff = turns[0]['blri_difference']
+        
+        interview_predictions.append(majority_pred)
+        interview_ground_truths.append(ground_truth)
+        interview_details.append({
+            'patient_id': interview_key[0],
+            'therapist_id': interview_key[1],
+            'interview_type': interview_key[2],
+            'n_turns': len(turns),
+            'prediction_counts': dict(pred_counts),
+            'majority_prediction': majority_pred,
+            'ground_truth': ground_truth,
+            'blri_difference': blri_diff
+        })
+    
+    # Calculate metrics
+    if not interview_predictions:
+        print(f"❌ No valid interview predictions for {split_name}!")
+        return {"error": "No valid predictions"}
+    
+    accuracy = accuracy_score(interview_ground_truths, interview_predictions)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        interview_ground_truths,
+        interview_predictions,
+        average='weighted',
+        zero_division=0
+    )
+    
+    # Confusion matrix
+    cm = confusion_matrix(interview_ground_truths, interview_predictions, 
+                          labels=["equally empathic", "discrepancy"])
+    
+    metrics = {
+        "n_interviews": len(interview_predictions),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "confusion_matrix": cm.tolist(),
+        "interview_details": interview_details
+    }
+    
+    # Print results
+    print(f"\n📊 {split_name.upper()} Interview-Level Results (Majority Vote):")
+    print(f"   Total interviews: {len(interview_predictions)}")
+    print(f"   Accuracy: {accuracy:.4f}")
+    print(f"   Precision: {precision:.4f}")
+    print(f"   Recall: {recall:.4f}")
+    print(f"   F1 Score: {f1:.4f}")
+    print(f"\n   Confusion Matrix:")
+    print(f"   {'':20s} | Pred: Empathic | Pred: Discrepancy")
+    print(f"   {'-'*60}")
+    print(f"   {'True: Empathic':20s} | {cm[0][0]:14d} | {cm[0][1]:17d}")
+    print(f"   {'True: Discrepancy':20s} | {cm[1][0]:14d} | {cm[1][1]:17d}")
+    
+    return metrics
+
+
+def calculate_metrics(predictions: List[str], ground_truths: List[str], split_name: str, level: str = "turn") -> Dict[str, Any]:
+    """Calculate evaluation metrics at turn level.
     
     Args:
         predictions: List of predicted categories
         ground_truths: List of ground truth categories
         split_name: Name of split (for display)
+        level: Level of evaluation ("turn" or "interview")
         
     Returns:
         Dictionary of metrics
@@ -439,8 +544,8 @@ def calculate_metrics(predictions: List[str], ground_truths: List[str], split_na
     }
     
     # Print results
-    print(f"\n📊 {split_name.upper()} Results:")
-    print(f"   Total samples: {len(predictions)}")
+    print(f"\n📊 {split_name.upper()} Turn-Level Results:")
+    print(f"   Total turns: {len(predictions)}")
     print(f"   Valid predictions: {len(valid_indices)} ({100*len(valid_indices)/len(predictions):.1f}%)")
     print(f"   Unknown predictions: {n_unknown}")
     print(f"   Accuracy: {accuracy:.4f}")
