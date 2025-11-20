@@ -660,7 +660,7 @@ def main():
     parser.add_argument(
         "--model_27b",
         type=str,
-        default="google/gemma-2-27b-it",
+        default="google/gemma-3-27b-it",
         help="Gemma 27B model for AU description generation"
     )
     parser.add_argument(
