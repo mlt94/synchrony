@@ -1498,7 +1498,7 @@ class CurriculumTrainer:
             batch_size=batch_size,
             eval_only=eval_only,
             sampler=sampler,
-            load_from_stage="stage2_captioning",  # Override to load from stage2
+            load_from_stage="stage4_sleep_cot",  # Override to load from stage x
             dataset_kwargs={'feature_columns': ['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r']}
         )
 

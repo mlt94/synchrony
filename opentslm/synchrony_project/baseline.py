@@ -272,7 +272,7 @@ Description:"""
         
         output = vlm_pipe(
             text=messages,
-            max_new_tokens=80,
+            max_new_tokens=200,
             do_sample=False
         )
         description = output[0]["generated_text"][-1]["content"].strip()
