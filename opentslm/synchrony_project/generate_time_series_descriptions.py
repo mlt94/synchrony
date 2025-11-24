@@ -462,7 +462,7 @@ def main():
     
     # Process all interviews
     all_results = []
-    results_by_dyad_type = {}  # Store results grouped by (patient_id, interview_type)
+    saved_files = []  # Track saved JSON files
     
     for interview_idx, interview in enumerate(interviews):
         patient_id = interview['patient']['patient_id']
@@ -483,18 +483,13 @@ def main():
             )
             all_results.extend(results)
             
-            # Group by (patient_id, interview_type)
-            key = (patient_id, interview_type)
-            if key not in results_by_dyad_type:
-                results_by_dyad_type[key] = []
-            results_by_dyad_type[key].extend(results)
+            # Save immediately after each interview session (3 per dyad)
+            if results:
+                output_json = args.output_dir / f"{patient_id}_{interview_type}_descriptions.json"
+                save_results(results, output_json)
+                saved_files.append(str(output_json))
     
-    # Save results per dyad and interview type
-    for (dyad_id, interview_type), dyad_results in results_by_dyad_type.items():
-        output_json = args.output_dir / f"{dyad_id}_{interview_type}_descriptions.json"
-        save_results(dyad_results, output_json)
-    
-    print(f"\n✅ Complete! Generated time-series descriptions for {len(all_results)} speech turns across {len(results_by_dyad_type)} dyad-interview combinations")
+    print(f"\n✅ Complete! Generated time-series descriptions for {len(all_results)} speech turns across {len(saved_files)} interview sessions")
 
 
 if __name__ == "__main__":
