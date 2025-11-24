@@ -128,7 +128,7 @@ def generate_plot_for_turn(
         therapist_csv: Path to therapist OpenFace CSV
         patient_csv: Path to patient OpenFace CSV
         turn: Speech turn dict with start_ms, end_ms, speaker_id
-        au_names: List of 4 AU names to plot
+        au_names: List of AU names to plot (can be 4 or 17)
         output_path: Where to save the plot
         num_bins: Number of temporal bins (default 8)
     
@@ -159,7 +159,9 @@ def generate_plot_for_turn(
             client_heatmap[i, :] = bin_time_series(patient_data, au_name, num_bins)
         
         # Create figure with two side-by-side heatmaps
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        # Dynamically adjust figure height based on number of AUs
+        fig_height = max(6, len(au_names) * 0.5)  # At least 6 inches, scale with AU count
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, fig_height))
         
         # Find global min/max for consistent color scaling
         vmin = min(therapist_heatmap.min(), client_heatmap.min())
@@ -181,11 +183,12 @@ def generate_plot_for_turn(
         cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
         cbar1.set_label('Activation Level', fontsize=11, fontweight='bold')
         
-        # Add value annotations on therapist heatmap
+        # Add value annotations on therapist heatmap (smaller font for many AUs)
+        font_size = 8 if len(au_names) <= 4 else 6
         for i in range(len(au_names)):
             for j in range(num_bins):
                 text = ax1.text(j, i, f'{therapist_heatmap[i, j]:.2f}',
-                               ha="center", va="center", color="black", fontsize=8)
+                               ha="center", va="center", color="black", fontsize=font_size)
         
         # Client heatmap (right)
         im2 = ax2.imshow(client_heatmap, aspect='auto', cmap='Oranges', 
@@ -203,11 +206,11 @@ def generate_plot_for_turn(
         cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
         cbar2.set_label('Activation Level', fontsize=11, fontweight='bold')
         
-        # Add value annotations on client heatmap
+        # Add value annotations on client heatmap (smaller font for many AUs)
         for i in range(len(au_names)):
             for j in range(num_bins):
                 text = ax2.text(j, i, f'{client_heatmap[i, j]:.2f}',
-                               ha="center", va="center", color="black", fontsize=8)
+                               ha="center", va="center", color="black", fontsize=font_size)
         
         # Overall title
         plt.suptitle(f"Turn {turn_index}: {speaker_id.capitalize()} speaking ({start_ms:.0f}-{end_ms:.0f}ms)\n" + 
@@ -230,6 +233,8 @@ def generate_description_with_pipeline(pipe, image_path: Path, turn: Dict, au_na
     
     pre_prompt = """Describe these AU heatmaps (left=therapist blue, right=client orange). 
 Each row is one AU across 8 time bins. Write one compact sentence per AU comparing patterns.
+ONLY consider the AUs which shows either 1) high variability within patient or client or 2) strong difference between therapist and client
+Consider a maximum of 4 action units. 
 Format: "AU##: therapist [pattern], client [pattern], [key difference]."
 No markdown, bullets, or headers. ONLY output your description."""
     
@@ -249,8 +254,7 @@ Description:"""
     ]
     
     try:
-        # Optimized: Reduced max_new_tokens from 150 to 80 (4 AUs × ~20 tokens each)
-        # Removed temperature parameter (do_sample=False already ensures deterministic output)
+        # Fixed token limit: model instructed to focus only on most volatile AUs
         output = pipe(
             text=messages,
             max_new_tokens=80,
@@ -418,8 +422,10 @@ def main():
     parser.add_argument(
         "--au_columns",
         nargs="+",
-        default=['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r'],
-        help="AU columns to analyze"
+        default=['AU01_r', 'AU02_r', 'AU04_r', 'AU05_r', 'AU06_r', 'AU07_r', 
+                 'AU09_r', 'AU10_r', 'AU12_r', 'AU14_r', 'AU15_r', 'AU17_r', 
+                 'AU20_r', 'AU23_r', 'AU25_r', 'AU26_r', 'AU45_r'],
+        help="AU columns to analyze (default: all 17 AUs)"
     )
     
     args = parser.parse_args()
