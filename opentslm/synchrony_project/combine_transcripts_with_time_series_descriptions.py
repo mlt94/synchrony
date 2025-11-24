@@ -1,14 +1,13 @@
 """
 Combine time-series descriptions (AU patterns) with transcript summaries (speech content)
-and BLRI empathy scores using Gemma 7B-it to describe associations.
+using Gemma 7B-it to describe associations.
 
 This script:
-1. Loads data_model.yaml containing interview metadata, transcript paths, and BLRI scores
-2. Loads time-series descriptions from ituhpc_timeseries_rationales/*.json (contains "generated_rationale" key - legacy naming)
+1. Loads data_model.yaml containing interview metadata and transcript paths
+2. Loads time-series descriptions from generated JSON files (contains "generated_descriptions" key)
 3. Matches entries by patient_id, interview_type, turn_index
-4. Calculates BLRI difference (therapist - client): positive = therapist finds client more empathic
-5. Uses Gemma 7B-it to describe associations between AU patterns, speech content, and BLRI
-6. Saves combined results to output JSON files
+4. Uses Gemma 7B-it to describe associations between AU patterns and speech content
+5. Saves combined results to output JSON files
 """
 
 import sys
@@ -87,41 +86,7 @@ def load_timeseries_descriptions(descriptions_dir: Path) -> Dict[str, List[Dict]
     return descriptions_by_key
 
 
-def extract_blri_scores(interview_data: Dict, interview_type: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Extract BLRI scores for therapist and client from interview data.
-    
-    Returns:
-        Tuple of (therapist_blri, client_blri, blri_difference)
-        blri_difference = therapist - client (positive = therapist finds client more empathic)
-        Returns (None, None, None) if either score is missing or NaN-like
-    """
-    if interview_type not in interview_data.get('types', {}):
-        return None, None, None
-    
-    type_data = interview_data['types'][interview_type]
-    labels = type_data.get('labels', {})
-    
-    # Find BLRI keys (they vary by interview type: T3, T5, T7)
-    therapist_blri = None
-    client_blri = None
-    
-    for key, value in labels.items():
-        if 'BLRI_ges_In' in key:  # Interviewer/Therapist
-            therapist_blri = value
-        elif 'BLRI_ges_Pr' in key:  # Patient/Client
-            client_blri = value
-    
-    # Skip if either score is missing or NaN-like
-    if therapist_blri is None or client_blri is None:
-        return None, None, None
-    if _is_nan_like(therapist_blri) or _is_nan_like(client_blri):
-        return None, None, None
-    
-    # Calculate difference using numeric values
-    therapist_val = float(therapist_blri)
-    client_val = float(client_blri)
-    blri_diff = therapist_val - client_val
-    return therapist_val, client_val, blri_diff
+
 
 
 def match_entries(
@@ -168,38 +133,16 @@ def match_entries(
     return matches
 
 
-def discretize_blri_difference(blri_diff: float) -> str:
-    """
-    Discretize BLRI difference into binary categories.
-    
-    Args:
-        blri_diff: Difference between therapist and client BLRI (therapist - client)
-        
-    Returns:
-        String label for the empathy category: "equal" or "discrepancy"
-    """
-    if -6 <= blri_diff <= 6:
-        return "equally empathic"
-    else:
-        return "discrepancy"
-
-
 def create_combination_prompt(
     timeseries_description: str, 
     summary: str, 
-    speaker_id: str, 
-    blri_diff: Optional[float] = None
+    speaker_id: str
 ) -> str:
-    """Create prompt for Gemma to combine time-series description, summary, and BLRI scores."""
-    
-    # Discretize BLRI difference to get the correct answer
-    empathy_category = discretize_blri_difference(blri_diff) if blri_diff is not None else "unknown"
+    """Create prompt for Gemma to combine time-series description and summary."""
     
     prompt = f"""
-    You are describing the relational dynamic in a speech turn from a psychotherapy session. 
-    Your task is to describe the associations between what was said, the client and therapist's facial expressions, and how that relates to the degree of relational empathy.
-
-There are two possible answer categories. Either the client and therapist feel equally **empathic** to one another or there is **discrepancy**.
+You are describing the relational dynamic in a speech turn from a psychotherapy session. 
+Your task is to describe the associations between what was said and the client and therapist's facial expressions.
 
 Data for this turn:
 
@@ -213,8 +156,6 @@ Instructions:
 - Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
 - Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
 - Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
-- Do **not** mention the answer category label until the final sentence.
-- You MUST end your response with "Answer: {empathy_category}"
 
 Description:"""
     
@@ -227,13 +168,12 @@ def combine_with_gemma(
     device: str,
     timeseries_description: str,
     summary: str,
-    speaker_id: str,
-    blri_diff: Optional[float] = None
+    speaker_id: str
 ) -> str:
-    """Use Gemma 7B-it to combine time-series description, summary, and BLRI into coherent text."""
+    """Use Gemma 7B-it to combine time-series description and summary into coherent text."""
     
     prompt = create_combination_prompt(
-        timeseries_description, summary, speaker_id, blri_diff
+        timeseries_description, summary, speaker_id
     )
     
     # Tokenize with proper chat template (Gemma uses specific format)
@@ -294,14 +234,6 @@ def process_patient_interview(
     patient_id = interview_data['patient']['patient_id']
     therapist_id = interview_data['therapist']['therapist_id']
     
-    # Extract BLRI scores
-    therapist_blri, client_blri, blri_diff = extract_blri_scores(interview_data, interview_type)
-    
-    # Skip interview if BLRI scores are missing or NaN
-    if blri_diff is None:
-        print(f"⚠️ Skipping {patient_id} {interview_type}: BLRI scores missing or NaN")
-        return results
-    
     # Load summaries from transcript path in data model
     if interview_type not in interview_data.get('types', {}):
         print(f"⚠️ Interview type '{interview_type}' not found for {patient_id}")
@@ -327,11 +259,7 @@ def process_patient_interview(
         matches = matches[:max_turns]
         print(f"ℹ️  Limited to first {max_turns} turns for debugging")
     
-    blri_info = ""
-    if blri_diff is not None:
-        blri_info = f" [BLRI diff: {blri_diff:+.1f}]"
-    
-    print(f"\nProcessing {patient_id} - {interview_type}: {len(matches)} matched turns{blri_info}")
+    print(f"\nProcessing {patient_id} - {interview_type}: {len(matches)} matched turns")
     
     skipped_empty = 0
     
@@ -354,17 +282,13 @@ def process_patient_interview(
                 skipped_empty += 1
                 continue
             
-            # Discretize BLRI category before calling combine_with_gemma
-            empathy_category = discretize_blri_difference(blri_diff)
-            
             combined = combine_with_gemma(
                 tokenizer,
                 model,
                 device,
                 description_text,
                 summary_text,
-                desc['speaker_id'],
-                blri_diff
+                desc['speaker_id']
             )
             
             result = {
@@ -376,11 +300,7 @@ def process_patient_interview(
                 "start_ms": desc['start_ms'],
                 "end_ms": desc['end_ms'],
                 "duration_ms": desc['duration_ms'],
-                "therapist_blri": therapist_blri,
-                "client_blri": client_blri,
-                "blri_difference": blri_diff,
-                "empathy_category": empathy_category,
-                "original_timeseries_description": desc['generated_rationale'],  # Note: JSON key is legacy 'generated_rationale'
+                "original_timeseries_description": desc.get('generated_descriptions', desc.get('generated_rationale', '')),
                 "original_summary": summ['summary'],
                 "combined_description": combined
             }
@@ -407,7 +327,7 @@ def save_results(results: List[Dict[str, Any]], output_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Combine time-series descriptions with transcript summaries and BLRI scores using Gemma 7B-it"
+        description="Combine time-series descriptions with transcript summaries using Gemma 7B-it"
     )
     parser.add_argument(
         "--data_model",
@@ -454,7 +374,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting time-series description + summary + BLRI combination with Gemma 7B-it")
+    print("🚀 Starting time-series description + summary combination with Gemma 7B-it")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
