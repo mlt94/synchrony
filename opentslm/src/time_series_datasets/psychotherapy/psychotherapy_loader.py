@@ -616,8 +616,7 @@ def _extract_single_window(
         "labels": labels,
         "baseline": baseline,
         "original_summary": original_summary,
-        "answer": answer_text,
-        "rationale": answer_text  # Use answer as rationale for backward compatibility
+        "answer": answer_text
     }
     
     return sample
