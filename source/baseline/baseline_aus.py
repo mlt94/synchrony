@@ -1,12 +1,12 @@
 """
-MLP baseline for BLRI regression using AU features.
+MLP baseline for T0_BFPE_C3 multi-class classification using AU features.
 
 This script:
 1. Loads interview data with train/val/test splits from config_opentslm.yaml
 2. Extracts ALL AU features (both therapist and client) from OpenFace CSVs
-3. Trains an MLP regressor to predict client BLRI scores (T3/T5/T7_BLRI_ges_Pr)
+3. Trains an MLP classifier to predict baseline attachment style (T0_BFPE_C3)
 4. Labels are per-interview, but prediction is per-frame
-5. Reports metrics at both frame-level and interview-level (via mean aggregation)
+5. Reports metrics at both frame-level and interview-level (via majority vote)
 """
 
 import sys
@@ -21,7 +21,8 @@ import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from collections import Counter
+from sklearn.metrics import f1_score, precision_score, recall_score, classification_report, confusion_matrix
 from tqdm import tqdm
 
 # Add OpenTSLM paths
@@ -61,34 +62,35 @@ def _is_nan_like(value) -> bool:
     return False
 
 
-def extract_client_blri(interview: Dict, interview_type: str) -> Optional[float]:
-    """Extract client BLRI score from interview data.
+def extract_bfpe_c3(interview: Dict) -> Optional[str]:
+    """Extract T0_BFPE_C3 baseline attachment style from interview data.
     
-    Interview types are: "personal" (T3), "bindung" (T5), "wunder" (T7)
-    BLRI keys are: T3_BLRI_ges_Pr, T5_BLRI_ges_Pr, T7_BLRI_ges_Pr (Patient/Client)
+    T0_BFPE_C3 is the baseline attachment classification (measured at T0).
+    This is stored at the interview level (not per interview type).
     
     Returns:
-        Client BLRI score (float) or None if missing/invalid
+        Attachment style string or None if missing/invalid
     """
-    if interview_type not in interview.get('types', {}):
-        return None
+    # T0_BFPE_C3 is typically at interview level, not per-type
+    # Check both locations: root level and within types
     
-    type_data = interview['types'][interview_type]
-    labels = type_data.get('labels', {})
+    # First try root-level labels
+    if 'labels' in interview:
+        labels = interview['labels']
+        if 'T0_BFPE_C3' in labels:
+            value = labels['T0_BFPE_C3']
+            if not _is_nan_like(value):
+                return str(value)
     
-    # Search for any key containing 'BLRI_ges_Pr' (Patient/Client BLRI)
-    # This handles T3_BLRI_ges_Pr, T5_BLRI_ges_Pr, T7_BLRI_ges_Pr
-    client_blri = None
-    for key, value in labels.items():
-        if 'BLRI_ges_Pr' in key:
-            client_blri = value
-            break
+    # Fallback: check in any interview type's labels
+    for type_name, type_data in interview.get('types', {}).items():
+        labels = type_data.get('labels', {})
+        if 'T0_BFPE_C3' in labels:
+            value = labels['T0_BFPE_C3']
+            if not _is_nan_like(value):
+                return str(value)
     
-    # Skip if missing or NaN-like
-    if client_blri is None or _is_nan_like(client_blri):
-        return None
-    
-    return float(client_blri)
+    return None
 
 
 def extract_au_features(
@@ -128,14 +130,15 @@ def extract_au_features(
 def load_interview_data_with_splits(
     data_model: Dict,
     config_path: Path,
-    au_columns: List[str]
-) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    au_columns: List[str],
+    label_encoder: Dict[str, int]
+) -> Tuple[List[Dict], List[Dict], List[Dict], Dict[str, int]]:
     """Load and split interview data by therapist.
     
     Returns:
-        Tuple of (train_list, val_list, test_list) where each entry contains:
+        Tuple of (train_list, val_list, test_list, label_encoder) where each entry contains:
         - X: AU feature matrix (n_frames × n_features)
-        - y: BLRI score array (n_frames,) - same score repeated for all frames
+        - y: class label array (n_frames,) - same label repeated for all frames
         - interview_id: unique identifier for grouping frames into interviews
     """
     splits_config = load_config_splits(config_path)
@@ -154,13 +157,23 @@ def load_interview_data_with_splits(
         therapist_id = interview['therapist']['therapist_id']
         patient_id = interview['patient']['patient_id']
         
+        # Extract T0_BFPE_C3 (baseline attachment style)
+        bfpe_c3 = extract_bfpe_c3(interview)
+        
+        # Skip if label is missing
+        if bfpe_c3 is None:
+            continue
+        
+        # Build label encoder dynamically
+        if bfpe_c3 not in label_encoder:
+            label_encoder[bfpe_c3] = len(label_encoder)
+        
+        label_idx = label_encoder[bfpe_c3]
+        
         for interview_type, type_data in interview.get('types', {}).items():
-            # Extract client BLRI score
-            client_blri = extract_client_blri(interview, interview_type)
-            
-            # Skip if BLRI score is missing
-            if client_blri is None:
-                continue
+            # Skip if we already processed this interview (T0_BFPE_C3 is per-patient, not per-interview-type)
+            # We'll use the first available interview type with valid OpenFace data
+            pass
             
             # Get OpenFace CSVs
             therapist_csv = Path(type_data.get('therapist_openface', ''))
@@ -183,7 +196,7 @@ def load_interview_data_with_splits(
             X = au_features.drop(columns=['timestamp_ms']).values
             
             # Label is the same for all frames in this interview
-            y = np.array([client_blri] * len(X), dtype=np.float32)
+            y = np.array([label_idx] * len(X), dtype=np.int64)
             
             # Unique interview identifier
             interview_id = f"{patient_id}_{interview_type}"
@@ -195,7 +208,8 @@ def load_interview_data_with_splits(
                 'patient_id': patient_id,
                 'therapist_id': therapist_id,
                 'interview_type': interview_type,
-                'client_blri': client_blri,
+                'bfpe_c3': bfpe_c3,
+                'label_idx': label_idx,
                 'n_frames': len(X)
             }
             
@@ -212,8 +226,9 @@ def load_interview_data_with_splits(
     print(f"   Train: {len(train_list)} interviews, {sum(e['n_frames'] for e in train_list):,} frames")
     print(f"   Val: {len(val_list)} interviews, {sum(e['n_frames'] for e in val_list):,} frames")
     print(f"   Test: {len(test_list)} interviews, {sum(e['n_frames'] for e in test_list):,} frames")
+    print(f"\n   Label encoding: {label_encoder}")
     
-    return train_list, val_list, test_list
+    return train_list, val_list, test_list, label_encoder
 
 
 def aggregate_to_arrays(entries: List[Dict]) -> Tuple[np.ndarray, np.ndarray, List[str]]:
@@ -239,11 +254,11 @@ def aggregate_to_arrays(entries: List[Dict]) -> Tuple[np.ndarray, np.ndarray, Li
     return X, y, interview_ids
 
 
-class MLPRegressor(nn.Module):
-    """Multi-layer perceptron for BLRI regression."""
+class MLPClassifier(nn.Module):
+    """Multi-layer perceptron for T0_BFPE_C3 classification."""
     
-    def __init__(self, input_dim: int, hidden_dims: List[int] = [128, 64, 32], dropout: float = 0.3):
-        super(MLPRegressor, self).__init__()
+    def __init__(self, input_dim: int, num_classes: int, hidden_dims: List[int] = [128, 64, 32], dropout: float = 0.3):
+        super(MLPClassifier, self).__init__()
         
         layers = []
         prev_dim = input_dim
@@ -254,13 +269,13 @@ class MLPRegressor(nn.Module):
             layers.append(nn.Dropout(dropout))
             prev_dim = hidden_dim
         
-        # Output layer (single value regression)
-        layers.append(nn.Linear(prev_dim, 1))
+        # Output layer (num_classes logits)
+        layers.append(nn.Linear(prev_dim, num_classes))
         
         self.network = nn.Sequential(*layers)
     
     def forward(self, x):
-        return self.network(x).squeeze(-1)
+        return self.network(x)
 
 
 def train_mlp(
@@ -268,18 +283,20 @@ def train_mlp(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
+    num_classes: int,
     hidden_dims: List[int] = [128, 64, 32],
     dropout: float = 0.3,
     learning_rate: float = 0.001,
     batch_size: int = 256,
     num_epochs: int = 15,
     device: str = 'cuda'
-) -> MLPRegressor:
-    """Train an MLP regressor for BLRI prediction.
+) -> MLPClassifier:
+    """Train an MLP classifier for T0_BFPE_C3 prediction.
     
     Args:
         X_train, y_train: Training data
         X_val, y_val: Validation data (for early stopping monitoring)
+        num_classes: Number of classes
         hidden_dims: List of hidden layer dimensions
         dropout: Dropout rate for regularization
         learning_rate: Learning rate for Adam optimizer
@@ -290,8 +307,8 @@ def train_mlp(
     Returns:
         Trained MLP model
     """
-    print(f"\n🧠 Training MLP Regressor...")
-    print(f"   Architecture: {X_train.shape[1]} → {' → '.join(map(str, hidden_dims))} → 1")
+    print(f"\n🧠 Training MLP Classifier...")
+    print(f"   Architecture: {X_train.shape[1]} → {' → '.join(map(str, hidden_dims))} → {num_classes}")
     print(f"   Dropout: {dropout}")
     print(f"   Learning rate: {learning_rate}")
     print(f"   Batch size: {batch_size}")
@@ -307,15 +324,15 @@ def train_mlp(
     
     # Convert to tensors
     X_train_tensor = torch.FloatTensor(X_train_norm).to(device)
-    y_train_tensor = torch.FloatTensor(y_train).to(device)
+    y_train_tensor = torch.LongTensor(y_train).to(device)
     X_val_tensor = torch.FloatTensor(X_val_norm).to(device)
-    y_val_tensor = torch.FloatTensor(y_val).to(device)
+    y_val_tensor = torch.LongTensor(y_val).to(device)
     
     # Create model
-    model = MLPRegressor(input_dim=X_train.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(device)
+    model = MLPClassifier(input_dim=X_train.shape[1], num_classes=num_classes, hidden_dims=hidden_dims, dropout=dropout).to(device)
     
     # Loss and optimizer
-    criterion = nn.MSELoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     # Training loop
@@ -372,18 +389,20 @@ def train_mlp(
     # Store normalization parameters in model
     model.train_mean = train_mean
     model.train_std = train_std
+    model.num_classes = num_classes
     
     return model
 
 
 def evaluate_frame_level(
-    model: MLPRegressor,
+    model: MLPClassifier,
     X: np.ndarray,
     y_true: np.ndarray,
     split_name: str,
+    label_names: List[str],
     device: str = 'cuda'
 ) -> Dict:
-    """Evaluate regressor at frame level."""
+    """Evaluate classifier at frame level."""
     model.eval()
     
     # Normalize using training statistics
@@ -391,42 +410,45 @@ def evaluate_frame_level(
     X_tensor = torch.FloatTensor(X_norm).to(device)
     
     with torch.no_grad():
-        y_pred = model(X_tensor).cpu().numpy()
+        logits = model(X_tensor)
+        y_pred = torch.argmax(logits, dim=1).cpu().numpy()
     
-    # Calculate regression metrics
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
+    # Calculate classification metrics
+    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
     
     print(f"\n📊 {split_name} - Frame-Level Metrics:")
-    print(f"   MSE:  {mse:.4f}")
-    print(f"   RMSE: {rmse:.4f}")
-    print(f"   MAE:  {mae:.4f}")
-    print(f"   R²:   {r2:.4f}")
+    print(f"   Precision: {precision:.4f}")
+    print(f"   Recall:    {recall:.4f}")
+    print(f"   F1-Score:  {f1:.4f}")
+    print(f"\n   Classification Report:")
+    print(classification_report(y_true, y_pred, target_names=label_names, zero_division=0, digits=4))
+    print(f"\n   Confusion Matrix:")
+    print(confusion_matrix(y_true, y_pred))
     
     return {
-        'mse': mse,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
         'y_true': y_true,
         'y_pred': y_pred
     }
 
 
 def evaluate_interview_level(
-    model: MLPRegressor,
+    model: MLPClassifier,
     entries: List[Dict],
     split_name: str,
+    label_names: List[str],
     device: str = 'cuda'
 ) -> Dict:
-    """Evaluate regressor at interview level using mean aggregation."""
+    """Evaluate classifier at interview level using majority vote."""
     y_true_interview = []
     y_pred_interview = []
     interview_ids = []
     
-    print(f"\n📊 {split_name} - Interview-Level Evaluation (Mean Aggregation):")
+    print(f"\n🗳️  {split_name} - Interview-Level Evaluation (Majority Vote):")
     
     model.eval()
     
@@ -436,37 +458,40 @@ def evaluate_interview_level(
         X_tensor = torch.FloatTensor(X_norm).to(device)
         
         with torch.no_grad():
-            y_pred_frames = model(X_tensor).cpu().numpy()
+            logits = model(X_tensor)
+            y_pred_frames = torch.argmax(logits, dim=1).cpu().numpy()
         
-        # Mean aggregation
-        mean_pred = y_pred_frames.mean()
+        # Majority vote
+        vote_counts = Counter(y_pred_frames)
+        majority_pred = vote_counts.most_common(1)[0][0]
         
         # Ground truth (all frames have same label)
         ground_truth = entry['y'][0]
         
         y_true_interview.append(ground_truth)
-        y_pred_interview.append(mean_pred)
+        y_pred_interview.append(majority_pred)
         interview_ids.append(entry['interview_id'])
     
     y_true_interview = np.array(y_true_interview)
     y_pred_interview = np.array(y_pred_interview)
     
-    # Calculate regression metrics
-    mse = mean_squared_error(y_true_interview, y_pred_interview)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_true_interview, y_pred_interview)
-    r2 = r2_score(y_true_interview, y_pred_interview)
+    # Calculate classification metrics
+    f1 = f1_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
+    precision = precision_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
+    recall = recall_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
     
-    print(f"   MSE:  {mse:.4f}")
-    print(f"   RMSE: {rmse:.4f}")
-    print(f"   MAE:  {mae:.4f}")
-    print(f"   R²:   {r2:.4f}")
+    print(f"   Precision: {precision:.4f}")
+    print(f"   Recall:    {recall:.4f}")
+    print(f"   F1-Score:  {f1:.4f}")
+    print(f"\n   Classification Report:")
+    print(classification_report(y_true_interview, y_pred_interview, target_names=label_names, zero_division=0, digits=4))
+    print(f"\n   Confusion Matrix:")
+    print(confusion_matrix(y_true_interview, y_pred_interview))
     
     return {
-        'mse': mse,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
         'y_true': y_true_interview,
         'y_pred': y_pred_interview,
         'interview_ids': interview_ids
@@ -475,7 +500,7 @@ def evaluate_interview_level(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MLP baseline for BLRI regression using AU features"
+        description="MLP baseline for T0_BFPE_C3 multi-class classification using AU features"
     )
     parser.add_argument(
         "--data_model",
@@ -530,13 +555,13 @@ def main():
     args = parser.parse_args()
     
     print("=" * 80)
-    print("MLP Baseline: AU-based BLRI Regression")
+    print("MLP Baseline: AU-based T0_BFPE_C3 Classification")
     print("=" * 80)
     print(f"\nConfiguration:")
     print(f"  Data model: {args.data_model}")
     print(f"  Config: {args.config}")
     print(f"  AU columns: ALL 17 AUs (both therapist and client) = 34 features")
-    print(f"  Target: Client BLRI scores (T3/T5/T7_BLRI_ges_Pr)")
+    print(f"  Target: Baseline attachment style (T0_BFPE_C3)")
     print(f"\nMLP Hyperparameters:")
     print(f"  Hidden dims: {args.hidden_dims}")
     print(f"  Dropout: {args.dropout}")
@@ -548,12 +573,21 @@ def main():
     # Load data model
     data_model = load_data_model(args.data_model)
     
-    # Load data with train/val/test splits
-    train_entries, val_entries, test_entries = load_interview_data_with_splits(
+    # Load data with train/val/test splits (label_encoder is built dynamically)
+    label_encoder = {}
+    train_entries, val_entries, test_entries, label_encoder = load_interview_data_with_splits(
         data_model,
         args.config,
-        ALL_AU_COLUMNS
+        ALL_AU_COLUMNS,
+        label_encoder
     )
+    
+    # Create reverse mapping for label names
+    num_classes = len(label_encoder)
+    idx_to_label = {idx: label for label, idx in label_encoder.items()}
+    label_names = [idx_to_label[i] for i in range(num_classes)]
+    
+    print(f"\n🏷️  Classes ({num_classes}): {label_names}")
     
     # Convert to arrays
     X_train, y_train, train_interview_ids = aggregate_to_arrays(train_entries)
@@ -565,10 +599,12 @@ def main():
     print(f"   X_val: {X_val.shape}")
     print(f"   X_test: {X_test.shape}")
     
-    print(f"\n📊 Target statistics:")
-    print(f"   Train BLRI - Mean: {y_train.mean():.2f}, Std: {y_train.std():.2f}, Range: [{y_train.min():.2f}, {y_train.max():.2f}]")
-    print(f"   Val BLRI   - Mean: {y_val.mean():.2f}, Std: {y_val.std():.2f}, Range: [{y_val.min():.2f}, {y_val.max():.2f}]")
-    print(f"   Test BLRI  - Mean: {y_test.mean():.2f}, Std: {y_test.std():.2f}, Range: [{y_test.min():.2f}, {y_test.max():.2f}]")
+    print(f"\n📊 Class distribution:")
+    train_counts = Counter(y_train)
+    val_counts = Counter(y_val)
+    test_counts = Counter(y_test)
+    for i in range(num_classes):
+        print(f"   {label_names[i]}: Train={train_counts[i]}, Val={val_counts[i]}, Test={test_counts[i]}")
     
     # Train MLP
     model = train_mlp(
@@ -576,6 +612,7 @@ def main():
         y_train,
         X_val,
         y_val,
+        num_classes=num_classes,
         hidden_dims=args.hidden_dims,
         dropout=args.dropout,
         learning_rate=args.learning_rate,
@@ -590,38 +627,38 @@ def main():
     print("=" * 80)
     
     # Frame-level evaluation
-    train_frame_metrics = evaluate_frame_level(model, X_train, y_train, "Train", args.device)
-    val_frame_metrics = evaluate_frame_level(model, X_val, y_val, "Validation", args.device)
-    test_frame_metrics = evaluate_frame_level(model, X_test, y_test, "Test", args.device)
+    train_frame_metrics = evaluate_frame_level(model, X_train, y_train, "Train", label_names, args.device)
+    val_frame_metrics = evaluate_frame_level(model, X_val, y_val, "Validation", label_names, args.device)
+    test_frame_metrics = evaluate_frame_level(model, X_test, y_test, "Test", label_names, args.device)
     
-    # Interview-level evaluation (mean aggregation)
-    train_interview_metrics = evaluate_interview_level(model, train_entries, "Train", args.device)
-    val_interview_metrics = evaluate_interview_level(model, val_entries, "Validation", args.device)
-    test_interview_metrics = evaluate_interview_level(model, test_entries, "Test", args.device)
+    # Interview-level evaluation (majority vote)
+    train_interview_metrics = evaluate_interview_level(model, train_entries, "Train", label_names, args.device)
+    val_interview_metrics = evaluate_interview_level(model, val_entries, "Validation", label_names, args.device)
+    test_interview_metrics = evaluate_interview_level(model, test_entries, "Test", label_names, args.device)
     
     # Summary
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
-    print("\nFrame-Level RMSE:")
-    print(f"  Train: {train_frame_metrics['rmse']:.4f}")
-    print(f"  Val:   {val_frame_metrics['rmse']:.4f}")
-    print(f"  Test:  {test_frame_metrics['rmse']:.4f}")
+    print("\nFrame-Level F1 Scores:")
+    print(f"  Train: {train_frame_metrics['f1']:.4f}")
+    print(f"  Val:   {val_frame_metrics['f1']:.4f}")
+    print(f"  Test:  {test_frame_metrics['f1']:.4f}")
     
-    print("\nFrame-Level R²:")
-    print(f"  Train: {train_frame_metrics['r2']:.4f}")
-    print(f"  Val:   {val_frame_metrics['r2']:.4f}")
-    print(f"  Test:  {test_frame_metrics['r2']:.4f}")
+    print("\nFrame-Level Precision:")
+    print(f"  Train: {train_frame_metrics['precision']:.4f}")
+    print(f"  Val:   {val_frame_metrics['precision']:.4f}")
+    print(f"  Test:  {test_frame_metrics['precision']:.4f}")
     
-    print("\nInterview-Level RMSE (Mean Aggregation):")
-    print(f"  Train: {train_interview_metrics['rmse']:.4f}")
-    print(f"  Val:   {val_interview_metrics['rmse']:.4f}")
-    print(f"  Test:  {test_interview_metrics['rmse']:.4f}")
+    print("\nInterview-Level F1 Scores (Majority Vote):")
+    print(f"  Train: {train_interview_metrics['f1']:.4f}")
+    print(f"  Val:   {val_interview_metrics['f1']:.4f}")
+    print(f"  Test:  {test_interview_metrics['f1']:.4f}")
     
-    print("\nInterview-Level R²:")
-    print(f"  Train: {train_interview_metrics['r2']:.4f}")
-    print(f"  Val:   {val_interview_metrics['r2']:.4f}")
-    print(f"  Test:  {test_interview_metrics['r2']:.4f}")
+    print("\nInterview-Level Precision:")
+    print(f"  Train: {train_interview_metrics['precision']:.4f}")
+    print(f"  Val:   {val_interview_metrics['precision']:.4f}")
+    print(f"  Test:  {test_interview_metrics['precision']:.4f}")
     
     print("\n✅ Evaluation complete!")
 
