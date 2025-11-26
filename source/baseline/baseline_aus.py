@@ -66,21 +66,26 @@ def extract_bfpe_c3(interview: Dict) -> Optional[str]:
     """Extract T0_BFPE_C3 baseline attachment style from interview data.
     
     T0_BFPE_C3 is the baseline attachment classification (measured at T0).
-    This is stored at the interview level (not per interview type).
+    This is stored under interview['baseline']['T0_BFPE_C3'].
     
     Returns:
         Attachment style string or None if missing/invalid
     """
-    # T0_BFPE_C3 is typically at interview level, not per-type
-    # Check both locations: root level and within types
+    # Check baseline header (correct location per user specification)
+    if 'baseline' in interview:
+        baseline = interview['baseline']
+        if 'T0_BFPE_C3' in baseline:
+            value = baseline['T0_BFPE_C3']
+            if not _is_nan_like(value):
+                return str(value).strip()
     
-    # First try root-level labels
+    # Fallback: try root-level labels
     if 'labels' in interview:
         labels = interview['labels']
         if 'T0_BFPE_C3' in labels:
             value = labels['T0_BFPE_C3']
             if not _is_nan_like(value):
-                return str(value)
+                return str(value).strip()
     
     # Fallback: check in any interview type's labels
     for type_name, type_data in interview.get('types', {}).items():
@@ -88,7 +93,7 @@ def extract_bfpe_c3(interview: Dict) -> Optional[str]:
         if 'T0_BFPE_C3' in labels:
             value = labels['T0_BFPE_C3']
             if not _is_nan_like(value):
-                return str(value)
+                return str(value).strip()
     
     return None
 
