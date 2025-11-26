@@ -423,12 +423,16 @@ def evaluate_frame_level(
     precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
     recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
     
+    # Get unique classes present in this split
+    unique_classes = np.unique(np.concatenate([y_true, y_pred]))
+    present_label_names = [label_names[i] for i in unique_classes]
+    
     print(f"\n📊 {split_name} - Frame-Level Metrics:")
     print(f"   Precision: {precision:.4f}")
     print(f"   Recall:    {recall:.4f}")
     print(f"   F1-Score:  {f1:.4f}")
     print(f"\n   Classification Report:")
-    print(classification_report(y_true, y_pred, target_names=label_names, zero_division=0, digits=4))
+    print(classification_report(y_true, y_pred, labels=unique_classes, target_names=present_label_names, zero_division=0, digits=4))
     print(f"\n   Confusion Matrix:")
     print(confusion_matrix(y_true, y_pred))
     
@@ -485,11 +489,15 @@ def evaluate_interview_level(
     precision = precision_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
     recall = recall_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
     
+    # Get unique classes present in this split
+    unique_classes = np.unique(np.concatenate([y_true_interview, y_pred_interview]))
+    present_label_names = [label_names[i] for i in unique_classes]
+    
     print(f"   Precision: {precision:.4f}")
     print(f"   Recall:    {recall:.4f}")
     print(f"   F1-Score:  {f1:.4f}")
     print(f"\n   Classification Report:")
-    print(classification_report(y_true_interview, y_pred_interview, target_names=label_names, zero_division=0, digits=4))
+    print(classification_report(y_true_interview, y_pred_interview, labels=unique_classes, target_names=present_label_names, zero_division=0, digits=4))
     print(f"\n   Confusion Matrix:")
     print(confusion_matrix(y_true_interview, y_pred_interview))
     
