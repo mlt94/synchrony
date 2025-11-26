@@ -1,14 +1,12 @@
 """
-Random Forest baseline for BLRI binary classification using AU features.
+MLP baseline for BLRI regression using AU features.
 
 This script:
 1. Loads interview data with train/val/test splits from config_opentslm.yaml
 2. Extracts ALL AU features (both therapist and client) from OpenFace CSVs
-3. Trains a Random Forest classifier to predict binary BLRI categories:
-   - "equally empathic": BLRI difference in [-6, 6]
-   - "discrepancy": BLRI difference outside [-6, 6]
-4. Labels are per-interview, but classification is per-frame
-5. Reports metrics at both frame-level and interview-level (via majority vote)
+3. Trains an MLP regressor to predict client BLRI scores (T3/T5/T7_BLRI_ges_Pr)
+4. Labels are per-interview, but prediction is per-frame
+5. Reports metrics at both frame-level and interview-level (via mean aggregation)
 """
 
 import sys
@@ -18,11 +16,12 @@ import pandas as pd
 import json
 import yaml
 import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from collections import Counter
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, f1_score, precision_score, recall_score, confusion_matrix
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from tqdm import tqdm
 
 # Add OpenTSLM paths
@@ -62,57 +61,34 @@ def _is_nan_like(value) -> bool:
     return False
 
 
-def extract_blri_scores(interview: Dict, interview_type: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Extract BLRI scores for therapist and client from interview data.
+def extract_client_blri(interview: Dict, interview_type: str) -> Optional[float]:
+    """Extract client BLRI score from interview data.
+    
+    Interview types are: "personal" (T3), "bindung" (T5), "wunder" (T7)
+    BLRI keys are: T3_BLRI_ges_Pr, T5_BLRI_ges_Pr, T7_BLRI_ges_Pr (Patient/Client)
     
     Returns:
-        Tuple of (therapist_blri, client_blri, blri_difference)
-        blri_difference = therapist - client (positive = therapist finds client more empathic)
+        Client BLRI score (float) or None if missing/invalid
     """
     if interview_type not in interview.get('types', {}):
-        return None, None, None
+        return None
     
     type_data = interview['types'][interview_type]
     labels = type_data.get('labels', {})
     
-    # Find BLRI keys (they vary by interview type: T3, T5, T7)
-    therapist_blri = None
+    # Search for any key containing 'BLRI_ges_Pr' (Patient/Client BLRI)
+    # This handles T3_BLRI_ges_Pr, T5_BLRI_ges_Pr, T7_BLRI_ges_Pr
     client_blri = None
-    
     for key, value in labels.items():
-        if 'BLRI_ges_In' in key:  # Interviewer/Therapist
-            therapist_blri = value
-        elif 'BLRI_ges_Pr' in key:  # Patient/Client
+        if 'BLRI_ges_Pr' in key:
             client_blri = value
+            break
     
-    # Skip if either score is missing or NaN-like
-    if therapist_blri is None or client_blri is None:
-        return None, None, None
-    if _is_nan_like(therapist_blri) or _is_nan_like(client_blri):
-        return None, None, None
-    
-    # Calculate difference
-    therapist_val = float(therapist_blri)
-    client_val = float(client_blri)
-    blri_diff = therapist_val - client_val
-    
-    return therapist_val, client_val, blri_diff
-
-
-def discretize_blri_difference(blri_diff: Optional[float]) -> Optional[str]:
-    """Convert BLRI difference to binary empathy category.
-    
-    Returns:
-        'equally empathic' if -6 <= blri_diff <= 6
-        'discrepancy' otherwise
-        None if blri_diff is None or NaN
-    """
-    if blri_diff is None or _is_nan_like(blri_diff):
+    # Skip if missing or NaN-like
+    if client_blri is None or _is_nan_like(client_blri):
         return None
-    if -6 <= blri_diff <= 6:
-        return "equally empathic"
-    else:
-        return "discrepancy"
+    
+    return float(client_blri)
 
 
 def extract_au_features(
@@ -159,7 +135,7 @@ def load_interview_data_with_splits(
     Returns:
         Tuple of (train_list, val_list, test_list) where each entry contains:
         - X: AU feature matrix (n_frames × n_features)
-        - y: binary label array (n_frames,) - same label repeated for all frames
+        - y: BLRI score array (n_frames,) - same score repeated for all frames
         - interview_id: unique identifier for grouping frames into interviews
     """
     splits_config = load_config_splits(config_path)
@@ -179,15 +155,11 @@ def load_interview_data_with_splits(
         patient_id = interview['patient']['patient_id']
         
         for interview_type, type_data in interview.get('types', {}).items():
-            # Extract BLRI scores
-            therapist_blri, client_blri, blri_diff = extract_blri_scores(interview, interview_type)
+            # Extract client BLRI score
+            client_blri = extract_client_blri(interview, interview_type)
             
-            # Skip if BLRI scores are missing
-            if blri_diff is None:
-                continue
-            
-            empathy_category = discretize_blri_difference(blri_diff)
-            if empathy_category is None:
+            # Skip if BLRI score is missing
+            if client_blri is None:
                 continue
             
             # Get OpenFace CSVs
@@ -211,7 +183,7 @@ def load_interview_data_with_splits(
             X = au_features.drop(columns=['timestamp_ms']).values
             
             # Label is the same for all frames in this interview
-            y = np.array([empathy_category] * len(X))
+            y = np.array([client_blri] * len(X), dtype=np.float32)
             
             # Unique interview identifier
             interview_id = f"{patient_id}_{interview_type}"
@@ -223,8 +195,7 @@ def load_interview_data_with_splits(
                 'patient_id': patient_id,
                 'therapist_id': therapist_id,
                 'interview_type': interview_type,
-                'empathy_category': empathy_category,
-                'blri_difference': blri_diff,
+                'client_blri': client_blri,
                 'n_frames': len(X)
             }
             
@@ -268,127 +239,234 @@ def aggregate_to_arrays(entries: List[Dict]) -> Tuple[np.ndarray, np.ndarray, Li
     return X, y, interview_ids
 
 
-def train_random_forest(
+class MLPRegressor(nn.Module):
+    """Multi-layer perceptron for BLRI regression."""
+    
+    def __init__(self, input_dim: int, hidden_dims: List[int] = [128, 64, 32], dropout: float = 0.3):
+        super(MLPRegressor, self).__init__()
+        
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        
+        # Output layer (single value regression)
+        layers.append(nn.Linear(prev_dim, 1))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x).squeeze(-1)
+
+
+def train_mlp(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    n_estimators: int = 100,
-    max_depth: Optional[int] = 10,
-    min_samples_split: int = 20,
-    min_samples_leaf: int = 10,
-    max_features: str = 'sqrt',
-    random_state: int = 42
-) -> RandomForestClassifier:
-    """Train a Random Forest classifier with regularization to prevent overfitting.
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    hidden_dims: List[int] = [128, 64, 32],
+    dropout: float = 0.3,
+    learning_rate: float = 0.001,
+    batch_size: int = 256,
+    num_epochs: int = 15,
+    device: str = 'cuda'
+) -> MLPRegressor:
+    """Train an MLP regressor for BLRI prediction.
     
-    Key parameters to prevent overfitting:
-    - max_depth: Limits tree depth (default: 10)
-    - min_samples_split: Minimum samples required to split a node (default: 20)
-    - min_samples_leaf: Minimum samples required at leaf node (default: 10)
-    - max_features: Features to consider for best split (default: 'sqrt')
+    Args:
+        X_train, y_train: Training data
+        X_val, y_val: Validation data (for early stopping monitoring)
+        hidden_dims: List of hidden layer dimensions
+        dropout: Dropout rate for regularization
+        learning_rate: Learning rate for Adam optimizer
+        batch_size: Batch size for training
+        num_epochs: Number of training epochs
+        device: 'cuda' or 'cpu'
+    
+    Returns:
+        Trained MLP model
     """
-    print(f"\n🌲 Training Random Forest with regularization...")
-    print(f"   n_estimators={n_estimators}")
-    print(f"   max_depth={max_depth}")
-    print(f"   min_samples_split={min_samples_split}")
-    print(f"   min_samples_leaf={min_samples_leaf}")
-    print(f"   max_features={max_features}")
+    print(f"\n🧠 Training MLP Regressor...")
+    print(f"   Architecture: {X_train.shape[1]} → {' → '.join(map(str, hidden_dims))} → 1")
+    print(f"   Dropout: {dropout}")
+    print(f"   Learning rate: {learning_rate}")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Epochs: {num_epochs}")
+    print(f"   Device: {device}")
     
-    clf = RandomForestClassifier(
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        min_samples_split=min_samples_split,
-        min_samples_leaf=min_samples_leaf,
-        max_features=max_features,
-        random_state=random_state,
-        n_jobs=-1,
-        class_weight='balanced'  # Handle class imbalance
-    )
+    # Standardize features (important for neural networks)
+    train_mean = X_train.mean(axis=0)
+    train_std = X_train.std(axis=0) + 1e-8
     
-    clf.fit(X_train, y_train)
+    X_train_norm = (X_train - train_mean) / train_std
+    X_val_norm = (X_val - train_mean) / train_std
     
-    print(f"✅ Training complete")
-    return clf
+    # Convert to tensors
+    X_train_tensor = torch.FloatTensor(X_train_norm).to(device)
+    y_train_tensor = torch.FloatTensor(y_train).to(device)
+    X_val_tensor = torch.FloatTensor(X_val_norm).to(device)
+    y_val_tensor = torch.FloatTensor(y_val).to(device)
+    
+    # Create model
+    model = MLPRegressor(input_dim=X_train.shape[1], hidden_dims=hidden_dims, dropout=dropout).to(device)
+    
+    # Loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Training loop
+    best_val_loss = float('inf')
+    best_model_state = None
+    
+    for epoch in range(num_epochs):
+        model.train()
+        
+        # Shuffle training data
+        perm = torch.randperm(len(X_train_tensor))
+        X_train_shuffled = X_train_tensor[perm]
+        y_train_shuffled = y_train_tensor[perm]
+        
+        # Mini-batch training
+        train_loss = 0.0
+        num_batches = 0
+        
+        for i in range(0, len(X_train_tensor), batch_size):
+            batch_X = X_train_shuffled[i:i+batch_size]
+            batch_y = y_train_shuffled[i:i+batch_size]
+            
+            # Forward pass
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            
+            # Backward pass
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            num_batches += 1
+        
+        avg_train_loss = train_loss / num_batches
+        
+        # Validation
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_tensor)
+            val_loss = criterion(val_outputs, y_val_tensor).item()
+        
+        print(f"   Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = model.state_dict().copy()
+    
+    # Load best model
+    model.load_state_dict(best_model_state)
+    print(f"\n✅ Training complete (Best Val Loss: {best_val_loss:.4f})")
+    
+    # Store normalization parameters in model
+    model.train_mean = train_mean
+    model.train_std = train_std
+    
+    return model
 
 
 def evaluate_frame_level(
-    clf: RandomForestClassifier,
+    model: MLPRegressor,
     X: np.ndarray,
     y_true: np.ndarray,
-    split_name: str
+    split_name: str,
+    device: str = 'cuda'
 ) -> Dict:
-    """Evaluate classifier at frame level."""
-    y_pred = clf.predict(X)
+    """Evaluate regressor at frame level."""
+    model.eval()
     
-    # Calculate metrics
-    f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
-    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
-    recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    # Normalize using training statistics
+    X_norm = (X - model.train_mean) / model.train_std
+    X_tensor = torch.FloatTensor(X_norm).to(device)
+    
+    with torch.no_grad():
+        y_pred = model(X_tensor).cpu().numpy()
+    
+    # Calculate regression metrics
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
     
     print(f"\n📊 {split_name} - Frame-Level Metrics:")
-    print(f"   Precision: {precision:.4f}")
-    print(f"   Recall: {recall:.4f}")
-    print(f"   F1-Score: {f1:.4f}")
-    print(f"\n   Classification Report:")
-    print(classification_report(y_true, y_pred, zero_division=0, digits=4))
-    print(f"\n   Confusion Matrix:")
-    print(confusion_matrix(y_true, y_pred))
+    print(f"   MSE:  {mse:.4f}")
+    print(f"   RMSE: {rmse:.4f}")
+    print(f"   MAE:  {mae:.4f}")
+    print(f"   R²:   {r2:.4f}")
     
     return {
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
+        'mse': mse,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
         'y_true': y_true,
         'y_pred': y_pred
     }
 
 
 def evaluate_interview_level(
-    clf: RandomForestClassifier,
+    model: MLPRegressor,
     entries: List[Dict],
-    split_name: str
+    split_name: str,
+    device: str = 'cuda'
 ) -> Dict:
-    """Evaluate classifier at interview level using majority vote."""
+    """Evaluate regressor at interview level using mean aggregation."""
     y_true_interview = []
     y_pred_interview = []
     interview_ids = []
     
-    print(f"\n🗳️  {split_name} - Interview-Level Evaluation (Majority Vote):")
+    print(f"\n📊 {split_name} - Interview-Level Evaluation (Mean Aggregation):")
+    
+    model.eval()
     
     for entry in entries:
-        # Predict on all frames
-        y_pred_frames = clf.predict(entry['X'])
+        # Normalize and predict on all frames
+        X_norm = (entry['X'] - model.train_mean) / model.train_std
+        X_tensor = torch.FloatTensor(X_norm).to(device)
         
-        # Majority vote
-        vote_counts = Counter(y_pred_frames)
-        majority_pred = vote_counts.most_common(1)[0][0]
+        with torch.no_grad():
+            y_pred_frames = model(X_tensor).cpu().numpy()
+        
+        # Mean aggregation
+        mean_pred = y_pred_frames.mean()
         
         # Ground truth (all frames have same label)
         ground_truth = entry['y'][0]
         
         y_true_interview.append(ground_truth)
-        y_pred_interview.append(majority_pred)
+        y_pred_interview.append(mean_pred)
         interview_ids.append(entry['interview_id'])
     
     y_true_interview = np.array(y_true_interview)
     y_pred_interview = np.array(y_pred_interview)
     
-    # Calculate metrics
-    f1 = f1_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
-    precision = precision_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
-    recall = recall_score(y_true_interview, y_pred_interview, average='weighted', zero_division=0)
+    # Calculate regression metrics
+    mse = mean_squared_error(y_true_interview, y_pred_interview)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true_interview, y_pred_interview)
+    r2 = r2_score(y_true_interview, y_pred_interview)
     
-    print(f"   Precision: {precision:.4f}")
-    print(f"   Recall: {recall:.4f}")
-    print(f"   F1-Score: {f1:.4f}")
-    print(f"\n   Classification Report:")
-    print(classification_report(y_true_interview, y_pred_interview, zero_division=0, digits=4))
-    print(f"\n   Confusion Matrix:")
-    print(confusion_matrix(y_true_interview, y_pred_interview))
+    print(f"   MSE:  {mse:.4f}")
+    print(f"   RMSE: {rmse:.4f}")
+    print(f"   MAE:  {mae:.4f}")
+    print(f"   R²:   {r2:.4f}")
     
     return {
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
+        'mse': mse,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2,
         'y_true': y_true_interview,
         'y_pred': y_pred_interview,
         'interview_ids': interview_ids
@@ -397,7 +475,7 @@ def evaluate_interview_level(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Random Forest baseline for BLRI binary classification using AU features"
+        description="MLP baseline for BLRI regression using AU features"
     )
     parser.add_argument(
         "--data_model",
@@ -412,58 +490,60 @@ def main():
         help="Path to config_opentslm.yaml (default: opentslm/config_opentslm.yaml)"
     )
     parser.add_argument(
-        "--n_estimators",
+        "--hidden_dims",
         type=int,
-        default=100,
-        help="Number of trees in Random Forest (default: 100)"
+        nargs='+',
+        default=[128, 64, 32],
+        help="Hidden layer dimensions (default: 128 64 32)"
     )
     parser.add_argument(
-        "--max_depth",
-        type=int,
-        default=10,
-        help="Maximum depth of trees to prevent overfitting (default: 10, try 5-15)"
+        "--dropout",
+        type=float,
+        default=0.3,
+        help="Dropout rate for regularization (default: 0.3)"
     )
     parser.add_argument(
-        "--min_samples_split",
-        type=int,
-        default=20,
-        help="Minimum samples required to split a node (default: 20, higher = more regularization)"
+        "--learning_rate",
+        type=float,
+        default=0.001,
+        help="Learning rate for Adam optimizer (default: 0.001)"
     )
     parser.add_argument(
-        "--min_samples_leaf",
+        "--batch_size",
         type=int,
-        default=10,
-        help="Minimum samples required at leaf node (default: 10, higher = more regularization)"
+        default=256,
+        help="Batch size for training (default: 256)"
     )
     parser.add_argument(
-        "--max_features",
+        "--num_epochs",
+        type=int,
+        default=15,
+        help="Number of training epochs (default: 15)"
+    )
+    parser.add_argument(
+        "--device",
         type=str,
-        default='sqrt',
-        help="Features to consider for best split: 'sqrt', 'log2', or float (default: 'sqrt')"
-    )
-    parser.add_argument(
-        "--random_state",
-        type=int,
-        default=42,
-        help="Random seed (default: 42)"
+        default='cuda' if torch.cuda.is_available() else 'cpu',
+        help="Device: 'cuda' or 'cpu' (default: auto-detect)"
     )
     
     args = parser.parse_args()
     
     print("=" * 80)
-    print("Random Forest Baseline: AU-based BLRI Binary Classification")
+    print("MLP Baseline: AU-based BLRI Regression")
     print("=" * 80)
     print(f"\nConfiguration:")
     print(f"  Data model: {args.data_model}")
     print(f"  Config: {args.config}")
     print(f"  AU columns: ALL 17 AUs (both therapist and client) = 34 features")
-    print(f"\nRandom Forest Hyperparameters:")
-    print(f"  n_estimators: {args.n_estimators}")
-    print(f"  max_depth: {args.max_depth}")
-    print(f"  min_samples_split: {args.min_samples_split}")
-    print(f"  min_samples_leaf: {args.min_samples_leaf}")
-    print(f"  max_features: {args.max_features}")
-    print(f"  random_state: {args.random_state}")
+    print(f"  Target: Client BLRI scores (T3/T5/T7_BLRI_ges_Pr)")
+    print(f"\nMLP Hyperparameters:")
+    print(f"  Hidden dims: {args.hidden_dims}")
+    print(f"  Dropout: {args.dropout}")
+    print(f"  Learning rate: {args.learning_rate}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Epochs: {args.num_epochs}")
+    print(f"  Device: {args.device}")
     
     # Load data model
     data_model = load_data_model(args.data_model)
@@ -485,16 +565,23 @@ def main():
     print(f"   X_val: {X_val.shape}")
     print(f"   X_test: {X_test.shape}")
     
-    # Train Random Forest
-    clf = train_random_forest(
+    print(f"\n📊 Target statistics:")
+    print(f"   Train BLRI - Mean: {y_train.mean():.2f}, Std: {y_train.std():.2f}, Range: [{y_train.min():.2f}, {y_train.max():.2f}]")
+    print(f"   Val BLRI   - Mean: {y_val.mean():.2f}, Std: {y_val.std():.2f}, Range: [{y_val.min():.2f}, {y_val.max():.2f}]")
+    print(f"   Test BLRI  - Mean: {y_test.mean():.2f}, Std: {y_test.std():.2f}, Range: [{y_test.min():.2f}, {y_test.max():.2f}]")
+    
+    # Train MLP
+    model = train_mlp(
         X_train,
         y_train,
-        n_estimators=args.n_estimators,
-        max_depth=args.max_depth,
-        min_samples_split=args.min_samples_split,
-        min_samples_leaf=args.min_samples_leaf,
-        max_features=args.max_features,
-        random_state=args.random_state
+        X_val,
+        y_val,
+        hidden_dims=args.hidden_dims,
+        dropout=args.dropout,
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        num_epochs=args.num_epochs,
+        device=args.device
     )
     
     # Evaluate on all splits
@@ -503,28 +590,38 @@ def main():
     print("=" * 80)
     
     # Frame-level evaluation
-    train_frame_metrics = evaluate_frame_level(clf, X_train, y_train, "Train")
-    val_frame_metrics = evaluate_frame_level(clf, X_val, y_val, "Validation")
-    test_frame_metrics = evaluate_frame_level(clf, X_test, y_test, "Test")
+    train_frame_metrics = evaluate_frame_level(model, X_train, y_train, "Train", args.device)
+    val_frame_metrics = evaluate_frame_level(model, X_val, y_val, "Validation", args.device)
+    test_frame_metrics = evaluate_frame_level(model, X_test, y_test, "Test", args.device)
     
-    # Interview-level evaluation (majority vote)
-    train_interview_metrics = evaluate_interview_level(clf, train_entries, "Train")
-    val_interview_metrics = evaluate_interview_level(clf, val_entries, "Validation")
-    test_interview_metrics = evaluate_interview_level(clf, test_entries, "Test")
+    # Interview-level evaluation (mean aggregation)
+    train_interview_metrics = evaluate_interview_level(model, train_entries, "Train", args.device)
+    val_interview_metrics = evaluate_interview_level(model, val_entries, "Validation", args.device)
+    test_interview_metrics = evaluate_interview_level(model, test_entries, "Test", args.device)
     
     # Summary
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
-    print("\nFrame-Level F1 Scores:")
-    print(f"  Train: {train_frame_metrics['f1']:.4f}")
-    print(f"  Val:   {val_frame_metrics['f1']:.4f}")
-    print(f"  Test:  {test_frame_metrics['f1']:.4f}")
+    print("\nFrame-Level RMSE:")
+    print(f"  Train: {train_frame_metrics['rmse']:.4f}")
+    print(f"  Val:   {val_frame_metrics['rmse']:.4f}")
+    print(f"  Test:  {test_frame_metrics['rmse']:.4f}")
     
-    print("\nInterview-Level F1 Scores (Majority Vote):")
-    print(f"  Train: {train_interview_metrics['f1']:.4f}")
-    print(f"  Val:   {val_interview_metrics['f1']:.4f}")
-    print(f"  Test:  {test_interview_metrics['f1']:.4f}")
+    print("\nFrame-Level R²:")
+    print(f"  Train: {train_frame_metrics['r2']:.4f}")
+    print(f"  Val:   {val_frame_metrics['r2']:.4f}")
+    print(f"  Test:  {test_frame_metrics['r2']:.4f}")
+    
+    print("\nInterview-Level RMSE (Mean Aggregation):")
+    print(f"  Train: {train_interview_metrics['rmse']:.4f}")
+    print(f"  Val:   {val_interview_metrics['rmse']:.4f}")
+    print(f"  Test:  {test_interview_metrics['rmse']:.4f}")
+    
+    print("\nInterview-Level R²:")
+    print(f"  Train: {train_interview_metrics['r2']:.4f}")
+    print(f"  Val:   {val_interview_metrics['r2']:.4f}")
+    print(f"  Test:  {test_interview_metrics['r2']:.4f}")
     
     print("\n✅ Evaluation complete!")
 
