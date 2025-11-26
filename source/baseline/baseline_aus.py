@@ -272,15 +272,33 @@ def train_random_forest(
     X_train: np.ndarray,
     y_train: np.ndarray,
     n_estimators: int = 100,
-    max_depth: Optional[int] = None,
+    max_depth: Optional[int] = 10,
+    min_samples_split: int = 20,
+    min_samples_leaf: int = 10,
+    max_features: str = 'sqrt',
     random_state: int = 42
 ) -> RandomForestClassifier:
-    """Train a Random Forest classifier."""
-    print(f"\n🌲 Training Random Forest (n_estimators={n_estimators}, max_depth={max_depth})...")
+    """Train a Random Forest classifier with regularization to prevent overfitting.
+    
+    Key parameters to prevent overfitting:
+    - max_depth: Limits tree depth (default: 10)
+    - min_samples_split: Minimum samples required to split a node (default: 20)
+    - min_samples_leaf: Minimum samples required at leaf node (default: 10)
+    - max_features: Features to consider for best split (default: 'sqrt')
+    """
+    print(f"\n🌲 Training Random Forest with regularization...")
+    print(f"   n_estimators={n_estimators}")
+    print(f"   max_depth={max_depth}")
+    print(f"   min_samples_split={min_samples_split}")
+    print(f"   min_samples_leaf={min_samples_leaf}")
+    print(f"   max_features={max_features}")
     
     clf = RandomForestClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
         random_state=random_state,
         n_jobs=-1,
         class_weight='balanced'  # Handle class imbalance
@@ -402,8 +420,26 @@ def main():
     parser.add_argument(
         "--max_depth",
         type=int,
-        default=None,
-        help="Maximum depth of trees (default: None)"
+        default=10,
+        help="Maximum depth of trees to prevent overfitting (default: 10, try 5-15)"
+    )
+    parser.add_argument(
+        "--min_samples_split",
+        type=int,
+        default=20,
+        help="Minimum samples required to split a node (default: 20, higher = more regularization)"
+    )
+    parser.add_argument(
+        "--min_samples_leaf",
+        type=int,
+        default=10,
+        help="Minimum samples required at leaf node (default: 10, higher = more regularization)"
+    )
+    parser.add_argument(
+        "--max_features",
+        type=str,
+        default='sqrt',
+        help="Features to consider for best split: 'sqrt', 'log2', or float (default: 'sqrt')"
     )
     parser.add_argument(
         "--random_state",
@@ -420,9 +456,13 @@ def main():
     print(f"\nConfiguration:")
     print(f"  Data model: {args.data_model}")
     print(f"  Config: {args.config}")
-    print(f"  AU columns: ALL 17 AUs (both therapist and client)")
+    print(f"  AU columns: ALL 17 AUs (both therapist and client) = 34 features")
+    print(f"\nRandom Forest Hyperparameters:")
     print(f"  n_estimators: {args.n_estimators}")
     print(f"  max_depth: {args.max_depth}")
+    print(f"  min_samples_split: {args.min_samples_split}")
+    print(f"  min_samples_leaf: {args.min_samples_leaf}")
+    print(f"  max_features: {args.max_features}")
     print(f"  random_state: {args.random_state}")
     
     # Load data model
@@ -451,6 +491,9 @@ def main():
         y_train,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,
+        min_samples_split=args.min_samples_split,
+        min_samples_leaf=args.min_samples_leaf,
+        max_features=args.max_features,
         random_state=args.random_state
     )
     
