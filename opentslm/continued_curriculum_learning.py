@@ -712,8 +712,8 @@ class ContinuedCurriculumTrainer:
         if batch_size is None:
             batch_size = BATCH_SIZE
             
-        if feature_columns is None:
-            feature_columns = ['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r']
+        # feature_columns=None means use ALL AU*_r columns from OpenFace
+        # The loader will automatically extract all available AU regression columns
 
         if self.rank == 0:
             print(f"\n🚀 Starting {stage_name} Training with {self.model_type}")
@@ -997,8 +997,8 @@ def main():
     parser.add_argument(
         "--feature_columns",
         nargs="+",
-        default=['AU12_r', 'AU06_r', 'AU04_r', 'AU15_r'],
-        help="AU feature columns to use (default: AU12_r AU06_r AU04_r AU15_r)",
+        default=None,
+        help="AU feature columns to use (default: None = all AU*_r columns from OpenFace)",
     )
     parser.add_argument(
         "--eval_only",
