@@ -30,6 +30,7 @@ class PsychotherapyCoTQADataset(QADataset):
         time_series_format_function: Optional function to format time series
         max_samples: Maximum number of samples to load (for debugging)
         feature_columns: List of AU column names to use (e.g., ['AU04_r'] for debugging)
+        max_seq_length: Maximum sequence length; longer sequences are downsampled (default: 4096)
     """
 
     def __init__(self, 
@@ -38,9 +39,11 @@ class PsychotherapyCoTQADataset(QADataset):
                  format_sample_str: bool = False, 
                  time_series_format_function=None,
                  max_samples: int = None,
-                 feature_columns: List[str] = None):
+                 feature_columns: List[str] = None,
+                 max_seq_length: int = 4096):
         self.max_samples = max_samples
         self.feature_columns = feature_columns
+        self.max_seq_length = max_seq_length
         super().__init__(
             split=split,
             EOS_TOKEN=EOS_TOKEN, 
@@ -52,13 +55,14 @@ class PsychotherapyCoTQADataset(QADataset):
         """Load train/val/test splits as plain Python lists."""
         train_list, val_list, test_list = load_psychotherapy_cot_splits(
             max_samples=self.max_samples,
-            feature_columns=self.feature_columns
+            feature_columns=self.feature_columns,
+            max_seq_length=self.max_seq_length
         )
         
         return train_list, val_list, test_list
 
     def _get_answer(self, row) -> str:
-        """Get the answer from the answer JSON file (combined_description)."""
+        """Get the answer from the data_model yaml file (combined_description)."""
         return row.get("answer", "")
 
     def _get_pre_prompt(self, row) -> str:

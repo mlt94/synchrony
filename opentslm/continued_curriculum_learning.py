@@ -746,7 +746,7 @@ class ContinuedCurriculumTrainer:
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
 
         # Dataset kwargs
-        dataset_kwargs = {'feature_columns': feature_columns}
+        dataset_kwargs = {'feature_columns': feature_columns, 'max_seq_length': 4096}
 
         # Create data loaders
         train_loader = self._merge_data_loaders(

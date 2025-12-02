@@ -11,7 +11,8 @@ def load_psychotherapy_cot_splits(
     data_model_path: str = r'/home/mlut/PsyTSLM/data_model.yaml',
     interview_types: List[str] = None,
     max_samples: int = None,
-    feature_columns: List[str] = None
+    feature_columns: List[str] = None,
+    max_seq_length: int = 4096
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Load psychotherapy data from data_model.yaml and create train/val/test splits by therapist.
@@ -30,6 +31,8 @@ def load_psychotherapy_cot_splits(
         max_samples: Maximum samples per split (for debugging; None = no limit)
         feature_columns: List of AU column names to extract (default: all AU*_r columns)
                         Example: ['AU04_r'] for debug mode with single feature
+        max_seq_length: Maximum sequence length after downsampling (default: 4096 to match model limit)
+                       Sequences longer than this will be uniformly downsampled
     
     Returns:
         Tuple of (train_samples, val_samples, test_samples) as lists of dicts.
@@ -41,7 +44,7 @@ def load_psychotherapy_cot_splits(
     
     # Disk caching: Create cache file based on parameters
     # This avoids reloading and processing JSONs/CSVs on every run (saves minutes)
-    cache_key = f"{config_path}_{data_model_path}_{interview_types}_{max_samples}_{feature_columns}"
+    cache_key = f"{config_path}_{data_model_path}_{interview_types}_{max_samples}_{feature_columns}_{max_seq_length}"
     cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
     cache_file = Path(f"psychotherapy_cache_{cache_hash}.pkl")
     
@@ -83,15 +86,15 @@ def load_psychotherapy_cot_splits(
     # Process splits with early exit if max_samples reached
     train_samples = _process_split(
         data_model['interviews'], train_therapists, interview_types,
-        combined_descriptions, answers, max_samples, feature_columns
+        combined_descriptions, answers, max_samples, feature_columns, max_seq_length
     )
     val_samples = _process_split(
         data_model['interviews'], val_therapists, interview_types,
-        combined_descriptions, answers, max_samples, feature_columns
+        combined_descriptions, answers, max_samples, feature_columns, max_seq_length
     )
     test_samples = _process_split(
         data_model['interviews'], test_therapists, interview_types,
-        combined_descriptions, answers, max_samples, feature_columns
+        combined_descriptions, answers, max_samples, feature_columns, max_seq_length
     )
     
     print(f"[psychotherapy_loader] Train: {len(train_samples)}, Val: {len(val_samples)}, Test: {len(test_samples)}")
@@ -301,7 +304,8 @@ def _process_split(
     combined_descriptions: List[Dict],
     answers: Dict[Tuple[str, str, str, int], str],
     max_samples: int = None,
-    feature_columns: List[str] = None
+    feature_columns: List[str] = None,
+    max_seq_length: int = 4096
 ) -> List[Dict]:
     """
     Process all interviews for therapists in the given split.
@@ -320,6 +324,7 @@ def _process_split(
         answers: Dict mapping turn keys to answer text (from answer JSONs)
         max_samples: Optional limit for debugging
         feature_columns: Optional list of AU columns to extract
+        max_seq_length: Maximum sequence length; longer sequences are downsampled (default: 4096)
     
     Returns:
         List of sample dicts ready for training
@@ -404,7 +409,8 @@ def _process_split(
             type_data.get('labels', {}),
             interview_data.get('baseline', {}),
             feature_columns,
-            answers
+            answers,
+            max_seq_length
         )
         
         if sample is not None:
@@ -424,7 +430,8 @@ def _extract_single_window(
     labels: Dict,
     baseline: Dict,
     feature_columns: List[str] = None,
-    answers: Dict[Tuple[str, str, str, int], str] = None
+    answers: Dict[Tuple[str, str, str, int], str] = None,
+    max_seq_length: int = 4096
 ) -> Dict:
     """
     Extract a single time window from therapist and patient OpenFace AU data.
@@ -433,8 +440,9 @@ def _extract_single_window(
     1. Extracts the time window specified by start_ms/end_ms from the turn description
     2. Filters to AU columns (default: all AU*_r regression values)
     3. Extracts AU vectors and computes mean/std for each AU for both people
-    4. Looks up the answer text from the answers dict
-    5. Returns a complete sample dict ready for the dataset
+    4. Downsamples sequences longer than max_seq_length using uniform sampling
+    5. Looks up the answer text from the answers dict
+    6. Returns a complete sample dict ready for the dataset
     
     Args:
         therapist_df: Therapist OpenFace CSV DataFrame
@@ -444,6 +452,7 @@ def _extract_single_window(
         baseline: Baseline from data_model (session-level metadata)
         feature_columns: Optional list of AU column names (e.g., ['AU04_r'] for debug)
         answers: Dict to lookup answer text by (patient_id, therapist_id, type, turn_idx)
+        max_seq_length: Maximum sequence length; longer sequences are downsampled (default: 4096)
     
     Returns:
         Sample dict with all necessary fields, or None if extraction fails
@@ -551,36 +560,42 @@ def _extract_single_window(
         print(f"[error] Failed to extract patient AUs for {desc_entry['patient_id']} ({desc_entry['interview_type']}): {e}")
         return None
     
-    # Check time series length and truncate if necessary to maintain model compatibility
-    # Max patches = 10400, so max time series length = 10400
-    MAX_SUPPORTED_LENGTH = 10400
+    # Check time series length and downsample if necessary to maintain model compatibility
+    # Model has max_patches limit which translates to max sequence length
+    # Use uniform downsampling to preserve temporal structure better than truncation
     
     # Get the length of the first AU (all AUs should have same length)
     sample_au = list(therapist_au_vectors.values())[0] if therapist_au_vectors else []
     actual_length = len(sample_au)
     
-    if actual_length > MAX_SUPPORTED_LENGTH:
-        print(f"⚠️  WARNING: Time series length {actual_length} exceeds maximum {MAX_SUPPORTED_LENGTH}")
+    if actual_length > max_seq_length:
+        print(f"⚠️  WARNING: Time series length {actual_length} exceeds maximum {max_seq_length}")
         print(f"   Patient: {desc_entry['patient_id']}, Therapist: {desc_entry['therapist_id']}")
         print(f"   Interview: {desc_entry['interview_type']}, Turn: {desc_entry['turn_index']}")
         print(f"   Time window: {desc_entry['start_ms']}ms - {desc_entry['end_ms']}ms ({(desc_entry['end_ms'] - desc_entry['start_ms'])/1000:.1f}s)")
-        print(f"   Truncating all AU vectors to {MAX_SUPPORTED_LENGTH} frames")
+        print(f"   Downsampling all AU vectors from {actual_length} to {max_seq_length} frames using uniform sampling")
         
-        # Truncate all therapist AU vectors
+        # Compute uniform sampling indices to preserve temporal structure
+        # This is better than truncation as it maintains representation across the full time window
+        indices = np.linspace(0, actual_length - 1, max_seq_length, dtype=int)
+        
+        # Downsample all therapist AU vectors
         for au_col in therapist_au_vectors:
-            therapist_au_vectors[au_col] = therapist_au_vectors[au_col][:MAX_SUPPORTED_LENGTH]
-            # Recalculate stats on truncated data
-            truncated_signal = np.array(therapist_au_vectors[au_col])
-            therapist_au_stats[au_col]["mean"] = float(truncated_signal.mean())
-            therapist_au_stats[au_col]["std"] = float(truncated_signal.std())
+            original_signal = np.array(therapist_au_vectors[au_col])
+            downsampled_signal = original_signal[indices]
+            therapist_au_vectors[au_col] = downsampled_signal.tolist()
+            # Recalculate stats on downsampled data
+            therapist_au_stats[au_col]["mean"] = float(downsampled_signal.mean())
+            therapist_au_stats[au_col]["std"] = float(downsampled_signal.std())
         
-        # Truncate all patient AU vectors
+        # Downsample all patient AU vectors
         for au_col in patient_au_vectors:
-            patient_au_vectors[au_col] = patient_au_vectors[au_col][:MAX_SUPPORTED_LENGTH]
-            # Recalculate stats on truncated data
-            truncated_signal = np.array(patient_au_vectors[au_col])
-            patient_au_stats[au_col]["mean"] = float(truncated_signal.mean())
-            patient_au_stats[au_col]["std"] = float(truncated_signal.std())
+            original_signal = np.array(patient_au_vectors[au_col])
+            downsampled_signal = original_signal[indices]
+            patient_au_vectors[au_col] = downsampled_signal.tolist()
+            # Recalculate stats on downsampled data
+            patient_au_stats[au_col]["mean"] = float(downsampled_signal.mean())
+            patient_au_stats[au_col]["std"] = float(downsampled_signal.std())
     
     # Get the transcript summary from the turn description
     # This provides context about what was said during this speech turn
