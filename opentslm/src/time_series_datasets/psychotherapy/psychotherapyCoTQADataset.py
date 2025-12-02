@@ -70,23 +70,16 @@ class PsychotherapyCoTQADataset(QADataset):
         original_summary = row.get("original_summary", "")
         speaker_id = row.get("speaker_id", "unknown")
         
-        prompt = f"""You are describing the relational dynamic in a speech turn from a psychotherapy session. 
-Your task is to describe the associations between what was said, the client and therapist's facial expressions, and how that relates to the degree of relational empathy.
+        prompt = f"""Describe the relational dynamic in this psychotherapy turn. Focus on the speech content and the 2-3 most salient facial Action Units (AUs). Be concise and avoid repetition.
 
-There are two possible answer categories. Either the client and therapist feel equally **empathic** to one another or there is **discrepancy**.
+Speech content: {original_summary} (spoken by {speaker_id})
 
-Data for this turn:
+Write a brief paragraph (3-5 sentences maximum):
+1. Summarize the speech content in ONE sentence
+2. Note only the MOST salient AU patterns that differ between client and therapist
+3. End with: "Answer: [equally empathic OR discrepancy]"
 
-Speech content summary: {original_summary} (spoken by {speaker_id})
-
-Instructions:
-- Begin by describing the speech content very briefly
-- Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones.
-- Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
-- Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
-- Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
-- Do **not** mention the answer category label until the final sentence.
-- You MUST end your response with "Answer: [equally empathic OR discrepancy]"
+Be concise. Do NOT describe every AU. Do NOT repeat phrases.
 
 """
         return prompt

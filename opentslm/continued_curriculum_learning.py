@@ -503,7 +503,7 @@ class ContinuedCurriculumTrainer:
         """Evaluate model on test set."""
         self.model.eval()
         results = []
-        max_new_tokens = 250
+        max_new_tokens = 150
 
         results_file_rank = os.path.join(
             self.results_dir,
