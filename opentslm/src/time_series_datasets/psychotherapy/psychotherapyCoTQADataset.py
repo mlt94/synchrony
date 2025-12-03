@@ -70,18 +70,20 @@ class PsychotherapyCoTQADataset(QADataset):
         original_summary = row.get("original_summary", "")
         speaker_id = row.get("speaker_id", "unknown")
         
-        prompt = f"""Describe the relational dynamic in this psychotherapy turn. Focus on the speech content and the 2-3 most salient facial Action Units (AUs). Be concise and avoid repetition.
+        prompt = f"""You are describing the content in a speech turn from a psychotherapy session. 
+Your task is to combine what was said with the client and therapist's facial expressions to one short, coherent paragraph.
 
 Speech content: {original_summary} (spoken by {speaker_id})
 
-Write a brief paragraph (3-5 sentences maximum):
-1. Summarize the speech content in ONE sentence
-2. Note only the MOST salient AU patterns that differ between client and therapist
-3. End with: "Answer: [equally empathic OR discrepancy]"
+Instructions:
+- Begin by describing the speech content very briefly
+- Then briefly note any salient facial Action Units (AUs) that stand out — do not over-analyze every AU, only mention the most relevant ones.
+- Do **not** over-analyze or speculate; be very true to what is actually present in the data available. 
+- Do not reflect on the emotional bond, synchrony or similar aspects of the interaction.
+- Write your description as a single, natural paragraph — do not use bullet points, numbered steps, or section headings.
+- ONLY output your description.
 
-Be concise. Do NOT describe every AU. Do NOT repeat phrases.
-
-"""
+Description: """
         return prompt
 
     def _get_post_prompt(self, row) -> str:
@@ -128,12 +130,6 @@ Be concise. Do NOT describe every AU. Do NOT repeat phrases.
             all_stds.append(stats["std"])
             all_labels.append(f"patient for {au_name}")
 
-        # Pad sequences to the same length within each speech turn.
-        # This is necessary because therapist and patient AU sequences may have slightly 
-        # different lengths (e.g., 662 vs 659 frames) due to timing differences.
-        # We use forward-fill (repeat last value) to ensure all signals have identical
-        # length for tensor creation while preserving signal characteristics.
-        # Note: Length check and truncation for MAX_SUPPORTED_LENGTH happens in the loader
         max_length = max(len(sig) for sig in all_signals)
         
         padded_signals = []
