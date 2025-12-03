@@ -168,9 +168,27 @@ def combine_with_gemma(
     device: str,
     timeseries_description: str,
     summary: str,
-    speaker_id: str
+    speaker_id: str,
+    use_concat: bool = False
 ) -> str:
-    """Use Gemma 7B-it to combine time-series description and summary into coherent text."""
+    """Use Gemma 7B-it to combine time-series description and summary into coherent text.
+    
+    Args:
+        tokenizer: Gemma tokenizer
+        model: Gemma model
+        device: Device to run on
+        timeseries_description: AU pattern description
+        summary: Speech content summary
+        speaker_id: Who spoke this turn
+        use_concat: If True, simply concatenate without LLM
+    
+    Returns:
+        Combined description text
+    """
+    
+    if use_concat:
+        # Simple concatenation bypass
+        return f"{summary} {timeseries_description}"
     
     prompt = create_combination_prompt(
         timeseries_description, summary, speaker_id
@@ -215,7 +233,8 @@ def process_patient_interview(
     tokenizer,
     model,
     device: str,
-    max_turns: Optional[int] = None
+    max_turns: Optional[int] = None,
+    use_concat: bool = False
 ) -> List[Dict[str, Any]]:
     """Process all turns for a single patient-interview combination.
     
@@ -227,6 +246,7 @@ def process_patient_interview(
         model: Gemma model
         device: Device to run on
         max_turns: Maximum number of turns to process (None = all)
+        use_concat: If True, use simple concatenation instead of LLM
     """
     
     results = []
@@ -288,7 +308,8 @@ def process_patient_interview(
                 device,
                 description_text,
                 summary_text,
-                desc['speaker_id']
+                desc['speaker_id'],
+                use_concat=use_concat
             )
             
             result = {
@@ -371,23 +392,28 @@ def main():
         default=["bindung", "personal", "wunder"],
         help="Interview types to process"
     )
+    parser.add_argument(
+        "--concat",
+        action="store_true",
+        help="Use simple string concatenation instead of LLM (bypasses Gemma model)"
+    )
     
     args = parser.parse_args()
     
-    print("🚀 Starting time-series description + summary combination with Gemma 7B-it")
+    print("🚀 Starting time-series description + summary combination" + (" (concat mode)" if args.concat else " with Gemma 7B-it"))
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
     print(f"  Time-series descriptions dir: {args.descriptions_dir}")
     print(f"  Output dir: {args.output_dir}")
-    print(f"  Model: {args.model_name}")
+    print(f"  Mode: {'String concatenation' if args.concat else f'LLM ({args.model_name})'}")
     print(f"  Interview types: {args.interview_types}")
     if args.max_turns:
         print(f"  Max turns per interview: {args.max_turns} (debugging mode)")
     print()
     
     # Setup
-    device = setup_device()
+    device = setup_device() if not args.concat else "cpu"
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load data
@@ -400,17 +426,27 @@ def main():
     
     print(f"\n📊 Processing {len(interviews)} interviews")
     
-    # Load Gemma model
-    print(f"\n🔧 Loading {args.model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map="auto" if device == "cuda" else None,
-        low_cpu_mem_usage=True
-    )
-    
-    if device == "cpu":
+    # Load Gemma model (skip if using concatenation)
+    if args.concat:
+        print("\n⚡ Using simple concatenation mode - skipping model load")
+        tokenizer = None
+        model = None
+    else:
+        print(f"\n🔧 Loading {args.model_name}...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto" if device == "cuda" else None,
+            low_cpu_mem_usage=True
+        )
+        
+        if device == "cpu":
+            model = model.to(device)
+        
+        print(f"✅ Model loaded on {device}")
+        if device == "cuda":
+            print(f"   GPU Memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
         model = model.to(device)
     
     print(f"✅ Model loaded on {device}")
@@ -448,7 +484,8 @@ def main():
                 tokenizer,
                 model,
                 device,
-                max_turns=args.max_turns
+                max_turns=args.max_turns,
+                use_concat=args.concat
             )
             
             if results:
