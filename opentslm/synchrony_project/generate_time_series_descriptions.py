@@ -1,7 +1,7 @@
 """
-Generate time-series descriptions using the Gemma-3 multimodal pipeline.
+Generate time-series descriptions using the Qwen2.5-VL multimodal model.
 This is the first out of two-steps to create comparable "rationales" as the OpenTSLM paper have.
-In this step, we give a Gemma-3 a heatmap of action unit time series, and simply asks it to describe it.
+In this step, we give a Qwen2.5-VL model a heatmap of action unit time series, and simply asks it to describe it.
 Its akin to what the opentslm authors did with gpt-4o.
 
 The next step is to combine these descriptions with the transcripts to form coherent rationales or descriptions,
@@ -11,7 +11,7 @@ This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
 3. Generates 4 subplots (2x2) with therapist and client AUs overlaid
-4. Feeds plots into Gemma-3 27b-it for description generation
+4. Feeds plots into Qwen2.5-VL-72B-Instruct-AWQ for description generation
 """
 
 import sys
@@ -19,15 +19,19 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-import random
 import json
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from transformers import pipeline
+from transformers import AutoModelForVision2Seq, AutoProcessor
+try:
+    from transformers import AwqConfig
+except Exception:
+    AwqConfig = None
 import yaml
+from PIL import Image
 
 # Add OpenTSLM src to path
 opentslm_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -40,6 +44,38 @@ def setup_device():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     return device
+
+
+def _build_max_memory(max_memory_gb: int) -> Dict[str, str]:
+    if not torch.cuda.is_available():
+        return {"cpu": "64GiB"}
+    num_gpus = torch.cuda.device_count()
+    max_memory = {i: f"{max_memory_gb}GiB" for i in range(num_gpus)}
+    max_memory["cpu"] = "64GiB"
+    return max_memory
+
+
+def load_qwen_vl_model(model_id: str, max_memory_gb: int, attn_implementation: str):
+    print(f"\n\ud83d\udd27 Loading Qwen2.5-VL model: {model_id}")
+
+    quantization_config = None
+    if AwqConfig is not None:
+        quantization_config = AwqConfig(bits=4, group_size=128, zero_point=True, version="GEMM")
+
+    max_memory = _build_max_memory(max_memory_gb)
+
+    model = AutoModelForVision2Seq.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto",
+        max_memory=max_memory,
+        quantization_config=quantization_config,
+        attn_implementation=attn_implementation,
+        trust_remote_code=True,
+    )
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    print("\u2705 Model loaded")
+    return model, processor
 
 
 def load_data_model(yaml_path: Path) -> Dict:
@@ -228,8 +264,8 @@ def generate_plot_for_turn(
         return False
 
 
-def generate_description_with_pipeline(pipe, image_path: Path, turn: Dict, au_names: List[str]) -> str:
-    """Generate time-series description using the Gemma-3 pipeline."""
+def generate_description_with_model(model, processor, image_path: Path, turn: Dict, au_names: List[str]) -> str:
+    """Generate time-series description using Qwen2.5-VL."""
     
     pre_prompt = """Describe these AU heatmaps (left=therapist blue, right=client orange). 
 Each row is one AU across 8 time bins. Write one compact sentence per AU comparing patterns.
@@ -247,20 +283,42 @@ Description:"""
         {
             "role": "user",
             "content": [
-                {"type": "image", "url": str(image_path)},
-                {"type": "text", "text": f"{pre_prompt}\n\n{context}"}
-            ]
+                {"type": "image"},
+                {"type": "text", "text": f"{pre_prompt}\n\n{context}"},
+            ],
         }
     ]
     
     try:
-        # Fixed token limit: model instructed to focus only on most volatile AUs
-        output = pipe(
-            text=messages,
-            max_new_tokens=125,
-            do_sample=False
+        image = Image.open(image_path).convert("RGB")
+        prompt = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
-        description = output[0]["generated_text"][-1]["content"].strip()
+        inputs = processor(
+            text=[prompt],
+            images=[image],
+            return_tensors="pt",
+        )
+
+        input_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        for k, v in inputs.items():
+            if torch.is_tensor(v):
+                inputs[k] = v.to(input_device)
+
+        # Fixed token limit: model instructed to focus only on most volatile AUs
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=125,
+            do_sample=False,
+        )
+        generated_text = processor.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )[0].strip()
+
+        if prompt in generated_text:
+            description = generated_text.replace(prompt, "", 1).strip()
+        else:
+            description = generated_text
         
         # Optimized: Minimal post-processing - remove only essential unwanted elements
         # Remove common prefixes
@@ -283,7 +341,8 @@ Description:"""
 def process_interview(
     interview: Dict,
     interview_type: str,
-    pipe,
+    model,
+    processor,
     output_dir: Path,
     au_names: List[str],
     max_turns: int = None
@@ -293,7 +352,8 @@ def process_interview(
     Args:
         interview: Interview dict from data_model.yaml
         interview_type: One of 'bindung', 'personal', 'wunder'
-        pipe: Gemma-3 pipeline
+        model: Qwen2.5-VL model
+        processor: Qwen2.5-VL processor
         output_dir: Directory to save plots and results
         au_names: List of AU names to analyze
         max_turns: Maximum number of turns to process (None = all)
@@ -349,7 +409,7 @@ def process_interview(
             continue
         
         # Generate description
-        description = generate_description_with_pipeline(pipe, plot_path, turn, au_names)
+        description = generate_description_with_model(model, processor, plot_path, turn, au_names)
         
         # Collect result
         result = {
@@ -387,7 +447,7 @@ def save_results(results: List[Dict[str, Any]], output_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate AU time-series descriptions from data_model.yaml using Gemma-3 multimodal pipeline"
+        description="Generate AU time-series descriptions from data_model.yaml using Qwen2.5-VL"
     )
     parser.add_argument(
         "--data_model",
@@ -427,16 +487,37 @@ def main():
                  'AU20_r', 'AU23_r', 'AU25_r', 'AU26_r', 'AU45_r'],
         help="AU columns to analyze (default: all 17 AUs)"
     )
+    parser.add_argument(
+        "--model_id",
+        type=str,
+        default="Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
+        help="Qwen2.5-VL model ID (default: Qwen/Qwen2.5-VL-72B-Instruct-AWQ)"
+    )
+    parser.add_argument(
+        "--max_memory_gb",
+        type=int,
+        default=75,
+        help="Per-GPU max memory for device_map auto (GiB, default: 75)"
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        help="Attention implementation (default: flash_attention_2)"
+    )
     
     args = parser.parse_args()
     
-    print("🚀 Starting AU time-series description generation with Gemma-3 multimodal pipeline")
+    print("🚀 Starting AU time-series description generation with Qwen2.5-VL")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
     print(f"  Output dir: {args.output_dir}")
     print(f"  Interview types: {args.interview_types}")
     print(f"  AU columns: {args.au_columns}")
+    print(f"  Model ID: {args.model_id}")
+    print(f"  Max memory per GPU (GiB): {args.max_memory_gb}")
+    print(f"  Attention impl: {args.attn_implementation}")
     print()
     
     # Setup
@@ -450,15 +531,12 @@ def main():
     if args.max_interviews:
         interviews = interviews[:args.max_interviews]
     
-    # Initialize Gemma-3 pipeline
-    print(f"\n🔧 Loading Gemma-3-27b-it model...")
-    pipe = pipeline(
-        "image-text-to-text",
-        model="google/gemma-3-27b-it",
-        device=device,
-        torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32
+    # Initialize Qwen2.5-VL model
+    model, processor = load_qwen_vl_model(
+        model_id=args.model_id,
+        max_memory_gb=args.max_memory_gb,
+        attn_implementation=args.attn_implementation,
     )
-    print("✅ Model loaded")
     
     # Process all interviews
     all_results = []
@@ -476,7 +554,8 @@ def main():
             results = process_interview(
                 interview,
                 interview_type,
-                pipe,
+                model,
+                processor,
                 args.output_dir,
                 args.au_columns,
                 max_turns=args.max_turns_per_interview
