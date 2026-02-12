@@ -55,24 +55,39 @@ def _build_max_memory(max_memory_gb: int) -> Dict[str, str]:
     return max_memory
 
 
-def load_qwen_vl_model(model_id: str, max_memory_gb: int, attn_implementation: str):
+def load_qwen_vl_model(
+    model_id: str,
+    max_memory_gb: int,
+    attn_implementation: str,
+    disable_awq: bool = False,
+):
     print(f"\nLoading Qwen2.5-VL model: {model_id}")
-
-    quantization_config = None
-    if AwqConfig is not None:
-        quantization_config = AwqConfig(bits=4, group_size=128, zero_point=True, version="GEMM")
 
     max_memory = _build_max_memory(max_memory_gb)
 
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-        max_memory=max_memory,
-        quantization_config=quantization_config,
-        attn_implementation=attn_implementation,
-        trust_remote_code=True,
-    )
+    def _load_model(quant_config):
+        return AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+            max_memory=max_memory,
+            quantization_config=quant_config,
+            attn_implementation=attn_implementation,
+            trust_remote_code=True,
+        )
+
+    quantization_config = None
+    if not disable_awq and AwqConfig is not None:
+        quantization_config = AwqConfig(bits=4, group_size=128, zero_point=True, version="GEMM")
+
+    try:
+        model = _load_model(quantization_config)
+    except ImportError as e:
+        if quantization_config is None:
+            raise
+        print(f"AWQ load failed ({e}). Retrying without 4-bit AWQ.")
+        model = _load_model(None)
+
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     print("Model loaded")
     return model, processor
@@ -505,6 +520,11 @@ def main():
         default="flash_attention_2",
         help="Attention implementation (default: flash_attention_2)"
     )
+    parser.add_argument(
+        "--disable_awq",
+        action="store_true",
+        help="Disable 4-bit AWQ and load in bf16"
+    )
     
     args = parser.parse_args()
     
@@ -518,6 +538,7 @@ def main():
     print(f"  Model ID: {args.model_id}")
     print(f"  Max memory per GPU (GiB): {args.max_memory_gb}")
     print(f"  Attention impl: {args.attn_implementation}")
+    print(f"  AWQ disabled: {args.disable_awq}")
     print()
     
     # Setup
@@ -536,6 +557,7 @@ def main():
         model_id=args.model_id,
         max_memory_gb=args.max_memory_gb,
         attn_implementation=args.attn_implementation,
+        disable_awq=args.disable_awq,
     )
     
     # Process all interviews
