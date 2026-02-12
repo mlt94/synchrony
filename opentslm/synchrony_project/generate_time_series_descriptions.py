@@ -56,7 +56,7 @@ def _build_max_memory(max_memory_gb: int) -> Dict[str, str]:
 
 
 def load_qwen_vl_model(model_id: str, max_memory_gb: int, attn_implementation: str):
-    print(f"\n\ud83d\udd27 Loading Qwen2.5-VL model: {model_id}")
+    print(f"\nLoading Qwen2.5-VL model: {model_id}")
 
     quantization_config = None
     if AwqConfig is not None:
@@ -74,7 +74,7 @@ def load_qwen_vl_model(model_id: str, max_memory_gb: int, attn_implementation: s
         trust_remote_code=True,
     )
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    print("\u2705 Model loaded")
+    print("Model loaded")
     return model, processor
 
 
@@ -83,7 +83,7 @@ def load_data_model(yaml_path: Path) -> Dict:
     print(f"Loading data model from {yaml_path}...")
     with open(yaml_path, 'r') as f:
         data = yaml.safe_load(f)
-    print(f"✅ Loaded {len(data['interviews'])} interviews")
+    print(f"Loaded {len(data['interviews'])} interviews")
     return data
 
 
@@ -183,7 +183,7 @@ def generate_plot_for_turn(
         
         # Check if we have data
         if therapist_data.empty or patient_data.empty:
-            print(f"⚠️ No data found for turn {turn_index} ({start_ms}-{end_ms}ms)")
+            print(f"Warning: No data found for turn {turn_index} ({start_ms}-{end_ms}ms)")
             return False
         
         # Create binned heatmaps for each AU
@@ -260,7 +260,7 @@ def generate_plot_for_turn(
         return True
         
     except Exception as e:
-        print(f"❌ Error generating plot for turn {turn.get('turn_index', '?')}: {e}")
+        print(f"Error generating plot for turn {turn.get('turn_index', '?')}: {e}")
         return False
 
 
@@ -334,7 +334,7 @@ Description:"""
         
         return description
     except Exception as e:
-        print(f"❌ Error generating description: {e}")
+        print(f"Error generating description: {e}")
         return f"Error: {str(e)}"
 
 
@@ -362,7 +362,7 @@ def process_interview(
         List of results dicts
     """
     if interview_type not in interview['types']:
-        print(f"⚠️ Interview type '{interview_type}' not found, skipping")
+        print(f"Warning: Interview type '{interview_type}' not found, skipping")
         return []
     
     type_data = interview['types'][interview_type]
@@ -372,13 +372,13 @@ def process_interview(
     
     # Validate paths
     if not therapist_csv.exists():
-        print(f"❌ Therapist CSV not found: {therapist_csv}")
+        print(f"Error: Therapist CSV not found: {therapist_csv}")
         return []
     if not patient_csv.exists():
-        print(f"❌ Patient CSV not found: {patient_csv}")
+        print(f"Error: Patient CSV not found: {patient_csv}")
         return []
     if not transcript_json.exists():
-        print(f"❌ Transcript JSON not found: {transcript_json}")
+        print(f"Error: Transcript JSON not found: {transcript_json}")
         return []
     
     # Load speech turns
@@ -431,15 +431,15 @@ def process_interview(
 
 def save_results(results: List[Dict[str, Any]], output_path: Path):
     """Save the generated time-series descriptions to JSON."""
-    print(f"\n💾 Saving {len(results)} results to {output_path}...")
+    print(f"\nSaving {len(results)} results to {output_path}...")
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
-    print(f"✅ Results saved")
+    print("Results saved")
     
     if results:
         avg_duration = np.mean([r['duration_ms'] for r in results])
         avg_description_len = np.mean([len(r['generated_descriptions']) for r in results])
-        print(f"\n📊 Summary:")
+        print("\nSummary:")
         print(f"  Total turns processed: {len(results)}")
         print(f"  Average turn duration: {avg_duration:.0f}ms")
         print(f"  Average description length: {avg_description_len:.0f} characters")
@@ -508,7 +508,7 @@ def main():
     
     args = parser.parse_args()
     
-    print("🚀 Starting AU time-series description generation with Qwen2.5-VL")
+    print("Starting AU time-series description generation with Qwen2.5-VL")
     print("=" * 80)
     print(f"Configuration:")
     print(f"  Data model: {args.data_model}")
@@ -568,7 +568,7 @@ def main():
                 save_results(results, output_json)
                 saved_files.append(str(output_json))
     
-    print(f"\n✅ Complete! Generated time-series descriptions for {len(all_results)} speech turns across {len(saved_files)} interview sessions")
+    print(f"\nComplete! Generated time-series descriptions for {len(all_results)} speech turns across {len(saved_files)} interview sessions")
 
 
 if __name__ == "__main__":
