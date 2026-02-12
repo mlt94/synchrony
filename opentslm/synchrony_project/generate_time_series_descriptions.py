@@ -11,7 +11,7 @@ This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
 3. Generates 4 subplots (2x2) with therapist and client AUs overlaid
-4. Feeds plots into Qwen2.5-VL-72B-Instruct-AWQ for description generation
+4. Feeds plots into Qwen2.5-VL-72B-Instruct for description generation
 """
 
 import sys
@@ -66,14 +66,18 @@ def load_qwen_vl_model(
     max_memory = _build_max_memory(max_memory_gb)
 
     def _load_model(quant_config):
-        return AutoModelForVision2Seq.from_pretrained(
-            model_id,
+        kwargs = dict(
             torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
             max_memory=max_memory,
-            quantization_config=quant_config,
             attn_implementation=attn_implementation,
             trust_remote_code=True,
+        )
+        if quant_config is not None:
+            kwargs["quantization_config"] = quant_config
+        return AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            **kwargs,
         )
 
     quantization_config = None
@@ -326,14 +330,11 @@ Description:"""
             max_new_tokens=125,
             do_sample=False,
         )
-        generated_text = processor.batch_decode(
-            generated_ids, skip_special_tokens=True
+        # Trim input tokens so we only decode the model's new output
+        generated_ids_trimmed = generated_ids[:, inputs["input_ids"].shape[1]:]
+        description = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True
         )[0].strip()
-
-        if prompt in generated_text:
-            description = generated_text.replace(prompt, "", 1).strip()
-        else:
-            description = generated_text
         
         # Optimized: Minimal post-processing - remove only essential unwanted elements
         # Remove common prefixes
@@ -505,8 +506,8 @@ def main():
     parser.add_argument(
         "--model_id",
         type=str,
-        default="Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
-        help="Qwen2.5-VL model ID (default: Qwen/Qwen2.5-VL-72B-Instruct-AWQ)"
+        default="Qwen/Qwen2.5-VL-72B-Instruct",
+        help="Qwen2.5-VL model ID (default: Qwen/Qwen2.5-VL-72B-Instruct)"
     )
     parser.add_argument(
         "--max_memory_gb",
