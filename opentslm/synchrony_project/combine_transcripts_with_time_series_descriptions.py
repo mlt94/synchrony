@@ -286,7 +286,7 @@ def process_patient_interview(
     for desc, summ in tqdm(matches, desc=f"{patient_id} {interview_type}"):
         try:
             # Skip if time-series description is empty or missing
-            description_text = desc.get('generated_descriptions', '').strip() 
+            description_text = desc.get('generated_rationale', desc.get('generated_descriptions', '')).strip()
             if not description_text:
                 skipped_empty += 1
                 continue

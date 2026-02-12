@@ -257,7 +257,7 @@ Description:"""
         # Fixed token limit: model instructed to focus only on most volatile AUs
         output = pipe(
             text=messages,
-            max_new_tokens=80,
+            max_new_tokens=125,
             do_sample=False
         )
         description = output[0]["generated_text"][-1]["content"].strip()
@@ -378,7 +378,7 @@ def save_results(results: List[Dict[str, Any]], output_path: Path):
     
     if results:
         avg_duration = np.mean([r['duration_ms'] for r in results])
-        avg_description_len = np.mean([len(r['generated_rationale']) for r in results])
+        avg_description_len = np.mean([len(r['generated_descriptions']) for r in results])
         print(f"\n📊 Summary:")
         print(f"  Total turns processed: {len(results)}")
         print(f"  Average turn duration: {avg_duration:.0f}ms")
