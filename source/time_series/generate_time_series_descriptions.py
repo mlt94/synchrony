@@ -10,7 +10,7 @@ as I like to call them (see combine_transcripts_with_time_series_descriptions.py
 This script:
 1. Reads data_model.yaml to get interview information
 2. Extracts AU time series from OpenFace CSVs for specific speech turn windows
-3. Generates 4 subplots (2x2) with therapist and client AUs overlaid
+3. Generate heatmap with therapist and client AUs overlaid
 4. Feeds plots into Qwen2.5-VL-72B-Instruct for description generation
 """
 
@@ -22,7 +22,7 @@ import pandas as pd
 import json
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from transformers import AutoModelForVision2Seq, AutoProcessor
@@ -33,11 +33,14 @@ except Exception:
 import yaml
 from PIL import Image
 
-# Add OpenTSLM src to path
-opentslm_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+# Add OpenTSLM src to path (script moved to source/time_series)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+opentslm_dir = os.path.join(project_root, "opentslm")
 src_dir = os.path.join(opentslm_dir, "src")
-sys.path.insert(0, opentslm_dir)
-sys.path.insert(0, src_dir)
+if os.path.isdir(opentslm_dir):
+    sys.path.insert(0, opentslm_dir)
+if os.path.isdir(src_dir):
+    sys.path.insert(0, src_dir)
 
 
 def setup_device():
@@ -111,6 +114,23 @@ def load_speech_turns(json_path: Path) -> List[Dict]:
     with open(json_path, 'r') as f:
         turns = json.load(f)
     return turns
+
+
+def load_existing_results(output_path: Path) -> List[Dict[str, Any]]:
+    """Load existing generated descriptions if present."""
+    if not output_path.exists():
+        return []
+
+    try:
+        with open(output_path, 'r') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+        print(f"Warning: Existing results file is not a list, ignoring: {output_path}")
+        return []
+    except Exception as e:
+        print(f"Warning: Failed to read existing results from {output_path}: {e}")
+        return []
 
 
 def extract_au_window(csv_path: Path, start_ms: float, end_ms: float, au_columns: List[str]) -> pd.DataFrame:
@@ -361,7 +381,9 @@ def process_interview(
     processor,
     output_dir: Path,
     au_names: List[str],
-    max_turns: int = None
+    max_turns: int = None,
+    existing_results: Optional[List[Dict[str, Any]]] = None,
+    checkpoint_path: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """Process a single interview type for description generation.
     
@@ -404,7 +426,9 @@ def process_interview(
     if max_turns:
         turns = turns[:max_turns]
     
-    results = []
+    existing_results = existing_results or []
+    processed_turn_indices = {r.get('turn_index') for r in existing_results if 'turn_index' in r}
+    results = list(existing_results)
     therapist_id = interview['therapist']['therapist_id']
     patient_id = interview['patient']['patient_id']
     
@@ -413,9 +437,14 @@ def process_interview(
     temp_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"\nProcessing {patient_id}/{therapist_id} - {interview_type}: {len(turns)} turns")
+    if processed_turn_indices:
+        print(f"Resuming: {len(processed_turn_indices)} turn(s) already processed; these will be skipped")
     
     for turn in tqdm(turns, desc=f"{patient_id} {interview_type}"):
         turn_index = turn['turn_index']
+
+        if turn_index in processed_turn_indices:
+            continue
         
         # Generate plot in .temp directory
         plot_path = temp_dir / f"{patient_id}_{interview_type}_turn{turn_index:03d}.jpg"
@@ -441,18 +470,25 @@ def process_interview(
             "plot_path": str(plot_path)
         }
         results.append(result)
+        processed_turn_indices.add(turn_index)
+
+        # Checkpoint after each successful turn so restarts resume from latest progress
+        if checkpoint_path is not None:
+            save_results(results, checkpoint_path, verbose=False)
     
     return results
 
 
-def save_results(results: List[Dict[str, Any]], output_path: Path):
+def save_results(results: List[Dict[str, Any]], output_path: Path, verbose: bool = True):
     """Save the generated time-series descriptions to JSON."""
-    print(f"\nSaving {len(results)} results to {output_path}...")
+    if verbose:
+        print(f"\nSaving {len(results)} results to {output_path}...")
     with open(output_path, 'w') as f:
         json.dump(results, f, indent=2)
-    print("Results saved")
+    if verbose:
+        print("Results saved")
     
-    if results:
+    if verbose and results:
         avg_duration = np.mean([r['duration_ms'] for r in results])
         avg_description_len = np.mean([len(r['generated_descriptions']) for r in results])
         print("\nSummary:")
@@ -526,6 +562,11 @@ def main():
         action="store_true",
         help="Disable 4-bit AWQ and load in bf16"
     )
+    parser.add_argument(
+        "--overwrite_existing",
+        action="store_true",
+        help="Overwrite existing output JSON files instead of resuming/skipping already processed turns"
+    )
     
     args = parser.parse_args()
     
@@ -540,6 +581,7 @@ def main():
     print(f"  Max memory per GPU (GiB): {args.max_memory_gb}")
     print(f"  Attention impl: {args.attn_implementation}")
     print(f"  AWQ disabled: {args.disable_awq}")
+    print(f"  Overwrite existing: {args.overwrite_existing}")
     print()
     
     # Setup
@@ -574,6 +616,14 @@ def main():
         print(f"{'='*80}")
         
         for interview_type in args.interview_types:
+            output_json = args.output_dir / f"{patient_id}_{interview_type}_descriptions.json"
+
+            existing_results = []
+            if not args.overwrite_existing:
+                existing_results = load_existing_results(output_json)
+                if existing_results:
+                    print(f"Found existing output ({len(existing_results)} rows): {output_json}")
+
             results = process_interview(
                 interview,
                 interview_type,
@@ -581,13 +631,14 @@ def main():
                 processor,
                 args.output_dir,
                 args.au_columns,
-                max_turns=args.max_turns_per_interview
+                max_turns=args.max_turns_per_interview,
+                existing_results=existing_results,
+                checkpoint_path=output_json,
             )
             all_results.extend(results)
             
             # Save immediately after each interview session (3 per dyad)
             if results:
-                output_json = args.output_dir / f"{patient_id}_{interview_type}_descriptions.json"
                 save_results(results, output_json)
                 saved_files.append(str(output_json))
     
