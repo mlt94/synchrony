@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 import sys
@@ -47,6 +48,24 @@ if str(_project_root) not in sys.path:
 
 from source.modeling.model import HierarchicalMultimodalAttentionNetwork
 from source.modeling.dataset import create_dataloaders
+
+
+def setup_logger(level: str = "INFO") -> logging.Logger:
+    """Configure process logger to emit to stderr (captured by SLURM .err)."""
+    logger = logging.getLogger("hman_train")
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.handlers.clear()
+    logger.propagate = False
+
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setLevel(getattr(logging, level.upper(), logging.INFO))
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +139,10 @@ def train_one_epoch(
     loader,
     optimizer,
     device: torch.device,
+    logger: logging.Logger,
+    epoch: int,
+    total_epochs: int,
+    log_interval: int = 20,
     grad_accum_steps: int = 1,
     max_grad_norm: float = 1.0,
 ) -> dict[str, float]:
@@ -129,6 +152,7 @@ def train_one_epoch(
     all_preds, all_targets = [], []
     optimizer.zero_grad()
 
+    grad_norm_value = float("nan")
     for step, batch in enumerate(loader):
         batch = _to_device(batch, device)
 
@@ -145,7 +169,8 @@ def train_one_epoch(
         loss.backward()
 
         if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(loader):
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            grad_norm_value = float(grad_norm.detach().cpu().item()) if torch.is_tensor(grad_norm) else float(grad_norm)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -153,6 +178,24 @@ def train_one_epoch(
         n_batches += 1
         all_preds.append(preds.detach().cpu().numpy())
         all_targets.append(batch["targets"].detach().cpu().numpy())
+
+        if ((step + 1) % max(log_interval, 1) == 0) or ((step + 1) == len(loader)):
+            gpu_mem_gb = 0.0
+            if device.type == "cuda":
+                gpu_mem_gb = torch.cuda.memory_allocated(device) / 1024**3
+            running_loss = total_loss / max(n_batches, 1)
+            logger.info(
+                "Epoch %d/%d | Train step %d/%d | loss=%.6f | running_loss=%.6f | grad_norm=%.4f | lr=%.3e | gpu_mem=%.2fGiB",
+                epoch,
+                total_epochs,
+                step + 1,
+                len(loader),
+                float(loss.item() * grad_accum_steps),
+                float(running_loss),
+                grad_norm_value,
+                optimizer.param_groups[0]["lr"],
+                gpu_mem_gb,
+            )
 
     all_preds_np = np.concatenate(all_preds, axis=0)
     all_targets_np = np.concatenate(all_targets, axis=0)
@@ -166,14 +209,17 @@ def evaluate(
     model: nn.Module,
     loader,
     device: torch.device,
-) -> dict[str, float]:
+    logger: logging.Logger,
+    stage: str = "val",
+    log_interval: int = 20,
+) -> tuple[dict[str, float], list[dict]]:
     model.eval()
     total_loss = 0.0
     n_batches = 0
     all_preds, all_targets = [], []
     all_attention: list[dict] = []
 
-    for batch in loader:
+    for step, batch in enumerate(loader):
         batch = _to_device(batch, device)
         preds, attn_w = model(
             batch["speech_input_ids"],
@@ -198,6 +244,20 @@ def evaluate(
                 "prediction": preds[i].cpu().tolist(),
                 "target": batch["targets"][i].cpu().tolist(),
             })
+
+        if ((step + 1) % max(log_interval, 1) == 0) or ((step + 1) == len(loader)):
+            gpu_mem_gb = 0.0
+            if device.type == "cuda":
+                gpu_mem_gb = torch.cuda.memory_allocated(device) / 1024**3
+            logger.info(
+                "%s step %d/%d | batch_loss=%.6f | running_loss=%.6f | gpu_mem=%.2fGiB",
+                stage.upper(),
+                step + 1,
+                len(loader),
+                float(loss.item()),
+                float(total_loss / max(n_batches, 1)),
+                gpu_mem_gb,
+            )
 
     all_preds_np = np.concatenate(all_preds, axis=0)
     all_targets_np = np.concatenate(all_targets, axis=0)
@@ -245,32 +305,44 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=10, help="Early stopping patience (0 = disabled)")
     p.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
     p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--log_level", type=str, default="INFO", help="Logging level: DEBUG, INFO, WARNING")
+    p.add_argument("--log_interval", type=int, default=20, help="Batch logging interval for train/val/test")
 
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    logger = setup_logger(args.log_level)
 
     # Reproducibility
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    logger.info("Starting HMAN training")
+    logger.info("Arguments: %s", json.dumps({k: str(v) for k, v in vars(args).items()}, indent=None))
+    logger.info("Python: %s", sys.version.replace("\n", " "))
+    logger.info("PyTorch: %s", torch.__version__)
+    logger.info("CUDA available: %s", torch.cuda.is_available())
+    logger.info("CUDA device count: %d", torch.cuda.device_count() if torch.cuda.is_available() else 0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    logger.info("Device: %s", device)
     if device.type == "cuda":
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  Memory: {torch.cuda.get_device_properties(0).total_mem / 1024**3:.1f} GiB")
+        props = torch.cuda.get_device_properties(0)
+        logger.info("GPU[0]: %s", torch.cuda.get_device_name(0))
+        logger.info("GPU[0] Memory: %.1f GiB", props.total_memory / 1024**3)
 
     # Output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory: %s", args.output_dir)
 
     # Tokeniser
-    print(f"\nLoading tokenizer: {args.bert_model}")
+    logger.info("Loading tokenizer: %s", args.bert_model)
     tokenizer = AutoTokenizer.from_pretrained(args.bert_model)
+    logger.info("Tokenizer loaded")
 
     # Dataloaders
-    print("\nBuilding datasets …")
+    logger.info("Building datasets and dataloaders")
     loaders = create_dataloaders(
         data_model_path=args.data_model,
         au_descriptions_dir=args.au_descriptions_dir,
@@ -280,9 +352,22 @@ def main():
         max_token_length=args.max_token_length,
         num_workers=args.num_workers,
     )
+    logger.info(
+        "DataLoader sizes | train: %d batches (%d sessions) | val: %d batches (%d sessions) | test: %d batches (%d sessions)",
+        len(loaders["train"]), len(loaders["train"].dataset),
+        len(loaders["val"]), len(loaders["val"].dataset),
+        len(loaders["test"]), len(loaders["test"].dataset),
+    )
+
+    if len(loaders["train"].dataset) == 0:
+        raise RuntimeError("Train split is empty after filtering. Check transcript/AU availability and split config.")
+    if len(loaders["val"].dataset) == 0:
+        logger.warning("Validation split is empty; validation metrics/checkpointing may fail.")
+    if len(loaders["test"].dataset) == 0:
+        logger.warning("Test split is empty; test evaluation will fail.")
 
     # Model
-    print(f"\nInitialising model (backbone={args.bert_model}) …")
+    logger.info("Initialising model (backbone=%s)", args.bert_model)
     model = HierarchicalMultimodalAttentionNetwork(
         bert_model_name=args.bert_model,
         fusion_dim=args.fusion_dim,
@@ -295,7 +380,7 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Parameters: {n_params:,}  (trainable: {n_train:,})")
+    logger.info("Model parameters: %s (trainable: %s)", f"{n_params:,}", f"{n_train:,}")
 
     # Optimiser and scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -313,9 +398,9 @@ def main():
     )
 
     # Training loop
-    print("\n" + "=" * 70)
-    print("TRAINING")
-    print("=" * 70)
+    logger.info("%s", "=" * 70)
+    logger.info("TRAINING")
+    logger.info("%s", "=" * 70)
 
     best_val_mse = float("inf")
     patience_counter = 0
@@ -327,19 +412,31 @@ def main():
         # Freeze / unfreeze BERT
         if epoch <= args.freeze_bert_epochs:
             model.freeze_bert()
+            logger.info("Epoch %d: BERT backbone frozen", epoch)
         elif epoch == args.freeze_bert_epochs + 1:
             model.unfreeze_bert()
-            print(f"  [Epoch {epoch}] BERT backbone unfrozen")
+            logger.info("Epoch %d: BERT backbone unfrozen", epoch)
 
         # Train
         train_metrics = train_one_epoch(
             model, loaders["train"], optimizer, device,
+            logger=logger,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            log_interval=args.log_interval,
             grad_accum_steps=args.grad_accum_steps,
             max_grad_norm=args.max_grad_norm,
         )
 
         # Validate
-        val_metrics, _ = evaluate(model, loaders["val"], device)
+        val_metrics, _ = evaluate(
+            model,
+            loaders["val"],
+            device,
+            logger=logger,
+            stage="val",
+            log_interval=args.log_interval,
+        )
 
         scheduler.step()
         elapsed = time.time() - t0
@@ -361,12 +458,18 @@ def main():
         }
         history.append(log)
 
-        print(
-            f"Epoch {epoch:3d}/{args.epochs} │ "
-            f"lr {lr_now:.2e} │ "
-            f"train MSE {train_metrics['mse']:.4f}  MAE {train_metrics['mae']:.4f}  R² {train_metrics['r2']:+.4f} │ "
-            f"val MSE {val_metrics['mse']:.4f}  MAE {val_metrics['mae']:.4f}  R² {val_metrics['r2']:+.4f} │ "
-            f"{elapsed:.1f}s"
+        logger.info(
+            "Epoch %d/%d done | lr=%.3e | train(mse=%.4f mae=%.4f r2=%+.4f) | val(mse=%.4f mae=%.4f r2=%+.4f) | %.1fs",
+            epoch,
+            args.epochs,
+            lr_now,
+            train_metrics["mse"],
+            train_metrics["mae"],
+            train_metrics["r2"],
+            val_metrics["mse"],
+            val_metrics["mae"],
+            val_metrics["r2"],
+            elapsed,
         )
 
         # Checkpointing
@@ -381,13 +484,14 @@ def main():
                 "val_mse": best_val_mse,
                 "args": vars(args),
             }, ckpt_path)
-            print(f"  ✓ New best model saved → {ckpt_path}")
+            logger.info("New best model saved: %s (val_mse=%.6f)", ckpt_path, best_val_mse)
         else:
             patience_counter += 1
+            logger.info("No val improvement. patience_counter=%d/%d", patience_counter, args.patience)
 
         # Early stopping
         if args.patience > 0 and patience_counter >= args.patience:
-            print(f"\n  Early stopping triggered (patience={args.patience})")
+            logger.info("Early stopping triggered (patience=%d)", args.patience)
             break
 
     # Save final checkpoint
@@ -402,31 +506,40 @@ def main():
     # Save training history
     with open(args.output_dir / "training_history.json", "w") as f:
         json.dump(history, f, indent=2, default=str)
+    logger.info("Saved training history: %s", args.output_dir / "training_history.json")
 
     # --------------- Test evaluation ----------------------------------------
-    print("\n" + "=" * 70)
-    print("TEST EVALUATION")
-    print("=" * 70)
+    logger.info("%s", "=" * 70)
+    logger.info("TEST EVALUATION")
+    logger.info("%s", "=" * 70)
 
     # Load best model
     best_ckpt = torch.load(args.output_dir / "best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
-    print(f"Loaded best model from epoch {best_ckpt['epoch']} (val MSE = {best_ckpt['val_mse']:.4f})")
+    logger.info("Loaded best model from epoch %s (val_mse=%.6f)", best_ckpt["epoch"], best_ckpt["val_mse"])
 
-    test_metrics, test_attention = evaluate(model, loaders["test"], device)
+    test_metrics, test_attention = evaluate(
+        model,
+        loaders["test"],
+        device,
+        logger=logger,
+        stage="test",
+        log_interval=args.log_interval,
+    )
 
-    print(
-        f"Test MSE  {test_metrics['mse']:.4f} │ "
-        f"MAE  {test_metrics['mae']:.4f} │ "
-        f"R²  {test_metrics['r2']:+.4f}"
+    logger.info(
+        "Test metrics | mse=%.4f | mae=%.4f | r2=%+.4f",
+        test_metrics["mse"],
+        test_metrics["mae"],
+        test_metrics["r2"],
     )
 
     # Save test predictions and attention weights for interpretability
     with open(args.output_dir / "test_predictions.json", "w") as f:
         json.dump(test_attention, f, indent=2, default=str)
-    print(f"Test predictions and attention weights saved → {args.output_dir / 'test_predictions.json'}")
+    logger.info("Saved test predictions/attention: %s", args.output_dir / "test_predictions.json")
 
-    print("\nDone.")
+    logger.info("Done")
 
 
 if __name__ == "__main__":
