@@ -22,13 +22,20 @@ robustness check.
 
 Usage
 -----
+    # Run as module (recommended):
     python -m source.modeling.baseline_embedding \
         --data_model data_model.yaml \
         --config config.yaml \
         --au_descriptions_dir <path_to_au_jsons>
 
+    # Or run directly:
+    python source/modeling/baseline_embedding.py \
+        --data_model data_model.yaml \
+        --config config.yaml \
+        --au_descriptions_dir <path_to_au_jsons>
+
     # On HPC (paths are WSL-style in data_model.yaml):
-    python -m source.modeling.baseline_embedding \
+    python source/modeling/baseline_embedding.py \
         --data_model data_model.yaml \
         --config config.yaml \
         --au_descriptions_dir /home/mlut/PsyTSLM/au_descriptions \
@@ -52,15 +59,31 @@ import numpy as np
 # This keeps the exact same data pipeline and avoids bugs from
 # re-implementing path resolution, BLRI label mapping, modality
 # completeness checks, etc.
-from source.modeling.dataset import (
-    PsychotherapyDataset,
-    SessionSample,
-    BLRI_LABEL_MAP,
-    load_au_descriptions,
-    _resolve_path,
-    _is_nan,
-    _load_json,
-)
+try:
+    from source.modeling.dataset import (
+        PsychotherapyDataset,
+        SessionSample,
+        BLRI_LABEL_MAP,
+        load_au_descriptions,
+        _resolve_path,
+        _is_nan,
+        _load_json,
+    )
+except ModuleNotFoundError:
+    # Script mode fallback (e.g., `python source/modeling/baseline_embedding.py`)
+    # requires project root on sys.path so `source.*` can be resolved.
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from source.modeling.dataset import (
+        PsychotherapyDataset,
+        SessionSample,
+        BLRI_LABEL_MAP,
+        load_au_descriptions,
+        _resolve_path,
+        _is_nan,
+        _load_json,
+    )
 
 import yaml
 
