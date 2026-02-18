@@ -362,8 +362,8 @@ def to_common_records(patients: list[PatientData]) -> list[PatientRecord]:
                     patient_id=p.patient_id,
                     therapist_id=p.therapist_id,
                     interview_type=itype,
-                    au_features=np.zeros((1,), dtype=np.float32),
-                    text_features=np.zeros((1,), dtype=np.float32),
+                    au_feat=np.zeros((1,), dtype=np.float32),
+                    text_feat=np.zeros((1,), dtype=np.float32),
                     labels=dict(p.labels_by_type.get(itype, {})),
                     baseline_labels=dict(p.baseline_labels),
                 )
