@@ -28,16 +28,31 @@ from typing import Any
 import numpy as np
 import yaml
 
-from source.modeling.multisession_eval_common import (
-    SessionFeatureRow,
-    build_features_and_targets,
-    build_patient_records,
-    compute_clf_metrics,
-    compute_reg_metrics,
-    discover_target_specs,
-    get_classifiers,
-    get_regressors,
-)
+try:
+    from source.modeling.multisession_eval_common import (
+        SessionFeatureRow,
+        build_features_and_targets,
+        build_patient_records,
+        compute_clf_metrics,
+        compute_reg_metrics,
+        discover_target_specs,
+        get_classifiers,
+        get_regressors,
+    )
+except ModuleNotFoundError:
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from source.modeling.multisession_eval_common import (
+        SessionFeatureRow,
+        build_features_and_targets,
+        build_patient_records,
+        compute_clf_metrics,
+        compute_reg_metrics,
+        discover_target_specs,
+        get_classifiers,
+        get_regressors,
+    )
 
 try:
     from source.modeling.dataset import load_au_descriptions, _resolve_path, _is_nan
