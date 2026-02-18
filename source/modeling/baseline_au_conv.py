@@ -1,11 +1,13 @@
 """
-Baseline diagnostic: raw AU time-series (1D Conv) + text summaries for BLRI.
+Baseline diagnostic: raw AU time-series (1D Conv) + text summaries for
+treatment-type classification (bindung / personal / wunder).
 
 Purpose
 -------
-Tests whether raw OpenFace AU intensities carry predictive signal for BLRI
-scores, using depthwise 1D convolutions (one filter bank per AU channel) to
-reduce each variable-length turn into a fixed-size feature vector.
+Tests whether raw OpenFace AU intensities carry predictive signal for
+therapy treatment type, using depthwise 1D convolutions (one filter bank
+per AU channel) to reduce each variable-length turn into a fixed-size
+feature vector.
 
 Two feature modalities, evaluated independently and jointly:
 
@@ -16,7 +18,7 @@ Two feature modalities, evaluated independently and jointly:
   sentence-transformer (``all-MiniLM-L6-v2``).
 
 Session vectors are obtained by mean-pooling turn vectors, then fed to a
-battery of sklearn regressors (Ridge, SVR, Lasso, RF, GBR).
+battery of sklearn classifiers (Logistic Regression, SVC, RF, GBC).
 
 Additionally performs leave-one-therapist-out cross-validation.
 
@@ -25,7 +27,7 @@ Usage
     python source/modeling/baseline_au_conv.py \\
         --data_model data_model.yaml \\
         --config config.yaml \\
-        --output_dir results/baseline_au
+        --output_dir results/baseline_au_classification
 """
 
 from __future__ import annotations
@@ -74,6 +76,11 @@ BLRI_LABEL_MAP: dict[str, tuple[str, str]] = {
     "personal": ("T3_BLRI_ges_Pr", "T3_BLRI_ges_In"),
     "wunder":   ("T7_BLRI_ges_Pr", "T7_BLRI_ges_In"),
 }
+
+# Treatment-type classification labels
+CLASS_LABELS: list[str] = ["bindung", "personal", "wunder"]
+CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(CLASS_LABELS)}
+N_CLASSES: int = len(CLASS_LABELS)
 
 # ---------------------------------------------------------------------------
 # Path helpers  (same logic as dataset.py)
@@ -219,7 +226,7 @@ def load_sessions(
         data_model = yaml.safe_load(f)
 
     sessions: list[SessionData] = []
-    skipped_no_target = 0
+    skipped_unknown_type = 0
     skipped_no_transcript = 0
     skipped_no_openface = 0
 
@@ -230,7 +237,12 @@ def load_sessions(
         pid = interview["patient"]["patient_id"]
 
         for itype, idata in interview.get("types", {}).items():
-            # --- BLRI targets ---
+            # --- Classification target: interview type ---
+            if itype not in CLASS_TO_IDX:
+                skipped_unknown_type += 1
+                continue
+
+            # --- Optional BLRI labels (kept for metadata) ---
             labels = idata.get("labels", {})
             pr_key, in_key = BLRI_LABEL_MAP.get(itype, (None, None))
             blri_pr = labels.get(pr_key) if pr_key else None
@@ -239,9 +251,6 @@ def load_sessions(
                 blri_pr = None
             if _is_nan(blri_in):
                 blri_in = None
-            if blri_pr is None and blri_in is None:
-                skipped_no_target += 1
-                continue
 
             # --- Transcript (for turn boundaries + optional summaries) ---
             transcript_raw = idata.get("transcript", "")
@@ -295,8 +304,8 @@ def load_sessions(
             ))
 
     log.info(
-        "[%s] Loaded %d sessions  (skipped: %d no target, %d no transcript, %d no openface)",
-        split.upper(), len(sessions), skipped_no_target, skipped_no_transcript, skipped_no_openface,
+        "[%s] Loaded %d sessions  (skipped: %d unknown type, %d no transcript, %d no openface)",
+        split.upper(), len(sessions), skipped_unknown_type, skipped_no_transcript, skipped_no_openface,
     )
     return sessions
 
@@ -545,46 +554,59 @@ def extract_text_features(
 # ---------------------------------------------------------------------------
 
 
-def extract_targets(
-    sessions: list[SessionData],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return (y_pr, y_in, mask_pr, mask_in)."""
-    y_pr = np.array([s.blri_pr if s.blri_pr is not None else np.nan for s in sessions])
-    y_in = np.array([s.blri_in if s.blri_in is not None else np.nan for s in sessions])
-    return y_pr, y_in, ~np.isnan(y_pr), ~np.isnan(y_in)
+def extract_targets(sessions: list[SessionData]) -> np.ndarray:
+    """Return integer class labels from interview_type.
+
+    Returns
+    -------
+    y : np.ndarray of shape (n_sessions,), dtype int
+        Class indices: bindung=0, personal=1, wunder=2.
+    """
+    return np.array([CLASS_TO_IDX[s.interview_type] for s in sessions], dtype=np.int64)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    mse = float(np.mean((y_true - y_pred) ** 2))
-    mae = float(np.mean(np.abs(y_true - y_pred)))
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-    r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
-    corr = float(np.corrcoef(y_true, y_pred)[0, 1]) if len(y_true) > 2 else float("nan")
-    return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": corr, "n": len(y_true)}
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
+    """Classification metrics: accuracy, macro-F1, per-class F1, confusion matrix."""
+    from sklearn.metrics import (
+        accuracy_score, f1_score, classification_report, confusion_matrix,
+    )
+
+    acc = float(accuracy_score(y_true, y_pred))
+    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    f1_per_class = f1_score(y_true, y_pred, average=None, labels=list(range(N_CLASSES)), zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(N_CLASSES)))
+
+    return {
+        "accuracy": acc,
+        "f1_macro": f1_macro,
+        "f1_weighted": f1_weighted,
+        **{f"f1_{CLASS_LABELS[i]}": float(f1_per_class[i]) for i in range(N_CLASSES)},
+        "confusion_matrix": cm.tolist(),
+        "n": len(y_true),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Regressors
+# Classifiers
 # ---------------------------------------------------------------------------
 
 
-def get_regressors() -> dict[str, Any]:
-    from sklearn.linear_model import Ridge, Lasso
-    from sklearn.svm import SVR
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+def get_classifiers() -> dict[str, Any]:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     return {
-        "Ridge(a=1)":     make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
-        "Ridge(a=10)":    make_pipeline(StandardScaler(), Ridge(alpha=10.0)),
-        "Ridge(a=100)":   make_pipeline(StandardScaler(), Ridge(alpha=100.0)),
-        "Lasso(a=1)":     make_pipeline(StandardScaler(), Lasso(alpha=1.0, max_iter=5000)),
-        "SVR(rbf)":       make_pipeline(StandardScaler(), SVR(kernel="rbf", C=1.0)),
-        "SVR(rbf,C=10)":  make_pipeline(StandardScaler(), SVR(kernel="rbf", C=10.0)),
-        "RF(100)":        RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
-        "GBR(100)":       GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42),
+        "LogReg(C=1)":     make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=42)),
+        "LogReg(C=10)":    make_pipeline(StandardScaler(), LogisticRegression(C=10.0, max_iter=2000, random_state=42)),
+        "LogReg(C=0.1)":   make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000, random_state=42)),
+        "SVC(rbf)":        make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, random_state=42)),
+        "SVC(rbf,C=10)":   make_pipeline(StandardScaler(), SVC(kernel="rbf", C=10.0, random_state=42)),
+        "RF(100)":         RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
+        "GBC(100)":        GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42),
     }
 
 
@@ -596,19 +618,18 @@ def get_regressors() -> dict[str, Any]:
 def run_fixed_split(
     X_train: np.ndarray, y_train: np.ndarray,
     X_test: np.ndarray, y_test: np.ndarray,
-    target_name: str,
     label: str = "",
 ) -> list[dict]:
     results = []
-    for name, reg in get_regressors().items():
-        reg.fit(X_train, y_train)
-        pred = reg.predict(X_test)
+    for name, clf in get_classifiers().items():
+        clf.fit(X_train, y_train)
+        pred = clf.predict(X_test)
         m = compute_metrics(y_test, pred)
-        m.update(regressor=name, target=target_name, split=label)
+        m.update(classifier=name, split=label)
         results.append(m)
         log.info(
-            "  %-20s %-6s %-15s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  r=%+.4f  (n=%d)",
-            name, label, target_name, m["r2"], m["mse"], m["mae"], m["pearson_r"], m["n"],
+            "  %-20s %-15s  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
+            name, label, m["accuracy"], m["f1_macro"], m["f1_weighted"], m["n"],
         )
     return results
 
@@ -616,50 +637,58 @@ def run_fixed_split(
 def run_loto_cv(
     all_sessions: list[SessionData], X_all: np.ndarray, feature_label: str,
 ) -> list[dict]:
-    """Leave-one-therapist-out CV with Ridge(alpha=10)."""
-    from sklearn.linear_model import Ridge
+    """Leave-one-therapist-out CV with LogisticRegression(C=1)."""
+    from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     therapist_ids = sorted(set(s.therapist_id for s in all_sessions))
     log.info("LOTO-CV across %d therapists: %s  [%s]", len(therapist_ids), therapist_ids, feature_label)
 
-    y_pr, y_in, m_pr, m_in = extract_targets(all_sessions)
+    y_all = extract_targets(all_sessions)
 
+    all_true: list[int] = []
+    all_pred: list[int] = []
     results: list[dict] = []
-    for target_name, y_all, mask_all in [("BLRI_Pr", y_pr, m_pr), ("BLRI_In", y_in, m_in)]:
-        all_true: list[float] = []
-        all_pred: list[float] = []
 
-        for held_out in therapist_ids:
-            tr_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out and mask_all[i]]
-            te_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out and mask_all[i]]
-            if len(tr_idx) < 5 or len(te_idx) == 0:
-                continue
+    for held_out in therapist_ids:
+        tr_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out]
+        te_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out]
+        if len(tr_idx) < 5 or len(te_idx) == 0:
+            continue
 
-            reg = make_pipeline(StandardScaler(), Ridge(alpha=10.0))
-            reg.fit(X_all[tr_idx], y_all[tr_idx])
-            pred = reg.predict(X_all[te_idx])
+        # Check that training set has at least 2 classes
+        n_classes_train = len(set(y_all[tr_idx]))
+        if n_classes_train < 2:
+            log.warning("  LOTO held=%s — only %d class(es) in train, skipping", held_out, n_classes_train)
+            continue
 
-            m = compute_metrics(y_all[te_idx], pred)
-            m.update(held_out_therapist=held_out, target=target_name,
-                     n_train=len(tr_idx), n_test=len(te_idx), features=feature_label)
-            results.append(m)
-            all_true.extend(y_all[te_idx].tolist())
-            all_pred.extend(pred.tolist())
-            log.info(
-                "  LOTO held=%s  %s  R2=%+.4f  MSE=%7.2f  n_test=%d  [%s]",
-                held_out, target_name, m["r2"], m["mse"], len(te_idx), feature_label,
-            )
+        clf = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(C=1.0, max_iter=2000, random_state=42),
+        )
+        clf.fit(X_all[tr_idx], y_all[tr_idx])
+        pred = clf.predict(X_all[te_idx])
 
-        if all_true:
-            agg = compute_metrics(np.array(all_true), np.array(all_pred))
-            agg.update(target=target_name, type="loto_aggregate", features=feature_label)
-            results.append(agg)
-            log.info(
-                "  LOTO AGG  %s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  r=%+.4f  (n=%d)  [%s]",
-                target_name, agg["r2"], agg["mse"], agg["mae"], agg["pearson_r"], agg["n"], feature_label,
-            )
+        m = compute_metrics(y_all[te_idx], pred)
+        m.update(held_out_therapist=held_out,
+                 n_train=len(tr_idx), n_test=len(te_idx), features=feature_label)
+        results.append(m)
+        all_true.extend(y_all[te_idx].tolist())
+        all_pred.extend(pred.tolist())
+        log.info(
+            "  LOTO held=%s  Acc=%.4f  F1_macro=%.4f  n_test=%d  [%s]",
+            held_out, m["accuracy"], m["f1_macro"], len(te_idx), feature_label,
+        )
+
+    if all_true:
+        agg = compute_metrics(np.array(all_true), np.array(all_pred))
+        agg.update(type="loto_aggregate", features=feature_label)
+        results.append(agg)
+        log.info(
+            "  LOTO AGG  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)  [%s]",
+            agg["accuracy"], agg["f1_macro"], agg["f1_weighted"], agg["n"], feature_label,
+        )
 
     return results
 
@@ -698,6 +727,12 @@ def main():
     n_with_of = sum(1 for s in all_s if s.openface_path is not None)
     n_with_text = sum(1 for s in all_s if any(t.summary for t in s.turns))
     log.info("Total sessions: %d  (with OpenFace: %d, with text summaries: %d)", len(all_s), n_with_of, n_with_text)
+
+    # Class distribution
+    for split_name, split_sessions in [("train", train_s), ("val", val_s), ("test", test_s), ("all", all_s)]:
+        from collections import Counter
+        dist = Counter(s.interview_type for s in split_sessions)
+        log.info("  [%s] class distribution: %s", split_name, dict(dist))
 
     # ------------------------------------------------------------------
     # 2. Extract AU features (Conv1D + stats)
@@ -752,34 +787,32 @@ def main():
         }
 
     # ------------------------------------------------------------------
-    # 5. Targets
+    # 5. Targets (classification: treatment type)
     # ------------------------------------------------------------------
-    y_pr_tr, y_in_tr, m_pr_tr, m_in_tr = extract_targets(train_s)
-    y_pr_va, y_in_va, m_pr_va, m_in_va = extract_targets(val_s)
-    y_pr_te, y_in_te, m_pr_te, m_in_te = extract_targets(test_s)
+    y_train = extract_targets(train_s)
+    y_val = extract_targets(val_s)
+    y_test = extract_targets(test_s)
 
     log.info(
-        "Valid targets — train: Pr=%d In=%d  val: Pr=%d In=%d  test: Pr=%d In=%d",
-        m_pr_tr.sum(), m_in_tr.sum(), m_pr_va.sum(), m_in_va.sum(), m_pr_te.sum(), m_in_te.sum(),
+        "Targets — train: %d  val: %d  test: %d", len(y_train), len(y_val), len(y_test),
     )
 
     # ------------------------------------------------------------------
-    # 6. Mean-predictor baseline
+    # 6. Majority-class baseline
     # ------------------------------------------------------------------
-    log.info("=== MEAN-PREDICTOR BASELINE ===")
-    for tgt, y_tr, mtr, y_te, mte, sn in [
-        ("BLRI_Pr", y_pr_tr, m_pr_tr, y_pr_te, m_pr_te, "test"),
-        ("BLRI_In", y_in_tr, m_in_tr, y_in_te, m_in_te, "test"),
-        ("BLRI_Pr", y_pr_tr, m_pr_tr, y_pr_va, m_pr_va, "val"),
-        ("BLRI_In", y_in_tr, m_in_tr, y_in_va, m_in_va, "val"),
-    ]:
-        if mtr.sum() == 0 or mte.sum() == 0:
+    log.info("=== MAJORITY-CLASS BASELINE ===")
+    from collections import Counter
+    majority_class = Counter(y_train.tolist()).most_common(1)[0][0]
+    majority_label = CLASS_LABELS[majority_class]
+
+    for sn, y_eval in [("val", y_val), ("test", y_test)]:
+        if len(y_eval) == 0:
             continue
-        train_mean = y_tr[mtr].mean()
-        m = compute_metrics(y_te[mte], np.full(mte.sum(), train_mean))
+        pred = np.full_like(y_eval, majority_class)
+        m = compute_metrics(y_eval, pred)
         log.info(
-            "  Mean-pred  %-5s %-8s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  (train_mean=%.2f)",
-            sn, tgt, m["r2"], m["mse"], m["mae"], train_mean,
+            "  Majority(%s)  %-5s  Acc=%.4f  F1_macro=%.4f  (n=%d)",
+            majority_label, sn, m["accuracy"], m["f1_macro"], m["n"],
         )
 
     # ------------------------------------------------------------------
@@ -792,31 +825,32 @@ def main():
         log.info("FEATURE SET: %s  (dim=%d)", feat_name, feat["train"].shape[1])
         log.info("=" * 70)
 
-        for tgt, y_tr, mtr, y_te, mte, sn in [
-            ("BLRI_Pr", y_pr_tr, m_pr_tr, y_pr_va, m_pr_va, "val"),
-            ("BLRI_In", y_in_tr, m_in_tr, y_in_va, m_in_va, "val"),
-            ("BLRI_Pr", y_pr_tr, m_pr_tr, y_pr_te, m_pr_te, "test"),
-            ("BLRI_In", y_in_tr, m_in_tr, y_in_te, m_in_te, "test"),
-        ]:
-            if mtr.sum() < 3 or mte.sum() == 0:
-                continue
-            log.info("--- %s -> %s [%s] ---", tgt, sn, feat_name)
-            X_tr = feat["train"][mtr] if sn != "test" else feat["train"][mtr]
-            X_te = feat[sn][mte]
-            res = run_fixed_split(X_tr, y_tr[mtr], X_te, y_te[mte], tgt, f"{sn}({feat_name})")
+        # train → val
+        if len(y_val) > 0:
+            log.info("--- train → val [%s] ---", feat_name)
+            res = run_fixed_split(
+                feat["train"], y_train,
+                feat["val"], y_val,
+                f"val({feat_name})",
+            )
+            all_results.extend(res)
+
+        # train → test
+        if len(y_test) > 0:
+            log.info("--- train → test [%s] ---", feat_name)
+            res = run_fixed_split(
+                feat["train"], y_train,
+                feat["test"], y_test,
+                f"test({feat_name})",
+            )
             all_results.extend(res)
 
         # train+val → test
-        for tgt, y_tr, mtr, y_va, mva, y_te, mte in [
-            ("BLRI_Pr", y_pr_tr, m_pr_tr, y_pr_va, m_pr_va, y_pr_te, m_pr_te),
-            ("BLRI_In", y_in_tr, m_in_tr, y_in_va, m_in_va, y_in_te, m_in_te),
-        ]:
-            if mte.sum() == 0:
-                continue
-            X_trv = np.vstack([feat["train"][mtr], feat["val"][mva]]) if mva.sum() > 0 else feat["train"][mtr]
-            y_trv = np.concatenate([y_tr[mtr], y_va[mva]]) if mva.sum() > 0 else y_tr[mtr]
-            log.info("--- %s -> test(tr+val) [%s] ---", tgt, feat_name)
-            res = run_fixed_split(X_trv, y_trv, feat["test"][mte], y_te[mte], tgt, f"test_tv({feat_name})")
+        if len(y_test) > 0 and len(y_val) > 0:
+            X_trv = np.vstack([feat["train"], feat["val"]])
+            y_trv = np.concatenate([y_train, y_val])
+            log.info("--- train+val → test [%s] ---", feat_name)
+            res = run_fixed_split(X_trv, y_trv, feat["test"], y_test, f"test_tv({feat_name})")
             all_results.extend(res)
 
     # ------------------------------------------------------------------
@@ -830,7 +864,7 @@ def main():
     # ------------------------------------------------------------------
     # 9. Save results
     # ------------------------------------------------------------------
-    results_path = output_dir / "baseline_au_results.json"
+    results_path = output_dir / "baseline_au_classification_results.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, default=str)
     log.info("Results saved to %s", results_path)
@@ -839,35 +873,35 @@ def main():
     # 10. Summary table
     # ------------------------------------------------------------------
     log.info("")
-    log.info("=" * 100)
-    log.info("SUMMARY — FIXED SPLITS")
-    log.info("=" * 100)
+    log.info("=" * 110)
+    log.info("SUMMARY — FIXED SPLITS (Treatment-Type Classification)")
+    log.info("=" * 110)
     log.info(
-        "%-25s %-10s %-20s %8s %8s %8s %8s",
-        "Regressor", "Target", "Split(Features)", "R2", "MSE", "MAE", "r",
+        "%-20s %-20s %8s %10s %10s %6s",
+        "Classifier", "Split(Features)", "Acc", "F1_macro", "F1_wtd", "n",
     )
-    log.info("-" * 100)
+    log.info("-" * 110)
     for r in all_results:
-        if "regressor" in r:
+        if "classifier" in r:
             log.info(
-                "%-25s %-10s %-20s %+8.4f %8.2f %8.2f %+8.4f",
-                r["regressor"], r["target"], r.get("split", ""),
-                r["r2"], r["mse"], r["mae"], r.get("pearson_r", float("nan")),
+                "%-20s %-20s %8.4f %10.4f %10.4f %6d",
+                r["classifier"], r.get("split", ""),
+                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
             )
-    log.info("=" * 100)
+    log.info("=" * 110)
 
     log.info("")
-    log.info("=" * 100)
+    log.info("=" * 110)
     log.info("SUMMARY — LOTO-CV AGGREGATES")
-    log.info("=" * 100)
+    log.info("=" * 110)
     for r in all_results:
         if r.get("type") == "loto_aggregate":
             log.info(
-                "  %-15s %-10s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  r=%+.4f  (n=%d)",
-                r.get("features", ""), r["target"],
-                r["r2"], r["mse"], r["mae"], r.get("pearson_r", float("nan")), r["n"],
+                "  %-15s  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
+                r.get("features", ""),
+                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
             )
-    log.info("=" * 100)
+    log.info("=" * 110)
 
 
 # ---------------------------------------------------------------------------
@@ -877,14 +911,14 @@ def main():
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Baseline: raw AU (1D Conv) + text summaries for BLRI prediction",
+        description="Baseline: raw AU (1D Conv) + text summaries for treatment-type classification",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Data paths
     p.add_argument("--data_model", type=Path, required=True, help="Path to data_model.yaml")
     p.add_argument("--config", type=Path, required=True, help="Path to config.yaml (split definitions)")
-    p.add_argument("--output_dir", type=Path, default=Path("results/baseline_au"),
+    p.add_argument("--output_dir", type=Path, default=Path("results/baseline_au_classification"),
                    help="Where to save results")
 
     # Conv1D parameters
