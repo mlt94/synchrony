@@ -1,40 +1,19 @@
 """
-Baseline diagnostic: raw AU time-series (1D Conv) + text summaries for
-multi-target regression of ALL numeric T3 / T5 / T7 outcomes.
+Baseline diagnostic: raw AU time-series (Conv1D) + text summaries with
+mixed-task outcome evaluation.
 
-Purpose
--------
-Predicts all numeric outcomes from data_model.yaml — PANAS (positive &
-negative affect), IRF (interpersonal reaction: self & other), and BLRI
-(global empathy) scores for both Practitioner (*_Pr*) and Instructor
-(*_In*) ratings — using raw OpenFace AU intensities and/or speech
-summaries.
-
-Depthwise 1D convolutions (one filter bank per AU channel) reduce each
-variable-length AU turn into a fixed-size feature vector.
-
-Three feature modalities are evaluated in an **ablation study**:
-
-* **AU_only**  – per-turn AU intensity time-series from the patient's
-  OpenFace CSV, segmented by transcript turn boundaries, reduced via
-  depthwise Conv1D + global pooling + temporal statistics.
-* **Text_only** – per-turn speech summaries encoded with a frozen
-  sentence-transformer (``all-MiniLM-L6-v2``).
-* **AU+Text**  – concatenation of both.
-
-Session vectors are obtained by mean-pooling turn vectors, then fed to a
-battery of sklearn regressors (Ridge, Lasso, SVR, RF, GBR).
-
-Performs fixed-split evaluation AND leave-one-therapist-out cross-
-validation (LOTO-CV).  Results are saved as a comprehensive JSON and a
-ranked summary of which outcomes are best predicted is printed.
-
-Usage
------
-    python source/modeling/baseline_au_conv.py \\
-        --data_model data_model.yaml \\
-        --config config.yaml \\
-        --output_dir results/baseline_au_regression
+Refactor highlights:
+- Predicts all post-treatment outcomes (T3/T5/T7 labels under interview types)
+  AND all baseline outcomes under interview['baseline'] (e.g., T0_*).
+- Handles mixed target types automatically:
+  - numeric -> regression metrics
+  - categorical/text -> multiclass classification metrics
+- Uses cumulative session information by target timepoint:
+  - T3: personal
+  - T5: personal + bindung
+  - T7: personal + bindung + wunder
+  - baseline (T0/T1): all available session types
+- Ablation remains explicit: AU_only, Text_only, AU+Text.
 """
 
 from __future__ import annotations
@@ -42,19 +21,26 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import platform
 import sys
-import time
-from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import yaml
-
 import torch
 import torch.nn as nn
+import yaml
+
+from source.modeling.multisession_eval_common import (
+    SessionFeatureRow,
+    build_features_and_targets,
+    build_patient_records,
+    compute_clf_metrics,
+    compute_reg_metrics,
+    discover_target_specs,
+    get_classifiers,
+    get_regressors,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,6 +54,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("baseline_au")
 
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -77,40 +64,31 @@ AU_R_COLS: list[str] = [
     "AU09_r", "AU10_r", "AU12_r", "AU14_r", "AU15_r", "AU17_r",
     "AU20_r", "AU23_r", "AU25_r", "AU26_r", "AU45_r",
 ]
-N_AUS: int = len(AU_R_COLS)  # 17
+N_AUS: int = len(AU_R_COLS)
 
-# Interview type → time-point prefix for label keys in data_model.yaml
 INTERVIEW_PREFIX: dict[str, str] = {
-    "bindung":  "T5",
+    "bindung": "T5",
     "personal": "T3",
-    "wunder":   "T7",
+    "wunder": "T7",
 }
 
-# All outcome suffixes (after stripping the T3_/T5_/T7_ prefix)
 OUTCOME_SUFFIXES: list[str] = [
     "PANAS_pos_Pr", "PANAS_neg_Pr",
-    "IRF_self_Pr",  "IRF_other_Pr",
+    "IRF_self_Pr", "IRF_other_Pr",
     "BLRI_ges_Pr",
     "PANAS_pos_In", "PANAS_neg_In",
-    "IRF_self_In",  "IRF_other_In",
+    "IRF_self_In", "IRF_other_In",
     "BLRI_ges_In",
 ]
 
-# Full label-key map: {interview_type: {outcome_suffix: yaml_label_key}}
 LABEL_MAP: dict[str, dict[str, str]] = {
     itype: {suffix: f"{prefix}_{suffix}" for suffix in OUTCOME_SUFFIXES}
     for itype, prefix in INTERVIEW_PREFIX.items()
 }
 
-# For backwards compatibility / reference
-BLRI_LABEL_MAP: dict[str, tuple[str, str]] = {
-    "bindung":  ("T5_BLRI_ges_Pr", "T5_BLRI_ges_In"),
-    "personal": ("T3_BLRI_ges_Pr", "T3_BLRI_ges_In"),
-    "wunder":   ("T7_BLRI_ges_Pr", "T7_BLRI_ges_In"),
-}
 
 # ---------------------------------------------------------------------------
-# Path helpers  (same logic as dataset.py)
+# Path / value helpers
 # ---------------------------------------------------------------------------
 
 
@@ -153,28 +131,27 @@ def _is_nan(x: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Data containers
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class TurnInfo:
-    """Timing and text for a single speech turn."""
     turn_index: int
-    speaker_id: str
-    start_s: float          # seconds
-    end_s: float            # seconds
-    summary: str = ""       # may be empty if not available
+    start_s: float
+    end_s: float
+    summary: str
 
 
 @dataclass
 class SessionData:
-    """One therapy session with all modalities."""
+    split: str
     patient_id: str
     therapist_id: str
     interview_type: str
     turns: list[TurnInfo]
-    labels: dict[str, float] = field(default_factory=dict)  # full yaml key (e.g. T5_BLRI_ges_Pr) → value
+    labels: dict[str, float] = field(default_factory=dict)
+    baseline_labels: dict[str, Any] = field(default_factory=dict)
     openface_path: Path | None = None
 
 
@@ -183,66 +160,18 @@ class SessionData:
 # ---------------------------------------------------------------------------
 
 
-def load_openface_au(
-    path: Path, confidence_threshold: float = 0.5,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Load patient OpenFace CSV → (AU intensities, timestamps).
-
-    Returns
-    -------
-    aus : np.ndarray, shape (T, 17)
-        AU intensity values for frames passing quality filters.
-    timestamps : np.ndarray, shape (T,)
-        Timestamp in seconds for each retained frame.
-    """
+def load_openface_au(path: Path, confidence_threshold: float = 0.5) -> tuple[np.ndarray, np.ndarray]:
     import pandas as pd
 
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
-
-    # Quality filter
     mask = (df["success"] == 1) & (df["confidence"] >= confidence_threshold)
     aus = df.loc[mask, AU_R_COLS].values.astype(np.float32)
     timestamps = df.loc[mask, "timestamp"].values.astype(np.float64)
     return aus, timestamps
 
 
-def segment_au_by_turns(
-    aus: np.ndarray,
-    timestamps: np.ndarray,
-    turns: list[TurnInfo],
-) -> list[np.ndarray]:
-    """Slice the AU matrix by turn boundaries.
-
-    Returns a list of arrays, one per turn, each of shape (t_i, 17).
-    If a turn has no frames (face not detected), returns an empty (0, 17) array.
-    """
-    segments: list[np.ndarray] = []
-    for turn in turns:
-        mask = (timestamps >= turn.start_s) & (timestamps < turn.end_s)
-        seg = aus[mask]
-        if seg.shape[0] == 0:
-            seg = np.zeros((0, N_AUS), dtype=np.float32)
-        segments.append(seg)
-    return segments
-
-
-def load_sessions(
-    data_model_path: Path,
-    config_path: Path,
-    split: str,
-) -> list[SessionData]:
-    """Load sessions for a given split from data_model.yaml.
-
-    Parameters
-    ----------
-    data_model_path : Path
-        Path to ``data_model.yaml``.
-    config_path : Path
-        Path to ``config.yaml`` with therapist-based splits.
-    split : str
-        One of ``"train"``, ``"val"``, ``"test"``.
-    """
+def load_sessions(data_model_path: Path, config_path: Path, split: str) -> list[SessionData]:
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     allowed = set(config["psychotherapy_splits"][split])
@@ -253,28 +182,33 @@ def load_sessions(
     sessions: list[SessionData] = []
     skipped_unknown_type = 0
     skipped_no_transcript = 0
-    skipped_no_openface = 0
 
     for interview in data_model["interviews"]:
-        tid = interview["therapist"]["therapist_id"]
-        if tid not in allowed:
+        therapist_id = interview["therapist"]["therapist_id"]
+        if therapist_id not in allowed:
             continue
-        pid = interview["patient"]["patient_id"]
+
+        patient_id = interview["patient"]["patient_id"]
+
+        baseline_raw = interview.get("baseline", {}) or {}
+        baseline_labels: dict[str, Any] = {}
+        for k, v in baseline_raw.items():
+            if v is None:
+                continue
+            baseline_labels[k] = v
 
         for itype, idata in interview.get("types", {}).items():
             if itype not in INTERVIEW_PREFIX:
                 skipped_unknown_type += 1
                 continue
 
-            # --- Extract ALL numeric labels for this interview type ---
             labels_raw = idata.get("labels", {})
             labels: dict[str, float] = {}
-            for suffix, yaml_key in LABEL_MAP[itype].items():
-                val = labels_raw.get(yaml_key)
+            for _suffix, full_key in LABEL_MAP[itype].items():
+                val = labels_raw.get(full_key)
                 if not _is_nan(val):
-                    labels[yaml_key] = float(val)
+                    labels[full_key] = float(val)
 
-            # --- Transcript (for turn boundaries + optional summaries) ---
             transcript_raw = idata.get("transcript", "")
             transcript_path = _resolve_path(transcript_raw) if transcript_raw else None
             if transcript_path is None or not transcript_path.exists():
@@ -295,68 +229,44 @@ def load_sessions(
             turns_raw = sorted(turns_raw, key=lambda t: t.get("turn_index", 0))
             turns: list[TurnInfo] = []
             for t in turns_raw:
-                tidx = t.get("turn_index", 0)
-                start_ms = t.get("start_ms", 0)
-                end_ms = t.get("end_ms", 0)
-                summary = t.get("summary", "").strip()
-                turns.append(TurnInfo(
-                    turn_index=int(tidx),
-                    speaker_id=t.get("speaker_id", ""),
-                    start_s=start_ms / 1000.0,
-                    end_s=end_ms / 1000.0,
-                    summary=summary,
-                ))
+                turns.append(
+                    TurnInfo(
+                        turn_index=int(t.get("turn_index", 0)),
+                        start_s=float(t.get("start_ms", 0)) / 1000.0,
+                        end_s=float(t.get("end_ms", 0)) / 1000.0,
+                        summary=(t.get("summary", "") or "").strip(),
+                    )
+                )
 
-            # --- Patient OpenFace ---
             of_raw = idata.get("patient_openface", "")
             of_path = _resolve_path(of_raw) if of_raw else None
-            if of_path is None:
-                skipped_no_openface += 1
-                # Still load session; AU features will just be zeros
-                # This allows text-only evaluation
 
-            sessions.append(SessionData(
-                patient_id=pid,
-                therapist_id=tid,
-                interview_type=itype,
-                turns=turns,
-                labels=labels,
-                openface_path=of_path,
-            ))
+            sessions.append(
+                SessionData(
+                    split=split,
+                    patient_id=patient_id,
+                    therapist_id=therapist_id,
+                    interview_type=itype,
+                    turns=turns,
+                    labels=labels,
+                    baseline_labels=baseline_labels,
+                    openface_path=of_path,
+                )
+            )
 
     log.info(
-        "[%s] Loaded %d sessions  (skipped: %d unknown type, %d no transcript, %d no openface)",
-        split.upper(), len(sessions), skipped_unknown_type, skipped_no_transcript, skipped_no_openface,
+        "[%s] Loaded %d sessions (skipped: %d unknown type, %d no transcript)",
+        split.upper(), len(sessions), skipped_unknown_type, skipped_no_transcript,
     )
     return sessions
 
 
 # ---------------------------------------------------------------------------
-# 1D Conv AU Feature Extractor (frozen random kernels – ROCKET-inspired)
+# AU feature extractor
 # ---------------------------------------------------------------------------
 
 
 class DepthwiseConv1DExtractor(nn.Module):
-    """Fixed (non-trainable) depthwise 1D convolutions for AU time-series.
-
-    One independent filter bank per AU channel.  Uses multiple kernel sizes
-    to capture patterns at different temporal scales.
-
-    Parameters
-    ----------
-    n_channels : int
-        Number of AU channels (17).
-    n_kernels_per_channel : int
-        Number of random kernels per AU per kernel size.
-    kernel_sizes : list[int]
-        Conv kernel widths (in frames; at 30 fps, 7≈0.23s, 15≈0.5s, 31≈1s).
-    seed : int
-        Random seed for reproducible kernel initialisation.
-
-    Output dimension = n_channels * n_kernels_per_channel * len(kernel_sizes) * 2
-    (×2 because we compute both global max-pool and global avg-pool per kernel).
-    """
-
     def __init__(
         self,
         n_channels: int = N_AUS,
@@ -368,10 +278,6 @@ class DepthwiseConv1DExtractor(nn.Module):
         if kernel_sizes is None:
             kernel_sizes = [7, 15, 31]
 
-        self.n_channels = n_channels
-        self.n_kernels = n_kernels_per_channel
-        self.kernel_sizes = kernel_sizes
-
         torch.manual_seed(seed)
         self.convs = nn.ModuleList()
         for ks in kernel_sizes:
@@ -379,7 +285,7 @@ class DepthwiseConv1DExtractor(nn.Module):
                 in_channels=n_channels,
                 out_channels=n_channels * n_kernels_per_channel,
                 kernel_size=ks,
-                groups=n_channels,   # depthwise: each AU has its own kernels
+                groups=n_channels,
                 padding=ks // 2,
                 bias=True,
             )
@@ -390,44 +296,18 @@ class DepthwiseConv1DExtractor(nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : Tensor of shape (batch, n_channels, T)
-
-        Returns
-        -------
-        Tensor of shape (batch, output_dim)
-        """
-        features: list[torch.Tensor] = []
+        chunks = []
         for conv in self.convs:
-            h = conv(x)                             # (batch, C*K, T')
-            h_max = h.max(dim=-1).values            # (batch, C*K)
-            h_avg = h.mean(dim=-1)                   # (batch, C*K)
-            features.append(h_max)
-            features.append(h_avg)
-        return torch.cat(features, dim=-1)           # (batch, output_dim)
+            h = conv(x)
+            chunks.append(h.max(dim=-1).values)
+            chunks.append(h.mean(dim=-1))
+        return torch.cat(chunks, dim=-1)
 
 
-# ---------------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------------
-
-# Minimum frames for conv processing; shorter segments → stats fallback
 MIN_FRAMES_FOR_CONV = 3
 
 
 def _au_stats(seg: np.ndarray) -> np.ndarray:
-    """Temporal statistics per AU for a single turn segment.
-
-    Parameters
-    ----------
-    seg : (T, 17)
-
-    Returns
-    -------
-    (17 * 6,) = (102,) vector: mean, std, max, min, range, median per AU.
-    """
     if seg.shape[0] == 0:
         return np.zeros(N_AUS * 6, dtype=np.float32)
     mean = seg.mean(axis=0)
@@ -439,76 +319,54 @@ def _au_stats(seg: np.ndarray) -> np.ndarray:
     return np.concatenate([mean, std, mx, mn, rng, med]).astype(np.float32)
 
 
-def extract_au_features(
-    sessions: list[SessionData],
-    au_extractor: DepthwiseConv1DExtractor,
-    include_stats: bool = True,
-) -> np.ndarray:
-    """Extract AU features for all sessions.
+def segment_au_by_turns(aus: np.ndarray, timestamps: np.ndarray, turns: list[TurnInfo]) -> list[np.ndarray]:
+    segments: list[np.ndarray] = []
+    for turn in turns:
+        mask = (timestamps >= turn.start_s) & (timestamps < turn.end_s)
+        seg = aus[mask]
+        if seg.shape[0] == 0:
+            seg = np.zeros((0, N_AUS), dtype=np.float32)
+        segments.append(seg)
+    return segments
 
-    For each session:
-      1. Load the patient OpenFace CSV.
-      2. Segment by turn boundaries.
-      3. Apply Conv1D extractor to each turn segment.
-      4. Optionally append temporal statistics.
-      5. Mean-pool across turns → session AU vector.
 
-    Returns
-    -------
-    np.ndarray of shape (n_sessions, au_dim)
-    """
-    import pandas as pd   # noqa: deferred import for HPC compatibility
-
+def extract_au_features(sessions: list[SessionData], au_extractor: DepthwiseConv1DExtractor) -> np.ndarray:
     conv_dim = au_extractor.output_dim
-    stats_dim = N_AUS * 6 if include_stats else 0
-    au_dim = conv_dim + stats_dim
+    stats_dim = N_AUS * 6
+    out_dim = conv_dim + stats_dim
 
-    X = np.zeros((len(sessions), au_dim), dtype=np.float32)
-    loaded_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    X = np.zeros((len(sessions), out_dim), dtype=np.float32)
+    cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
-    for i, session in enumerate(sessions):
-        if session.openface_path is None:
-            continue  # leave zeros
+    for i, s in enumerate(sessions):
+        if s.openface_path is None:
+            continue
 
-        # Cache OpenFace loading
-        cache_key = str(session.openface_path)
-        if cache_key not in loaded_cache:
+        key = str(s.openface_path)
+        if key not in cache:
             try:
-                aus, timestamps = load_openface_au(session.openface_path)
-                loaded_cache[cache_key] = (aus, timestamps)
+                cache[key] = load_openface_au(s.openface_path)
             except Exception as e:
-                log.warning("Failed to load %s: %s", session.openface_path, e)
+                log.warning("Failed OpenFace load (%s): %s", s.openface_path, e)
                 continue
-        aus, timestamps = loaded_cache[cache_key]
 
-        # Segment by turns
-        segments = segment_au_by_turns(aus, timestamps, session.turns)
+        aus, timestamps = cache[key]
+        segments = segment_au_by_turns(aus, timestamps, s.turns)
 
-        # Per-turn features → list of vectors
-        turn_features: list[np.ndarray] = []
+        turn_vecs: list[np.ndarray] = []
         for seg in segments:
             parts: list[np.ndarray] = []
-
-            # Conv1D features
             if seg.shape[0] >= MIN_FRAMES_FOR_CONV:
-                x = torch.tensor(seg.T, dtype=torch.float32).unsqueeze(0)  # (1, 17, T)
-                feat_t = au_extractor(x).squeeze(0)                        # (conv_dim,)
-                feat = np.array(feat_t.tolist(), dtype=np.float32)
-                parts.append(feat)
+                x = torch.tensor(seg.T, dtype=torch.float32).unsqueeze(0)
+                feat = au_extractor(x).squeeze(0).cpu().numpy().astype(np.float32)
             else:
-                parts.append(np.zeros(conv_dim, dtype=np.float32))
+                feat = np.zeros(conv_dim, dtype=np.float32)
+            parts.append(feat)
+            parts.append(_au_stats(seg))
+            turn_vecs.append(np.concatenate(parts))
 
-            # Stats features
-            if include_stats:
-                parts.append(_au_stats(seg))
-
-            turn_features.append(np.concatenate(parts))
-
-        if turn_features:
-            X[i] = np.mean(turn_features, axis=0)
-
-        if (i + 1) % 50 == 0 or i == len(sessions) - 1:
-            log.info("  AU extraction: %d / %d sessions", i + 1, len(sessions))
+        if turn_vecs:
+            X[i] = np.mean(turn_vecs, axis=0)
 
     return X
 
@@ -518,231 +376,212 @@ def extract_text_features(
     model_name: str = "all-MiniLM-L6-v2",
     batch_size: int = 256,
 ) -> np.ndarray:
-    """Encode speech summaries with a sentence-transformer, mean-pool per session.
-
-    Sessions whose turns lack summaries get a zero vector.
-
-    Returns
-    -------
-    np.ndarray of shape (n_sessions, embed_dim)
-    """
     from sentence_transformers import SentenceTransformer
 
-    log.info("Loading sentence-transformer '%s' ...", model_name)
-    st_model = SentenceTransformer(model_name)
-    dim = st_model.get_sentence_embedding_dimension()
-    log.info("Text embedding dim = %d", dim)
+    st = SentenceTransformer(model_name)
+    dim = st.get_sentence_embedding_dimension()
 
-    # Collect all summaries with (session_idx, turn_idx) tracking
     all_texts: list[str] = []
-    index_map: list[tuple[int, int]] = []  # (session_idx, turn_idx)
-
-    for si, session in enumerate(sessions):
-        for ti, turn in enumerate(session.turns):
-            if turn.summary:
-                all_texts.append(turn.summary)
-                index_map.append((si, ti))
+    idx_map: list[int] = []
+    for i, s in enumerate(sessions):
+        for t in s.turns:
+            txt = (t.summary or "").strip()
+            if txt:
+                all_texts.append(txt)
+                idx_map.append(i)
 
     if not all_texts:
-        log.warning("No speech summaries found in any session — text features will be all zeros.")
         return np.zeros((len(sessions), dim), dtype=np.float32)
 
-    log.info("Encoding %d turn summaries ...", len(all_texts))
-    embeddings = st_model.encode(
-        all_texts, batch_size=batch_size, show_progress_bar=True,
-        convert_to_numpy=True,
-    )
+    embs = st.encode(all_texts, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True)
 
-    # Mean-pool per session
     X = np.zeros((len(sessions), dim), dtype=np.float32)
     counts = np.zeros(len(sessions), dtype=np.int32)
-    for (si, _), emb in zip(index_map, embeddings):
-        X[si] += emb
-        counts[si] += 1
+    for i, emb in zip(idx_map, embs):
+        X[i] += emb
+        counts[i] += 1
 
-    nonzero = counts > 0
-    X[nonzero] /= counts[nonzero, np.newaxis]
-
-    n_with_text = int(nonzero.sum())
-    log.info("Text features: %d/%d sessions have summaries", n_with_text, len(sessions))
-
+    valid = counts > 0
+    X[valid] /= counts[valid, None]
     return X
 
 
 # ---------------------------------------------------------------------------
-# Targets & metrics (REGRESSION)
+# Evaluation
 # ---------------------------------------------------------------------------
 
 
-def extract_targets(
-    sessions: list[SessionData], full_key: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return targets and validity mask for a specific outcome.
+def run_all_evaluations(records: list, output_path: Path) -> list[dict]:
+    train_records = [r for r in records if r.split == "train"]
+    val_records = [r for r in records if r.split == "val"]
+    test_records = [r for r in records if r.split == "test"]
 
-    Parameters
-    ----------
-    sessions : list of SessionData
-    full_key : str
-        Full yaml label key (e.g. ``"T5_BLRI_ges_Pr"``, ``"T3_PANAS_pos_In"``).
-        Only sessions whose ``labels`` dict contains this key will have
-        valid entries; effectively this restricts to the matching interview
-        type.
+    all_results: list[dict] = []
 
-    Returns
-    -------
-    y : np.ndarray of shape (n_sessions,)
-        Target values (NaN where missing / wrong interview type).
-    valid : np.ndarray of shape (n_sessions,), dtype bool
-        True where a valid label exists.
-    """
-    y = np.full(len(sessions), np.nan, dtype=np.float64)
-    for i, s in enumerate(sessions):
-        v = s.labels.get(full_key)
-        if v is not None:
-            y[i] = v
-    valid = ~np.isnan(y)
-    return y, valid
+    specs = discover_target_specs(records)
+    log.info("Discovered %d targets (%d regression, %d classification)",
+             len(specs),
+             sum(1 for s in specs if s.task == "regression"),
+             sum(1 for s in specs if s.task == "classification"))
 
+    feature_modes = ["AU_only", "Text_only", "AU+Text"]
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
-    """Regression metrics: MSE, MAE, R², Pearson r."""
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-    from scipy.stats import pearsonr
+    for spec in specs:
+        log.info("=" * 96)
+        log.info("TARGET: %s  [%s]", spec.name, spec.task)
+        log.info("=" * 96)
 
-    n = len(y_true)
-    mse = float(mean_squared_error(y_true, y_pred))
-    mae = float(mean_absolute_error(y_true, y_pred))
-    r2 = float(r2_score(y_true, y_pred)) if n > 1 else float("nan")
+        class_to_idx = {c: i for i, c in enumerate(spec.classes)} if spec.task == "classification" else None
 
-    if n > 2 and np.std(y_true) > 1e-12 and np.std(y_pred) > 1e-12:
-        r, p = pearsonr(y_true, y_pred)
-        r, p = float(r), float(p)
-    else:
-        r, p = 0.0, 1.0
+        for feat in feature_modes:
+            X_tr, y_tr, _ = build_features_and_targets(train_records, spec.name, feat, class_to_idx)
+            X_va, y_va, _ = build_features_and_targets(val_records, spec.name, feat, class_to_idx)
+            X_te, y_te, _ = build_features_and_targets(test_records, spec.name, feat, class_to_idx)
 
-    return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": r, "pearson_p": p, "n": n}
+            log.info("  [%s] valid n: train=%d val=%d test=%d", feat, len(y_tr), len(y_va), len(y_te))
 
+            if spec.task == "regression":
+                if len(y_tr) >= 5 and len(y_va) >= 2:
+                    for name, reg in get_regressors().items():
+                        try:
+                            reg.fit(X_tr, y_tr)
+                            pred = reg.predict(X_va)
+                            m = compute_reg_metrics(y_va, pred)
+                            m.update(task="regression", target=spec.name, features=feat, split="train→val", model=name)
+                            all_results.append(m)
+                        except Exception:
+                            pass
 
-# ---------------------------------------------------------------------------
-# Regressors
-# ---------------------------------------------------------------------------
+                if len(y_tr) >= 5 and len(y_te) >= 2:
+                    for name, reg in get_regressors().items():
+                        try:
+                            reg.fit(X_tr, y_tr)
+                            pred = reg.predict(X_te)
+                            m = compute_reg_metrics(y_te, pred)
+                            m.update(task="regression", target=spec.name, features=feat, split="train→test", model=name)
+                            all_results.append(m)
+                        except Exception:
+                            pass
 
+                if (len(y_tr) + len(y_va)) >= 5 and len(y_te) >= 2:
+                    X_trv = np.vstack([X_tr, X_va]) if len(y_va) > 0 else X_tr
+                    y_trv = np.concatenate([y_tr, y_va]) if len(y_va) > 0 else y_tr
+                    for name, reg in get_regressors().items():
+                        try:
+                            reg.fit(X_trv, y_trv)
+                            pred = reg.predict(X_te)
+                            m = compute_reg_metrics(y_te, pred)
+                            m.update(task="regression", target=spec.name, features=feat, split="train+val→test", model=name)
+                            all_results.append(m)
+                        except Exception:
+                            pass
 
-def get_regressors() -> dict[str, Any]:
-    from sklearn.linear_model import Ridge, Lasso
-    from sklearn.svm import SVR
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
+                # LOTO (Ridge default)
+                from sklearn.linear_model import Ridge
+                from sklearn.pipeline import make_pipeline
+                from sklearn.preprocessing import StandardScaler
 
-    return {
-        "Ridge(a=1)":   make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
-        "Ridge(a=10)":  make_pipeline(StandardScaler(), Ridge(alpha=10.0)),
-        "Ridge(a=0.1)": make_pipeline(StandardScaler(), Ridge(alpha=0.1)),
-        "Lasso(a=0.1)": make_pipeline(StandardScaler(), Lasso(alpha=0.1, max_iter=5000)),
-        "SVR(rbf)":     make_pipeline(StandardScaler(), SVR(kernel="rbf", C=1.0)),
-        "RF(100)":      RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
-        "GBR(100)":     GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42),
-    }
+                all_true: list[float] = []
+                all_pred: list[float] = []
+                therapist_ids = sorted({r.therapist_id for r in records})
 
+                X_all, y_all, _ = build_features_and_targets(records, spec.name, feat, None)
+                if len(y_all) >= 10:
+                    rec_all_valid = [r for r in records if build_features_and_targets([r], spec.name, feat, None)[1].shape[0] == 1]
+                    for held in therapist_ids:
+                        tr_idx = [i for i, r in enumerate(rec_all_valid) if r.therapist_id != held]
+                        te_idx = [i for i, r in enumerate(rec_all_valid) if r.therapist_id == held]
+                        if len(tr_idx) < 5 or len(te_idx) == 0:
+                            continue
+                        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+                        reg.fit(X_all[tr_idx], y_all[tr_idx])
+                        pred = reg.predict(X_all[te_idx])
+                        m = compute_reg_metrics(y_all[te_idx], pred)
+                        m.update(task="regression", target=spec.name, features=feat, held_out_therapist=held, n_train=len(tr_idx), n_test=len(te_idx))
+                        all_results.append(m)
+                        all_true.extend(y_all[te_idx].tolist())
+                        all_pred.extend(pred.tolist())
 
-# ---------------------------------------------------------------------------
-# Evaluation routines
-# ---------------------------------------------------------------------------
+                    if len(all_true) > 2:
+                        agg = compute_reg_metrics(np.array(all_true), np.array(all_pred))
+                        agg.update(task="regression", target=spec.name, features=feat, type="loto_aggregate")
+                        all_results.append(agg)
 
+            else:
+                # classification
+                if len(y_tr) >= 8 and len(set(y_tr.tolist())) >= 2 and len(y_va) >= 2:
+                    for name, clf in get_classifiers().items():
+                        try:
+                            clf.fit(X_tr, y_tr)
+                            pred = clf.predict(X_va)
+                            m = compute_clf_metrics(y_va, pred, spec.classes)
+                            m.update(task="classification", target=spec.name, features=feat, split="train→val", model=name)
+                            all_results.append(m)
+                        except Exception:
+                            pass
 
-def run_reg_fixed_split(
-    X_train: np.ndarray, y_train: np.ndarray,
-    X_test: np.ndarray, y_test: np.ndarray,
-    outcome: str, feature_label: str, split_label: str,
-) -> list[dict]:
-    """Train all regressors on a fixed split and return per-regressor metrics."""
-    results: list[dict] = []
-    best_r2 = -np.inf
-    best_name = ""
+                if len(y_tr) >= 8 and len(set(y_tr.tolist())) >= 2 and len(y_te) >= 2:
+                    for name, clf in get_classifiers().items():
+                        try:
+                            clf.fit(X_tr, y_tr)
+                            pred = clf.predict(X_te)
+                            m = compute_clf_metrics(y_te, pred, spec.classes)
+                            m.update(task="classification", target=spec.name, features=feat, split="train→test", model=name)
+                            all_results.append(m)
+                        except Exception:
+                            pass
 
-    for name, reg in get_regressors().items():
-        try:
-            reg.fit(X_train, y_train)
-            pred = reg.predict(X_test)
-            m = compute_metrics(y_test, pred)
-            m.update(regressor=name, outcome=outcome, features=feature_label, split=split_label)
-            results.append(m)
-            if m["r2"] > best_r2:
-                best_r2 = m["r2"]
-                best_name = name
-        except Exception as e:
-            log.warning("  %s failed on %s/%s: %s", name, outcome, feature_label, e)
+                if (len(y_tr) + len(y_va)) >= 8 and len(y_te) >= 2:
+                    X_trv = np.vstack([X_tr, X_va]) if len(y_va) > 0 else X_tr
+                    y_trv = np.concatenate([y_tr, y_va]) if len(y_va) > 0 else y_tr
+                    if len(set(y_trv.tolist())) >= 2:
+                        for name, clf in get_classifiers().items():
+                            try:
+                                clf.fit(X_trv, y_trv)
+                                pred = clf.predict(X_te)
+                                m = compute_clf_metrics(y_te, pred, spec.classes)
+                                m.update(task="classification", target=spec.name, features=feat, split="train+val→test", model=name)
+                                all_results.append(m)
+                            except Exception:
+                                pass
 
-    if best_name:
-        best_r = next((r["pearson_r"] for r in results if r["regressor"] == best_name), 0)
-        log.info(
-            "  %-18s %-10s %-18s best=%-14s R²=%7.4f  r=%7.4f  (n=%d)",
-            outcome, feature_label, split_label, best_name, best_r2, best_r, len(y_test),
-        )
-    return results
+                # LOTO (LogReg default)
+                from sklearn.linear_model import LogisticRegression
+                from sklearn.pipeline import make_pipeline
+                from sklearn.preprocessing import StandardScaler
 
+                all_true: list[int] = []
+                all_pred: list[int] = []
+                therapist_ids = sorted({r.therapist_id for r in records})
 
-def run_reg_loto_cv(
-    all_sessions: list[SessionData],
-    X_all: np.ndarray,
-    outcome: str,
-    feature_label: str,
-) -> list[dict]:
-    """Leave-one-therapist-out CV with Ridge(alpha=1) for one outcome."""
-    from sklearn.linear_model import Ridge
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
+                X_all, y_all, _ = build_features_and_targets(records, spec.name, feat, class_to_idx)
+                if len(y_all) >= 10:
+                    rec_all_valid = [r for r in records if build_features_and_targets([r], spec.name, feat, class_to_idx)[1].shape[0] == 1]
+                    for held in therapist_ids:
+                        tr_idx = [i for i, r in enumerate(rec_all_valid) if r.therapist_id != held]
+                        te_idx = [i for i, r in enumerate(rec_all_valid) if r.therapist_id == held]
+                        if len(tr_idx) < 8 or len(te_idx) == 0:
+                            continue
+                        if len(set(y_all[tr_idx].tolist())) < 2:
+                            continue
+                        clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=4000, random_state=42))
+                        clf.fit(X_all[tr_idx], y_all[tr_idx])
+                        pred = clf.predict(X_all[te_idx])
+                        m = compute_clf_metrics(y_all[te_idx], pred, spec.classes)
+                        m.update(task="classification", target=spec.name, features=feat, held_out_therapist=held, n_train=len(tr_idx), n_test=len(te_idx))
+                        all_results.append(m)
+                        all_true.extend(y_all[te_idx].tolist())
+                        all_pred.extend(pred.tolist())
 
-    y_all, valid = extract_targets(all_sessions, outcome)
-    n_valid = int(valid.sum())
-    if n_valid < 10:
-        log.info("  LOTO [%s/%s] skipped — only %d valid samples", outcome, feature_label, n_valid)
-        return []
+                    if len(all_true) > 2:
+                        agg = compute_clf_metrics(np.array(all_true), np.array(all_pred), spec.classes)
+                        agg.update(task="classification", target=spec.name, features=feat, type="loto_aggregate")
+                        all_results.append(agg)
 
-    therapist_ids = sorted(set(s.therapist_id for s in all_sessions))
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2, default=str)
 
-    all_true: list[float] = []
-    all_pred: list[float] = []
-    fold_results: list[dict] = []
-
-    for held_out in therapist_ids:
-        tr_idx = [i for i, s in enumerate(all_sessions)
-                  if s.therapist_id != held_out and valid[i]]
-        te_idx = [i for i, s in enumerate(all_sessions)
-                  if s.therapist_id == held_out and valid[i]]
-        if len(tr_idx) < 5 or len(te_idx) == 0:
-            continue
-
-        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
-        reg.fit(X_all[tr_idx], y_all[tr_idx])
-        pred = reg.predict(X_all[te_idx])
-
-        m = compute_metrics(y_all[te_idx], pred)
-        m.update(
-            held_out_therapist=held_out,
-            n_train=len(tr_idx), n_test=len(te_idx),
-            outcome=outcome, features=feature_label,
-        )
-        fold_results.append(m)
-        all_true.extend(y_all[te_idx].tolist())
-        all_pred.extend(pred.tolist())
-
-    results: list[dict] = list(fold_results)
-    if len(all_true) > 2:
-        agg = compute_metrics(np.array(all_true), np.array(all_pred))
-        agg.update(
-            type="loto_aggregate", outcome=outcome, features=feature_label,
-            n_valid=n_valid, n_folds=len(fold_results),
-        )
-        results.append(agg)
-        log.info(
-            "  LOTO AGG  %-18s %-10s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d, %d folds)",
-            outcome, feature_label,
-            agg["r2"], agg["pearson_r"], agg["mae"], agg["n"], len(fold_results),
-        )
-
-    return results
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -750,22 +589,16 @@ def run_reg_loto_cv(
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     args = parse_args()
     log.setLevel(getattr(logging, args.log_level.upper()))
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 1. Load sessions
-    # ------------------------------------------------------------------
-    log.info("Loading sessions ...")
     datasets: dict[str, list[SessionData]] = {}
     for split in ("train", "val", "test"):
-        datasets[split] = load_sessions(
-            args.data_model, args.config, split,
-        )
+        datasets[split] = load_sessions(args.data_model, args.config, split)
 
     train_s = datasets["train"]
     val_s = datasets["val"]
@@ -773,287 +606,43 @@ def main():
     all_s = train_s + val_s + test_s
 
     if not train_s:
-        log.error("Train split empty — aborting.")
+        log.error("Train split is empty.")
         sys.exit(1)
 
-    n_with_of = sum(1 for s in all_s if s.openface_path is not None)
-    n_with_text = sum(1 for s in all_s if any(t.summary for t in s.turns))
-    log.info(
-        "Total sessions: %d  (with OpenFace: %d, with text: %d)",
-        len(all_s), n_with_of, n_with_text,
-    )
-
-    # Label availability overview (grouped by interview type)
-    log.info("Label availability (per interview type):")
-    for itype, prefix in INTERVIEW_PREFIX.items():
-        n_type = sum(1 for s in all_s if s.interview_type == itype)
-        log.info("  --- %s (n=%d) ---", itype, n_type)
-        for suffix in OUTCOME_SUFFIXES:
-            full_key = f"{prefix}_{suffix}"
-            _, valid = extract_targets(all_s, full_key)
-            log.info("    %-25s  %d / %d", full_key, int(valid.sum()), n_type)
-
-    # Interview type distribution
-    for split_name, split_sessions in [("train", train_s), ("val", val_s), ("test", test_s), ("all", all_s)]:
-        dist = Counter(s.interview_type for s in split_sessions)
-        log.info("  [%s] type distribution: %s", split_name, dict(dist))
-
-    # ------------------------------------------------------------------
-    # 2. Extract AU features (Conv1D + stats)
-    # ------------------------------------------------------------------
-    log.info("=== EXTRACTING AU FEATURES ===")
+    log.info("Extracting AU features ...")
     au_extractor = DepthwiseConv1DExtractor(
         n_channels=N_AUS,
         n_kernels_per_channel=args.n_kernels,
-        kernel_sizes=[int(k) for k in args.kernel_sizes.split(",")],
+        kernel_sizes=[int(x) for x in args.kernel_sizes.split(",")],
         seed=args.seed,
     )
-    log.info(
-        "Conv1D output dim = %d  (+ stats %d = total AU dim %d)",
-        au_extractor.output_dim, N_AUS * 6, au_extractor.output_dim + N_AUS * 6,
-    )
+    X_au_all = extract_au_features(all_s, au_extractor)
 
-    X_au_all = extract_au_features(all_s, au_extractor, include_stats=True)
+    log.info("Extracting text features ...")
+    X_text_all = extract_text_features(all_s, model_name=args.embed_model, batch_size=args.embed_batch_size)
 
-    n_tr = len(train_s)
-    n_va = len(val_s)
-    X_au_train = X_au_all[:n_tr]
-    X_au_val = X_au_all[n_tr:n_tr + n_va]
-    X_au_test = X_au_all[n_tr + n_va:]
-
-    # ------------------------------------------------------------------
-    # 3. Extract text features
-    # ------------------------------------------------------------------
-    log.info("=== EXTRACTING TEXT FEATURES ===")
-    X_txt_all = extract_text_features(
-        all_s, model_name=args.embed_model, batch_size=args.embed_batch_size,
-    )
-
-    X_txt_train = X_txt_all[:n_tr]
-    X_txt_val = X_txt_all[n_tr:n_tr + n_va]
-    X_txt_test = X_txt_all[n_tr + n_va:]
-
-    # ------------------------------------------------------------------
-    # 4. Build feature sets (ablation)
-    # ------------------------------------------------------------------
-    feature_sets: dict[str, dict[str, np.ndarray]] = {
-        "AU_only": {
-            "train": X_au_train, "val": X_au_val, "test": X_au_test, "all": X_au_all,
-        },
-        "AU+Text": {
-            "train": np.hstack([X_au_train, X_txt_train]),
-            "val": np.hstack([X_au_val, X_txt_val]),
-            "test": np.hstack([X_au_test, X_txt_test]),
-            "all": np.hstack([X_au_all, X_txt_all]),
-        },
-    }
-
-    # Only add text-only if summaries exist
-    if n_with_text > 0:
-        feature_sets["Text_only"] = {
-            "train": X_txt_train, "val": X_txt_val, "test": X_txt_test, "all": X_txt_all,
-        }
-
-    # ------------------------------------------------------------------
-    # 5. Multi-target regression: loop over interview types × outcomes
-    #    Each full label key (e.g. T5_BLRI_ges_Pr) is only available for
-    #    sessions of the matching interview type.  The validity mask from
-    #    extract_targets() enforces this automatically since labels are
-    #    stored with the full key.
-    # ------------------------------------------------------------------
-    all_results: list[dict] = []
-    loto_summary: list[dict] = []  # LOTO aggregates for the final ranking
-
-    # Flat list of all (type, suffix, full_key) triples for summary tables
-    ALL_FULL_KEYS: list[tuple[str, str, str]] = [
-        (itype, suffix, f"{prefix}_{suffix}")
-        for itype, prefix in INTERVIEW_PREFIX.items()
-        for suffix in OUTCOME_SUFFIXES
-    ]
-
-    for itype, prefix in INTERVIEW_PREFIX.items():
-        log.info("")
-        log.info("#" * 80)
-        log.info("INTERVIEW TYPE: %s  (prefix=%s)", itype, prefix)
-        log.info("#" * 80)
-
-        for suffix in OUTCOME_SUFFIXES:
-            full_key = f"{prefix}_{suffix}"
-            log.info("")
-            log.info("=" * 80)
-            log.info("OUTCOME: %s", full_key)
-            log.info("=" * 80)
-
-            # --- Fixed-split evaluation ---
-            y_train, v_train = extract_targets(train_s, full_key)
-            y_val, v_val = extract_targets(val_s, full_key)
-            y_test, v_test = extract_targets(test_s, full_key)
-
-            log.info(
-                "  Valid labels — train: %d/%d  val: %d/%d  test: %d/%d",
-                int(v_train.sum()), len(train_s),
-                int(v_val.sum()), len(val_s),
-                int(v_test.sum()), len(test_s),
+    rows: list[SessionFeatureRow] = []
+    for i, s in enumerate(all_s):
+        rows.append(
+            SessionFeatureRow(
+                split=s.split,
+                patient_id=s.patient_id,
+                therapist_id=s.therapist_id,
+                interview_type=s.interview_type,
+                labels=s.labels,
+                baseline_labels=s.baseline_labels,
+                au_feat=X_au_all[i],
+                text_feat=X_text_all[i],
             )
-
-            for feat_name, feat in feature_sets.items():
-                # train → val
-                if v_train.sum() >= 5 and v_val.sum() >= 2:
-                    res = run_reg_fixed_split(
-                        feat["train"][v_train], y_train[v_train],
-                        feat["val"][v_val], y_val[v_val],
-                        full_key, feat_name, "train→val",
-                    )
-                    all_results.extend(res)
-
-                # train → test
-                if v_train.sum() >= 5 and v_test.sum() >= 2:
-                    res = run_reg_fixed_split(
-                        feat["train"][v_train], y_train[v_train],
-                        feat["test"][v_test], y_test[v_test],
-                        full_key, feat_name, "train→test",
-                    )
-                    all_results.extend(res)
-
-                # train+val → test
-                if v_train.sum() + v_val.sum() >= 5 and v_test.sum() >= 2:
-                    X_trv = np.vstack([feat["train"], feat["val"]])
-                    y_trv = np.concatenate([y_train, y_val])
-                    v_trv = np.concatenate([v_train, v_val])
-                    res = run_reg_fixed_split(
-                        X_trv[v_trv], y_trv[v_trv],
-                        feat["test"][v_test], y_test[v_test],
-                        full_key, feat_name, "train+val→test",
-                    )
-                    all_results.extend(res)
-
-            # --- LOTO-CV ---
-            log.info("--- LOTO-CV for %s ---", full_key)
-            for feat_name, feat in feature_sets.items():
-                loto_res = run_reg_loto_cv(all_s, feat["all"], full_key, feat_name)
-                all_results.extend(loto_res)
-                # Collect aggregates for summary
-                for r in loto_res:
-                    if r.get("type") == "loto_aggregate":
-                        loto_summary.append(r)
-
-    # ------------------------------------------------------------------
-    # 6. Save results
-    # ------------------------------------------------------------------
-    results_path = output_dir / "baseline_au_regression_results.json"
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2, default=str)
-    log.info("Results saved to %s  (%d entries)", results_path, len(all_results))
-
-    # ------------------------------------------------------------------
-    # 7. Summary tables
-    # ------------------------------------------------------------------
-
-    # --- 7a. Full LOTO table sorted by R² ---
-    log.info("")
-    log.info("=" * 130)
-    log.info("SUMMARY — LOTO-CV AGGREGATES (all outcomes × feature sets, sorted by R²)")
-    log.info("=" * 130)
-    log.info(
-        "%-26s %-12s %8s %10s %10s %10s %6s",
-        "Outcome", "Features", "R²", "Pearson_r", "Pearson_p", "MAE", "n",
-    )
-    log.info("-" * 130)
-
-    loto_sorted = sorted(loto_summary, key=lambda r: r.get("r2", -999), reverse=True)
-    for r in loto_sorted:
-        log.info(
-            "%-26s %-12s %8.4f %10.4f %10.4f %10.4f %6d",
-            r["outcome"], r["features"],
-            r["r2"], r["pearson_r"], r.get("pearson_p", 0), r["mae"], r["n"],
         )
-    log.info("=" * 130)
 
-    # --- 7b. Best modality per outcome ---
-    log.info("")
-    log.info("=" * 130)
-    log.info("BEST MODALITY PER OUTCOME (by LOTO R²)")
-    log.info("=" * 130)
-    log.info(
-        "%-26s %-12s %8s %10s %10s %6s",
-        "Outcome", "Best_feat", "R²", "Pearson_r", "MAE", "n",
-    )
-    log.info("-" * 130)
+    patient_records = build_patient_records(rows)
+    log.info("Built %d patient records.", len(patient_records))
 
-    best_per_outcome: dict[str, dict] = {}
-    for r in loto_summary:
-        oc = r["outcome"]
-        if oc not in best_per_outcome or r["r2"] > best_per_outcome[oc]["r2"]:
-            best_per_outcome[oc] = r
+    results_path = out_dir / "baseline_au_mixed_outcomes_results.json"
+    results = run_all_evaluations(patient_records, results_path)
 
-    for _itype, _suffix, full_key in ALL_FULL_KEYS:
-        if full_key in best_per_outcome:
-            r = best_per_outcome[full_key]
-            log.info(
-                "%-26s %-12s %8.4f %10.4f %10.4f %6d",
-                full_key, r["features"], r["r2"], r["pearson_r"], r["mae"], r["n"],
-            )
-        else:
-            log.info("%-26s  (no results — insufficient data)", full_key)
-    log.info("=" * 130)
-
-    # --- 7c. Best outcome per modality ---
-    log.info("")
-    log.info("=" * 130)
-    log.info("BEST OUTCOME PER MODALITY (by LOTO R²)")
-    log.info("=" * 130)
-    for feat_name in feature_sets:
-        feat_results = [r for r in loto_summary if r["features"] == feat_name]
-        if feat_results:
-            best = max(feat_results, key=lambda r: r["r2"])
-            log.info(
-                "  %-12s → best outcome: %-26s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d)",
-                feat_name, best["outcome"],
-                best["r2"], best["pearson_r"], best["mae"], best["n"],
-            )
-    log.info("=" * 130)
-
-    # --- 7d. Ablation delta: AU+Text vs individual modalities ---
-    log.info("")
-    log.info("=" * 130)
-    log.info("ABLATION DELTAS (AU+Text R² minus single-modality R²)")
-    log.info("=" * 130)
-    log.info(
-        "%-26s %10s %10s %12s %12s",
-        "Outcome", "AU_only", "Text_only", "AU+Text", "Δ(best→comb)",
-    )
-    log.info("-" * 130)
-
-    loto_by_key: dict[tuple[str, str], dict] = {}
-    for r in loto_summary:
-        loto_by_key[(r["outcome"], r["features"])] = r
-
-    for _itype, _suffix, full_key in ALL_FULL_KEYS:
-        r_au = loto_by_key.get((full_key, "AU_only"))
-        r_tx = loto_by_key.get((full_key, "Text_only"))
-        r_at = loto_by_key.get((full_key, "AU+Text"))
-
-        au_r2 = r_au["r2"] if r_au else float("nan")
-        tx_r2 = r_tx["r2"] if r_tx else float("nan")
-        at_r2 = r_at["r2"] if r_at else float("nan")
-
-        best_single = max(
-            x for x in [au_r2, tx_r2] if not (x != x)  # filter NaN
-        ) if any(not (x != x) for x in [au_r2, tx_r2]) else float("nan")
-
-        delta = at_r2 - best_single if not (at_r2 != at_r2 or best_single != best_single) else float("nan")
-
-        log.info(
-            "%-26s %10s %10s %12s %12s",
-            full_key,
-            f"{au_r2:8.4f}" if not (au_r2 != au_r2) else "   N/A   ",
-            f"{tx_r2:8.4f}" if not (tx_r2 != tx_r2) else "   N/A   ",
-            f"{at_r2:8.4f}" if not (at_r2 != at_r2) else "   N/A   ",
-            f"{delta:+8.4f}" if not (delta != delta) else "   N/A   ",
-        )
-    log.info("=" * 130)
-
-    log.info("\nDone.  %d total result entries saved.", len(all_results))
+    log.info("Saved %d result rows -> %s", len(results), results_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,39 +652,22 @@ def main():
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description=(
-            "Baseline: raw AU (1D Conv) + text summaries — "
-            "multi-target regression of all T3/T5/T7 outcomes"
-        ),
+        description="AU-conv baseline with mixed outcomes (regression+classification) and cumulative sessions",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Data paths
-    p.add_argument("--data_model", type=Path, required=True,
-                   help="Path to data_model.yaml")
-    p.add_argument("--config", type=Path, required=True,
-                   help="Path to config.yaml (split definitions)")
-    p.add_argument("--output_dir", type=Path,
-                   default=Path("results/baseline_au_regression"),
-                   help="Where to save results")
+    p.add_argument("--data_model", type=Path, required=True)
+    p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--output_dir", type=Path, default=Path("results/baseline_au_mixed"))
 
-    # Conv1D parameters
-    p.add_argument("--n_kernels", type=int, default=4,
-                   help="Number of random conv kernels per AU per kernel size")
-    p.add_argument("--kernel_sizes", type=str, default="7,15,31",
-                   help="Comma-separated kernel sizes (frames; 30fps)")
-    p.add_argument("--seed", type=int, default=42,
-                   help="Random seed for conv kernel initialisation")
+    p.add_argument("--n_kernels", type=int, default=4)
+    p.add_argument("--kernel_sizes", type=str, default="7,15,31")
+    p.add_argument("--seed", type=int, default=42)
 
-    # Text embedding
-    p.add_argument("--embed_model", type=str, default="all-MiniLM-L6-v2",
-                   help="Sentence-transformer model for text summaries")
-    p.add_argument("--embed_batch_size", type=int, default=256,
-                   help="Batch size for sentence-transformer encoding")
+    p.add_argument("--embed_model", type=str, default="all-MiniLM-L6-v2")
+    p.add_argument("--embed_batch_size", type=int, default=256)
 
-    # Misc
-    p.add_argument("--log_level", type=str, default="INFO",
-                   choices=["DEBUG", "INFO", "WARNING"])
+    p.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING"])
 
     return p.parse_args()
 
