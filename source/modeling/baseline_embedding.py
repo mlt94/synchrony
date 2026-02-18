@@ -1,24 +1,25 @@
 """
-Embedding-baseline diagnostic for BLRI prediction.
+Embedding-baseline diagnostic for BLRI prediction and treatment-type
+classification.
 
 Purpose
 -------
 Before investing in complex architectures (HMAN), this script tests whether
 the text features (speech summaries + AU descriptions) carry *any* signal
-predictive of BLRI scores.  It does so by:
+predictive of BLRI scores **and** whether they can discriminate between
+treatment types (bindung / personal / wunder).
+
+It does so by:
 
 1. Encoding every turn's speech summary and AU description with a frozen
    sentence-transformer (``all-MiniLM-L6-v2`` by default).
 2. Mean-pooling across turns to get a fixed-size session vector.
-3. Fitting simple regressors (Ridge, SVR, Lasso, RF) on the training split
-   and evaluating on val/test.
-
-If even a Ridge regression on mean-pooled sentence embeddings scores R² < 0,
-then the text features themselves are insufficient and architectural
-complexity won't help.
+3. Fitting simple regressors (Ridge, SVR, Lasso, RF) for BLRI and simple
+   classifiers (LogReg, SVC, RF, GBC) for treatment type on the training
+   split and evaluating on val/test.
 
 Additionally performs leave-one-therapist-out cross-validation as a
-robustness check.
+robustness check for both tasks.
 
 Usage
 -----
@@ -98,6 +99,14 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 log = logging.getLogger("baseline")
+
+# ---------------------------------------------------------------------------
+# Treatment-type classification constants
+# ---------------------------------------------------------------------------
+
+CLASS_LABELS: list[str] = ["bindung", "personal", "wunder"]
+CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(CLASS_LABELS)}
+N_CLASSES: int = len(CLASS_LABELS)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +212,126 @@ def compute_metrics(
     r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
     corr = float(np.corrcoef(y_true, y_pred)[0, 1]) if len(y_true) > 2 else float("nan")
     return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": corr, "n": len(y_true)}
+
+
+# ---------------------------------------------------------------------------
+# Classification metrics & classifiers
+# ---------------------------------------------------------------------------
+
+
+def compute_clf_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
+    """Classification metrics: accuracy, macro-F1, per-class F1, confusion matrix."""
+    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+    acc = float(accuracy_score(y_true, y_pred))
+    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+    f1_per = f1_score(y_true, y_pred, average=None, labels=list(range(N_CLASSES)), zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(N_CLASSES)))
+
+    return {
+        "accuracy": acc,
+        "f1_macro": f1_macro,
+        "f1_weighted": f1_weighted,
+        **{f"f1_{CLASS_LABELS[i]}": float(f1_per[i]) for i in range(N_CLASSES)},
+        "confusion_matrix": cm.tolist(),
+        "n": len(y_true),
+    }
+
+
+def get_classifiers() -> dict[str, Any]:
+    """Return a dict of name → sklearn classifier (unfitted)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    return {
+        "LogReg(C=1)": make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=42)),
+        "LogReg(C=10)": make_pipeline(StandardScaler(), LogisticRegression(C=10.0, max_iter=2000, random_state=42)),
+        "LogReg(C=0.1)": make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000, random_state=42)),
+        "SVC(rbf)": make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, random_state=42)),
+        "SVC(rbf,C=10)": make_pipeline(StandardScaler(), SVC(kernel="rbf", C=10.0, random_state=42)),
+        "RF(100)": RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
+        "GBC(100)": GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42),
+    }
+
+
+def extract_class_targets(sessions: list[SessionSample]) -> np.ndarray:
+    """Return integer class labels from interview_type."""
+    return np.array([CLASS_TO_IDX[s.interview_type] for s in sessions], dtype=np.int64)
+
+
+def run_clf_fixed_split(
+    X_train: np.ndarray, y_train: np.ndarray,
+    X_test: np.ndarray, y_test: np.ndarray,
+    label: str = "",
+) -> list[dict]:
+    """Fit all classifiers on (X_train, y_train), evaluate on (X_test, y_test)."""
+    results = []
+    for name, clf in get_classifiers().items():
+        clf.fit(X_train, y_train)
+        pred = clf.predict(X_test)
+        m = compute_clf_metrics(y_test, pred)
+        m.update(classifier=name, split=label)
+        results.append(m)
+        log.info(
+            "  %-20s %-15s  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
+            name, label, m["accuracy"], m["f1_macro"], m["f1_weighted"], m["n"],
+        )
+    return results
+
+
+def run_clf_loto_cv(
+    all_sessions: list[SessionSample],
+    X_all: np.ndarray,
+) -> list[dict]:
+    """Leave-one-therapist-out CV for treatment-type classification."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    therapist_ids = sorted(set(s.therapist_id for s in all_sessions))
+    log.info("LOTO-CV (classification) across %d therapists", len(therapist_ids))
+
+    y_all = extract_class_targets(all_sessions)
+    all_true: list[int] = []
+    all_pred: list[int] = []
+    results: list[dict] = []
+
+    for held_out in therapist_ids:
+        tr_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out]
+        te_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out]
+        if len(tr_idx) < 5 or len(te_idx) == 0:
+            continue
+        if len(set(y_all[tr_idx])) < 2:
+            continue
+
+        clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=42))
+        clf.fit(X_all[tr_idx], y_all[tr_idx])
+        pred = clf.predict(X_all[te_idx])
+
+        m = compute_clf_metrics(y_all[te_idx], pred)
+        m.update(held_out_therapist=held_out, n_train=len(tr_idx), n_test=len(te_idx))
+        results.append(m)
+        all_true.extend(y_all[te_idx].tolist())
+        all_pred.extend(pred.tolist())
+        log.info(
+            "  LOTO held=%s  Acc=%.4f  F1_macro=%.4f  n_test=%d",
+            held_out, m["accuracy"], m["f1_macro"], len(te_idx),
+        )
+
+    if all_true:
+        agg = compute_clf_metrics(np.array(all_true), np.array(all_pred))
+        agg["type"] = "loto_aggregate_clf"
+        results.append(agg)
+        log.info(
+            "  LOTO AGG  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
+            agg["accuracy"], agg["f1_macro"], agg["f1_weighted"], agg["n"],
+        )
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +587,7 @@ def main():
         log.info("=== %s → %s ===", tgt, split_name)
         res = run_fixed_split(
             X_train[mask_tr], y_tr[mask_tr],
-            X_te=X_test[mask_te] if split_name == "test" else X_val[mask_te],
+            X_test=X_test[mask_te] if split_name == "test" else X_val[mask_te],
             y_test=y_te[mask_te],
             target_name=tgt,
             label=split_name,
@@ -489,26 +618,81 @@ def main():
         all_results.extend(res)
 
     # ------------------------------------------------------------------
-    # 6. Leave-one-therapist-out CV
+    # 6. Leave-one-therapist-out CV (regression)
     # ------------------------------------------------------------------
-    log.info("=== LEAVE-ONE-THERAPIST-OUT CV ===")
+    log.info("=== LEAVE-ONE-THERAPIST-OUT CV (BLRI) ===")
     loto_results = run_loto_cv(all_sessions, X_all, args.embed_model)
     all_results.extend(loto_results)
 
     # ------------------------------------------------------------------
-    # 7. Save results
+    # 7. Treatment-type classification
+    # ------------------------------------------------------------------
+    log.info("")
+    log.info("=" * 90)
+    log.info("TREATMENT-TYPE CLASSIFICATION (bindung / personal / wunder)")
+    log.info("=" * 90)
+
+    y_cls_train = extract_class_targets(train_sessions)
+    y_cls_val = extract_class_targets(val_sessions)
+    y_cls_test = extract_class_targets(test_sessions)
+
+    from collections import Counter
+    for sn, y_c in [("train", y_cls_train), ("val", y_cls_val), ("test", y_cls_test)]:
+        dist = Counter(y_c.tolist())
+        log.info("  [%s] class dist: %s", sn, {CLASS_LABELS[k]: v for k, v in sorted(dist.items())})
+
+    # Majority-class baseline
+    majority_class = Counter(y_cls_train.tolist()).most_common(1)[0][0]
+    for sn, y_eval in [("val", y_cls_val), ("test", y_cls_test)]:
+        if len(y_eval) == 0:
+            continue
+        pred = np.full_like(y_eval, majority_class)
+        m = compute_clf_metrics(y_eval, pred)
+        log.info("  Majority(%s) %s  Acc=%.4f  F1m=%.4f", CLASS_LABELS[majority_class], sn, m["accuracy"], m["f1_macro"])
+
+    clf_results: list[dict] = []
+
+    # train → val
+    if len(y_cls_val) > 0:
+        log.info("--- train → val (classification) ---")
+        clf_results.extend(run_clf_fixed_split(X_train, y_cls_train, X_val, y_cls_val, "val"))
+
+    # train → test
+    if len(y_cls_test) > 0:
+        log.info("--- train → test (classification) ---")
+        clf_results.extend(run_clf_fixed_split(X_train, y_cls_train, X_test, y_cls_test, "test"))
+
+    # train+val → test
+    if len(y_cls_test) > 0 and len(y_cls_val) > 0:
+        X_trv = np.vstack([X_train, X_val])
+        y_trv = np.concatenate([y_cls_train, y_cls_val])
+        log.info("--- train+val → test (classification) ---")
+        clf_results.extend(run_clf_fixed_split(X_trv, y_trv, X_test, y_cls_test, "test_tv"))
+
+    # LOTO-CV classification
+    log.info("=== LEAVE-ONE-THERAPIST-OUT CV (Classification) ===")
+    clf_loto = run_clf_loto_cv(all_sessions, X_all)
+    clf_results.extend(clf_loto)
+
+    # ------------------------------------------------------------------
+    # 8. Save results
     # ------------------------------------------------------------------
     results_path = output_dir / "baseline_results.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, default=str)
-    log.info("Results saved to %s", results_path)
+    log.info("Regression results saved to %s", results_path)
+
+    clf_results_path = output_dir / "baseline_classification_results.json"
+    with open(clf_results_path, "w", encoding="utf-8") as f:
+        json.dump(clf_results, f, indent=2, default=str)
+    log.info("Classification results saved to %s", clf_results_path)
 
     # ------------------------------------------------------------------
-    # 8. Summary table
+    # 9. Summary tables
     # ------------------------------------------------------------------
     log.info("")
     log.info("=" * 90)
-    log.info("SUMMARY")
+    log.info("SUMMARY — BLRI REGRESSION")
     log.info("=" * 90)
     log.info(
         "%-25s %-10s %-15s %8s %8s %8s %8s",
@@ -530,6 +714,31 @@ def main():
             )
     log.info("=" * 90)
 
+    log.info("")
+    log.info("=" * 110)
+    log.info("SUMMARY — TREATMENT-TYPE CLASSIFICATION")
+    log.info("=" * 110)
+    log.info(
+        "%-20s %-15s %8s %10s %10s %6s",
+        "Classifier", "Split", "Acc", "F1_macro", "F1_wtd", "n",
+    )
+    log.info("-" * 110)
+    for r in clf_results:
+        if "classifier" in r:
+            log.info(
+                "%-20s %-15s %8.4f %10.4f %10.4f %6d",
+                r["classifier"], r.get("split", ""),
+                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
+            )
+    for r in clf_results:
+        if r.get("type") == "loto_aggregate_clf":
+            log.info(
+                "%-20s %-15s %8.4f %10.4f %10.4f %6d",
+                "LOTO-LogReg(C=1)", "aggregate",
+                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
+            )
+    log.info("=" * 110)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -538,7 +747,7 @@ def main():
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Embedding-baseline diagnostic for BLRI prediction",
+        description="Embedding-baseline diagnostic for BLRI prediction and treatment-type classification",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
