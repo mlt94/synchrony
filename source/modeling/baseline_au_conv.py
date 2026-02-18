@@ -889,53 +889,53 @@ def main():
             y_val, v_val = extract_targets(val_s, full_key)
             y_test, v_test = extract_targets(test_s, full_key)
 
-        log.info(
-            "  Valid labels — train: %d/%d  val: %d/%d  test: %d/%d",
-            int(v_train.sum()), len(train_s),
-            int(v_val.sum()), len(val_s),
-            int(v_test.sum()), len(test_s),
-        )
+            log.info(
+                "  Valid labels — train: %d/%d  val: %d/%d  test: %d/%d",
+                int(v_train.sum()), len(train_s),
+                int(v_val.sum()), len(val_s),
+                int(v_test.sum()), len(test_s),
+            )
 
-        for feat_name, feat in feature_sets.items():
-            # train → val
-            if v_train.sum() >= 5 and v_val.sum() >= 2:
-                res = run_reg_fixed_split(
-                    feat["train"][v_train], y_train[v_train],
-                    feat["val"][v_val], y_val[v_val],
-                    full_key, feat_name, "train→val",
-                )
-                all_results.extend(res)
+            for feat_name, feat in feature_sets.items():
+                # train → val
+                if v_train.sum() >= 5 and v_val.sum() >= 2:
+                    res = run_reg_fixed_split(
+                        feat["train"][v_train], y_train[v_train],
+                        feat["val"][v_val], y_val[v_val],
+                        full_key, feat_name, "train→val",
+                    )
+                    all_results.extend(res)
 
-            # train → test
-            if v_train.sum() >= 5 and v_test.sum() >= 2:
-                res = run_reg_fixed_split(
-                    feat["train"][v_train], y_train[v_train],
-                    feat["test"][v_test], y_test[v_test],
-                    full_key, feat_name, "train→test",
-                )
-                all_results.extend(res)
+                # train → test
+                if v_train.sum() >= 5 and v_test.sum() >= 2:
+                    res = run_reg_fixed_split(
+                        feat["train"][v_train], y_train[v_train],
+                        feat["test"][v_test], y_test[v_test],
+                        full_key, feat_name, "train→test",
+                    )
+                    all_results.extend(res)
 
-            # train+val → test
-            if v_train.sum() + v_val.sum() >= 5 and v_test.sum() >= 2:
-                X_trv = np.vstack([feat["train"], feat["val"]])
-                y_trv = np.concatenate([y_train, y_val])
-                v_trv = np.concatenate([v_train, v_val])
-                res = run_reg_fixed_split(
-                    X_trv[v_trv], y_trv[v_trv],
-                    feat["test"][v_test], y_test[v_test],
-                    full_key, feat_name, "train+val→test",
-                )
-                all_results.extend(res)
+                # train+val → test
+                if v_train.sum() + v_val.sum() >= 5 and v_test.sum() >= 2:
+                    X_trv = np.vstack([feat["train"], feat["val"]])
+                    y_trv = np.concatenate([y_train, y_val])
+                    v_trv = np.concatenate([v_train, v_val])
+                    res = run_reg_fixed_split(
+                        X_trv[v_trv], y_trv[v_trv],
+                        feat["test"][v_test], y_test[v_test],
+                        full_key, feat_name, "train+val→test",
+                    )
+                    all_results.extend(res)
 
-        # --- LOTO-CV ---
-        log.info("--- LOTO-CV for %s ---", full_key)
-        for feat_name, feat in feature_sets.items():
-            loto_res = run_reg_loto_cv(all_s, feat["all"], full_key, feat_name)
-            all_results.extend(loto_res)
-            # Collect aggregates for summary
-            for r in loto_res:
-                if r.get("type") == "loto_aggregate":
-                    loto_summary.append(r)
+            # --- LOTO-CV ---
+            log.info("--- LOTO-CV for %s ---", full_key)
+            for feat_name, feat in feature_sets.items():
+                loto_res = run_reg_loto_cv(all_s, feat["all"], full_key, feat_name)
+                all_results.extend(loto_res)
+                # Collect aggregates for summary
+                for r in loto_res:
+                    if r.get("type") == "loto_aggregate":
+                        loto_summary.append(r)
 
     # ------------------------------------------------------------------
     # 6. Save results
