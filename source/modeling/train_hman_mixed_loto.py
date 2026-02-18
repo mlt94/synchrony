@@ -36,6 +36,7 @@ try:
     from source.modeling.multisession_eval_common import (
         PatientRecord,
         SessionFeatureRow,
+        build_patient_records,
         compute_reg_metrics,
         discover_target_specs,
         required_types_for_target,
@@ -49,6 +50,7 @@ except ModuleNotFoundError:
     from source.modeling.multisession_eval_common import (
         PatientRecord,
         SessionFeatureRow,
+        build_patient_records,
         compute_reg_metrics,
         discover_target_specs,
         required_types_for_target,
