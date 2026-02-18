@@ -1,33 +1,40 @@
 """
 Baseline diagnostic: raw AU time-series (1D Conv) + text summaries for
-treatment-type classification (bindung / personal / wunder).
+multi-target regression of ALL numeric T3 / T5 / T7 outcomes.
 
 Purpose
 -------
-Tests whether raw OpenFace AU intensities carry predictive signal for
-therapy treatment type, using depthwise 1D convolutions (one filter bank
-per AU channel) to reduce each variable-length turn into a fixed-size
-feature vector.
+Predicts all numeric outcomes from data_model.yaml — PANAS (positive &
+negative affect), IRF (interpersonal reaction: self & other), and BLRI
+(global empathy) scores for both Practitioner (*_Pr*) and Instructor
+(*_In*) ratings — using raw OpenFace AU intensities and/or speech
+summaries.
 
-Two feature modalities, evaluated independently and jointly:
+Depthwise 1D convolutions (one filter bank per AU channel) reduce each
+variable-length AU turn into a fixed-size feature vector.
 
-* **AU features** – per-turn AU intensity time-series from the patient's
+Three feature modalities are evaluated in an **ablation study**:
+
+* **AU_only**  – per-turn AU intensity time-series from the patient's
   OpenFace CSV, segmented by transcript turn boundaries, reduced via
-  depthwise Conv1D + global pooling.
-* **Text features** – per-turn speech summaries encoded with a frozen
+  depthwise Conv1D + global pooling + temporal statistics.
+* **Text_only** – per-turn speech summaries encoded with a frozen
   sentence-transformer (``all-MiniLM-L6-v2``).
+* **AU+Text**  – concatenation of both.
 
 Session vectors are obtained by mean-pooling turn vectors, then fed to a
-battery of sklearn classifiers (Logistic Regression, SVC, RF, GBC).
+battery of sklearn regressors (Ridge, Lasso, SVR, RF, GBR).
 
-Additionally performs leave-one-therapist-out cross-validation.
+Performs fixed-split evaluation AND leave-one-therapist-out cross-
+validation (LOTO-CV).  Results are saved as a comprehensive JSON and a
+ranked summary of which outcomes are best predicted is printed.
 
 Usage
 -----
     python source/modeling/baseline_au_conv.py \\
         --data_model data_model.yaml \\
         --config config.yaml \\
-        --output_dir results/baseline_au_classification
+        --output_dir results/baseline_au_regression
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ import logging
 import platform
 import sys
 import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -71,16 +79,35 @@ AU_R_COLS: list[str] = [
 ]
 N_AUS: int = len(AU_R_COLS)  # 17
 
+# Interview type → time-point prefix for label keys in data_model.yaml
+INTERVIEW_PREFIX: dict[str, str] = {
+    "bindung":  "T5",
+    "personal": "T3",
+    "wunder":   "T7",
+}
+
+# All outcome suffixes (after stripping the T3_/T5_/T7_ prefix)
+OUTCOME_SUFFIXES: list[str] = [
+    "PANAS_pos_Pr", "PANAS_neg_Pr",
+    "IRF_self_Pr",  "IRF_other_Pr",
+    "BLRI_ges_Pr",
+    "PANAS_pos_In", "PANAS_neg_In",
+    "IRF_self_In",  "IRF_other_In",
+    "BLRI_ges_In",
+]
+
+# Full label-key map: {interview_type: {outcome_suffix: yaml_label_key}}
+LABEL_MAP: dict[str, dict[str, str]] = {
+    itype: {suffix: f"{prefix}_{suffix}" for suffix in OUTCOME_SUFFIXES}
+    for itype, prefix in INTERVIEW_PREFIX.items()
+}
+
+# For backwards compatibility / reference
 BLRI_LABEL_MAP: dict[str, tuple[str, str]] = {
     "bindung":  ("T5_BLRI_ges_Pr", "T5_BLRI_ges_In"),
     "personal": ("T3_BLRI_ges_Pr", "T3_BLRI_ges_In"),
     "wunder":   ("T7_BLRI_ges_Pr", "T7_BLRI_ges_In"),
 }
-
-# Treatment-type classification labels
-CLASS_LABELS: list[str] = ["bindung", "personal", "wunder"]
-CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(CLASS_LABELS)}
-N_CLASSES: int = len(CLASS_LABELS)
 
 # ---------------------------------------------------------------------------
 # Path helpers  (same logic as dataset.py)
@@ -147,9 +174,7 @@ class SessionData:
     therapist_id: str
     interview_type: str
     turns: list[TurnInfo]
-    blri_pr: float | None = None
-    blri_in: float | None = None
-    # Resolved paths (None if unavailable)
+    labels: dict[str, float] = field(default_factory=dict)  # outcome_suffix → numeric value
     openface_path: Path | None = None
 
 
@@ -237,20 +262,17 @@ def load_sessions(
         pid = interview["patient"]["patient_id"]
 
         for itype, idata in interview.get("types", {}).items():
-            # --- Classification target: interview type ---
-            if itype not in CLASS_TO_IDX:
+            if itype not in INTERVIEW_PREFIX:
                 skipped_unknown_type += 1
                 continue
 
-            # --- Optional BLRI labels (kept for metadata) ---
-            labels = idata.get("labels", {})
-            pr_key, in_key = BLRI_LABEL_MAP.get(itype, (None, None))
-            blri_pr = labels.get(pr_key) if pr_key else None
-            blri_in = labels.get(in_key) if in_key else None
-            if _is_nan(blri_pr):
-                blri_pr = None
-            if _is_nan(blri_in):
-                blri_in = None
+            # --- Extract ALL numeric labels for this interview type ---
+            labels_raw = idata.get("labels", {})
+            labels: dict[str, float] = {}
+            for suffix, yaml_key in LABEL_MAP[itype].items():
+                val = labels_raw.get(yaml_key)
+                if not _is_nan(val):
+                    labels[suffix] = float(val)
 
             # --- Transcript (for turn boundaries + optional summaries) ---
             transcript_raw = idata.get("transcript", "")
@@ -298,8 +320,7 @@ def load_sessions(
                 therapist_id=tid,
                 interview_type=itype,
                 turns=turns,
-                blri_pr=float(blri_pr) if blri_pr is not None else None,
-                blri_in=float(blri_in) if blri_in is not None else None,
+                labels=labels,
                 openface_path=of_path,
             ))
 
@@ -449,8 +470,7 @@ def extract_au_features(
         if session.openface_path is None:
             continue  # leave zeros
 
-        # Cache OpenFace loading (same CSV may be used by different sessions?
-        # No — each session has its own CSV.  But cache anyway for safety.)
+        # Cache OpenFace loading
         cache_key = str(session.openface_path)
         if cache_key not in loaded_cache:
             try:
@@ -550,63 +570,76 @@ def extract_text_features(
 
 
 # ---------------------------------------------------------------------------
-# Targets & metrics
+# Targets & metrics (REGRESSION)
 # ---------------------------------------------------------------------------
 
 
-def extract_targets(sessions: list[SessionData]) -> np.ndarray:
-    """Return integer class labels from interview_type.
+def extract_targets(
+    sessions: list[SessionData], outcome: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return targets and validity mask for a specific outcome.
+
+    Parameters
+    ----------
+    sessions : list of SessionData
+    outcome : str
+        Outcome suffix (e.g. ``"BLRI_ges_Pr"``, ``"PANAS_pos_In"``).
 
     Returns
     -------
-    y : np.ndarray of shape (n_sessions,), dtype int
-        Class indices: bindung=0, personal=1, wunder=2.
+    y : np.ndarray of shape (n_sessions,)
+        Target values (NaN where missing).
+    valid : np.ndarray of shape (n_sessions,), dtype bool
+        True where a valid label exists.
     """
-    return np.array([CLASS_TO_IDX[s.interview_type] for s in sessions], dtype=np.int64)
+    y = np.full(len(sessions), np.nan, dtype=np.float64)
+    for i, s in enumerate(sessions):
+        v = s.labels.get(outcome)
+        if v is not None:
+            y[i] = v
+    valid = ~np.isnan(y)
+    return y, valid
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
-    """Classification metrics: accuracy, macro-F1, per-class F1, confusion matrix."""
-    from sklearn.metrics import (
-        accuracy_score, f1_score, classification_report, confusion_matrix,
-    )
+    """Regression metrics: MSE, MAE, R², Pearson r."""
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    from scipy.stats import pearsonr
 
-    acc = float(accuracy_score(y_true, y_pred))
-    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
-    f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
-    f1_per_class = f1_score(y_true, y_pred, average=None, labels=list(range(N_CLASSES)), zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(N_CLASSES)))
+    n = len(y_true)
+    mse = float(mean_squared_error(y_true, y_pred))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred)) if n > 1 else float("nan")
 
-    return {
-        "accuracy": acc,
-        "f1_macro": f1_macro,
-        "f1_weighted": f1_weighted,
-        **{f"f1_{CLASS_LABELS[i]}": float(f1_per_class[i]) for i in range(N_CLASSES)},
-        "confusion_matrix": cm.tolist(),
-        "n": len(y_true),
-    }
+    if n > 2 and np.std(y_true) > 1e-12 and np.std(y_pred) > 1e-12:
+        r, p = pearsonr(y_true, y_pred)
+        r, p = float(r), float(p)
+    else:
+        r, p = 0.0, 1.0
+
+    return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": r, "pearson_p": p, "n": n}
 
 
 # ---------------------------------------------------------------------------
-# Classifiers
+# Regressors
 # ---------------------------------------------------------------------------
 
 
-def get_classifiers() -> dict[str, Any]:
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.svm import SVC
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+def get_regressors() -> dict[str, Any]:
+    from sklearn.linear_model import Ridge, Lasso
+    from sklearn.svm import SVR
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     return {
-        "LogReg(C=1)":     make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=42)),
-        "LogReg(C=10)":    make_pipeline(StandardScaler(), LogisticRegression(C=10.0, max_iter=2000, random_state=42)),
-        "LogReg(C=0.1)":   make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000, random_state=42)),
-        "SVC(rbf)":        make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, random_state=42)),
-        "SVC(rbf,C=10)":   make_pipeline(StandardScaler(), SVC(kernel="rbf", C=10.0, random_state=42)),
-        "RF(100)":         RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
-        "GBC(100)":        GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42),
+        "Ridge(a=1)":   make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
+        "Ridge(a=10)":  make_pipeline(StandardScaler(), Ridge(alpha=10.0)),
+        "Ridge(a=0.1)": make_pipeline(StandardScaler(), Ridge(alpha=0.1)),
+        "Lasso(a=0.1)": make_pipeline(StandardScaler(), Lasso(alpha=0.1, max_iter=5000)),
+        "SVR(rbf)":     make_pipeline(StandardScaler(), SVR(kernel="rbf", C=1.0)),
+        "RF(100)":      RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
+        "GBR(100)":     GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42),
     }
 
 
@@ -615,79 +648,95 @@ def get_classifiers() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def run_fixed_split(
+def run_reg_fixed_split(
     X_train: np.ndarray, y_train: np.ndarray,
     X_test: np.ndarray, y_test: np.ndarray,
-    label: str = "",
+    outcome: str, feature_label: str, split_label: str,
 ) -> list[dict]:
-    results = []
-    for name, clf in get_classifiers().items():
-        clf.fit(X_train, y_train)
-        pred = clf.predict(X_test)
-        m = compute_metrics(y_test, pred)
-        m.update(classifier=name, split=label)
-        results.append(m)
+    """Train all regressors on a fixed split and return per-regressor metrics."""
+    results: list[dict] = []
+    best_r2 = -np.inf
+    best_name = ""
+
+    for name, reg in get_regressors().items():
+        try:
+            reg.fit(X_train, y_train)
+            pred = reg.predict(X_test)
+            m = compute_metrics(y_test, pred)
+            m.update(regressor=name, outcome=outcome, features=feature_label, split=split_label)
+            results.append(m)
+            if m["r2"] > best_r2:
+                best_r2 = m["r2"]
+                best_name = name
+        except Exception as e:
+            log.warning("  %s failed on %s/%s: %s", name, outcome, feature_label, e)
+
+    if best_name:
+        best_r = next((r["pearson_r"] for r in results if r["regressor"] == best_name), 0)
         log.info(
-            "  %-20s %-15s  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
-            name, label, m["accuracy"], m["f1_macro"], m["f1_weighted"], m["n"],
+            "  %-18s %-10s %-18s best=%-14s R²=%7.4f  r=%7.4f  (n=%d)",
+            outcome, feature_label, split_label, best_name, best_r2, best_r, len(y_test),
         )
     return results
 
 
-def run_loto_cv(
-    all_sessions: list[SessionData], X_all: np.ndarray, feature_label: str,
+def run_reg_loto_cv(
+    all_sessions: list[SessionData],
+    X_all: np.ndarray,
+    outcome: str,
+    feature_label: str,
 ) -> list[dict]:
-    """Leave-one-therapist-out CV with LogisticRegression(C=1)."""
-    from sklearn.linear_model import LogisticRegression
+    """Leave-one-therapist-out CV with Ridge(alpha=1) for one outcome."""
+    from sklearn.linear_model import Ridge
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
+    y_all, valid = extract_targets(all_sessions, outcome)
+    n_valid = int(valid.sum())
+    if n_valid < 10:
+        log.info("  LOTO [%s/%s] skipped — only %d valid samples", outcome, feature_label, n_valid)
+        return []
+
     therapist_ids = sorted(set(s.therapist_id for s in all_sessions))
-    log.info("LOTO-CV across %d therapists: %s  [%s]", len(therapist_ids), therapist_ids, feature_label)
 
-    y_all = extract_targets(all_sessions)
-
-    all_true: list[int] = []
-    all_pred: list[int] = []
-    results: list[dict] = []
+    all_true: list[float] = []
+    all_pred: list[float] = []
+    fold_results: list[dict] = []
 
     for held_out in therapist_ids:
-        tr_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out]
-        te_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out]
+        tr_idx = [i for i, s in enumerate(all_sessions)
+                  if s.therapist_id != held_out and valid[i]]
+        te_idx = [i for i, s in enumerate(all_sessions)
+                  if s.therapist_id == held_out and valid[i]]
         if len(tr_idx) < 5 or len(te_idx) == 0:
             continue
 
-        # Check that training set has at least 2 classes
-        n_classes_train = len(set(y_all[tr_idx]))
-        if n_classes_train < 2:
-            log.warning("  LOTO held=%s — only %d class(es) in train, skipping", held_out, n_classes_train)
-            continue
-
-        clf = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(C=1.0, max_iter=2000, random_state=42),
-        )
-        clf.fit(X_all[tr_idx], y_all[tr_idx])
-        pred = clf.predict(X_all[te_idx])
+        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        reg.fit(X_all[tr_idx], y_all[tr_idx])
+        pred = reg.predict(X_all[te_idx])
 
         m = compute_metrics(y_all[te_idx], pred)
-        m.update(held_out_therapist=held_out,
-                 n_train=len(tr_idx), n_test=len(te_idx), features=feature_label)
-        results.append(m)
+        m.update(
+            held_out_therapist=held_out,
+            n_train=len(tr_idx), n_test=len(te_idx),
+            outcome=outcome, features=feature_label,
+        )
+        fold_results.append(m)
         all_true.extend(y_all[te_idx].tolist())
         all_pred.extend(pred.tolist())
-        log.info(
-            "  LOTO held=%s  Acc=%.4f  F1_macro=%.4f  n_test=%d  [%s]",
-            held_out, m["accuracy"], m["f1_macro"], len(te_idx), feature_label,
-        )
 
-    if all_true:
+    results: list[dict] = list(fold_results)
+    if len(all_true) > 2:
         agg = compute_metrics(np.array(all_true), np.array(all_pred))
-        agg.update(type="loto_aggregate", features=feature_label)
+        agg.update(
+            type="loto_aggregate", outcome=outcome, features=feature_label,
+            n_valid=n_valid, n_folds=len(fold_results),
+        )
         results.append(agg)
         log.info(
-            "  LOTO AGG  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)  [%s]",
-            agg["accuracy"], agg["f1_macro"], agg["f1_weighted"], agg["n"], feature_label,
+            "  LOTO AGG  %-18s %-10s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d, %d folds)",
+            outcome, feature_label,
+            agg["r2"], agg["pearson_r"], agg["mae"], agg["n"], len(fold_results),
         )
 
     return results
@@ -726,13 +775,21 @@ def main():
 
     n_with_of = sum(1 for s in all_s if s.openface_path is not None)
     n_with_text = sum(1 for s in all_s if any(t.summary for t in s.turns))
-    log.info("Total sessions: %d  (with OpenFace: %d, with text summaries: %d)", len(all_s), n_with_of, n_with_text)
+    log.info(
+        "Total sessions: %d  (with OpenFace: %d, with text: %d)",
+        len(all_s), n_with_of, n_with_text,
+    )
 
-    # Class distribution
+    # Label availability overview
+    log.info("Label availability:")
+    for outcome in OUTCOME_SUFFIXES:
+        _, valid = extract_targets(all_s, outcome)
+        log.info("  %-20s  %d / %d sessions have labels", outcome, int(valid.sum()), len(all_s))
+
+    # Interview type distribution
     for split_name, split_sessions in [("train", train_s), ("val", val_s), ("test", test_s), ("all", all_s)]:
-        from collections import Counter
         dist = Counter(s.interview_type for s in split_sessions)
-        log.info("  [%s] class distribution: %s", split_name, dict(dist))
+        log.info("  [%s] type distribution: %s", split_name, dict(dist))
 
     # ------------------------------------------------------------------
     # 2. Extract AU features (Conv1D + stats)
@@ -744,8 +801,10 @@ def main():
         kernel_sizes=[int(k) for k in args.kernel_sizes.split(",")],
         seed=args.seed,
     )
-    log.info("Conv1D output dim = %d  (+ stats %d = total AU dim %d)",
-             au_extractor.output_dim, N_AUS * 6, au_extractor.output_dim + N_AUS * 6)
+    log.info(
+        "Conv1D output dim = %d  (+ stats %d = total AU dim %d)",
+        au_extractor.output_dim, N_AUS * 6, au_extractor.output_dim + N_AUS * 6,
+    )
 
     X_au_all = extract_au_features(all_s, au_extractor, include_stats=True)
 
@@ -759,14 +818,16 @@ def main():
     # 3. Extract text features
     # ------------------------------------------------------------------
     log.info("=== EXTRACTING TEXT FEATURES ===")
-    X_txt_all = extract_text_features(all_s, model_name=args.embed_model, batch_size=args.embed_batch_size)
+    X_txt_all = extract_text_features(
+        all_s, model_name=args.embed_model, batch_size=args.embed_batch_size,
+    )
 
     X_txt_train = X_txt_all[:n_tr]
     X_txt_val = X_txt_all[n_tr:n_tr + n_va]
     X_txt_test = X_txt_all[n_tr + n_va:]
 
     # ------------------------------------------------------------------
-    # 4. Build combined feature sets
+    # 4. Build feature sets (ablation)
     # ------------------------------------------------------------------
     feature_sets: dict[str, dict[str, np.ndarray]] = {
         "AU_only": {
@@ -787,121 +848,186 @@ def main():
         }
 
     # ------------------------------------------------------------------
-    # 5. Targets (classification: treatment type)
-    # ------------------------------------------------------------------
-    y_train = extract_targets(train_s)
-    y_val = extract_targets(val_s)
-    y_test = extract_targets(test_s)
-
-    log.info(
-        "Targets — train: %d  val: %d  test: %d", len(y_train), len(y_val), len(y_test),
-    )
-
-    # ------------------------------------------------------------------
-    # 6. Majority-class baseline
-    # ------------------------------------------------------------------
-    log.info("=== MAJORITY-CLASS BASELINE ===")
-    from collections import Counter
-    majority_class = Counter(y_train.tolist()).most_common(1)[0][0]
-    majority_label = CLASS_LABELS[majority_class]
-
-    for sn, y_eval in [("val", y_val), ("test", y_test)]:
-        if len(y_eval) == 0:
-            continue
-        pred = np.full_like(y_eval, majority_class)
-        m = compute_metrics(y_eval, pred)
-        log.info(
-            "  Majority(%s)  %-5s  Acc=%.4f  F1_macro=%.4f  (n=%d)",
-            majority_label, sn, m["accuracy"], m["f1_macro"], m["n"],
-        )
-
-    # ------------------------------------------------------------------
-    # 7. Fixed-split evaluation per feature set
+    # 5. Multi-target regression: loop over ALL outcomes × feature sets
     # ------------------------------------------------------------------
     all_results: list[dict] = []
+    loto_summary: list[dict] = []  # LOTO aggregates for the final ranking
 
-    for feat_name, feat in feature_sets.items():
-        log.info("=" * 70)
-        log.info("FEATURE SET: %s  (dim=%d)", feat_name, feat["train"].shape[1])
-        log.info("=" * 70)
+    for outcome in OUTCOME_SUFFIXES:
+        log.info("=" * 80)
+        log.info("OUTCOME: %s", outcome)
+        log.info("=" * 80)
 
-        # train → val
-        if len(y_val) > 0:
-            log.info("--- train → val [%s] ---", feat_name)
-            res = run_fixed_split(
-                feat["train"], y_train,
-                feat["val"], y_val,
-                f"val({feat_name})",
-            )
-            all_results.extend(res)
+        # --- Fixed-split evaluation ---
+        y_train, v_train = extract_targets(train_s, outcome)
+        y_val, v_val = extract_targets(val_s, outcome)
+        y_test, v_test = extract_targets(test_s, outcome)
 
-        # train → test
-        if len(y_test) > 0:
-            log.info("--- train → test [%s] ---", feat_name)
-            res = run_fixed_split(
-                feat["train"], y_train,
-                feat["test"], y_test,
-                f"test({feat_name})",
-            )
-            all_results.extend(res)
+        log.info(
+            "  Valid labels — train: %d/%d  val: %d/%d  test: %d/%d",
+            int(v_train.sum()), len(train_s),
+            int(v_val.sum()), len(val_s),
+            int(v_test.sum()), len(test_s),
+        )
 
-        # train+val → test
-        if len(y_test) > 0 and len(y_val) > 0:
-            X_trv = np.vstack([feat["train"], feat["val"]])
-            y_trv = np.concatenate([y_train, y_val])
-            log.info("--- train+val → test [%s] ---", feat_name)
-            res = run_fixed_split(X_trv, y_trv, feat["test"], y_test, f"test_tv({feat_name})")
-            all_results.extend(res)
+        for feat_name, feat in feature_sets.items():
+            # train → val
+            if v_train.sum() >= 5 and v_val.sum() >= 2:
+                res = run_reg_fixed_split(
+                    feat["train"][v_train], y_train[v_train],
+                    feat["val"][v_val], y_val[v_val],
+                    outcome, feat_name, "train→val",
+                )
+                all_results.extend(res)
+
+            # train → test
+            if v_train.sum() >= 5 and v_test.sum() >= 2:
+                res = run_reg_fixed_split(
+                    feat["train"][v_train], y_train[v_train],
+                    feat["test"][v_test], y_test[v_test],
+                    outcome, feat_name, "train→test",
+                )
+                all_results.extend(res)
+
+            # train+val → test
+            if v_train.sum() + v_val.sum() >= 5 and v_test.sum() >= 2:
+                X_trv = np.vstack([feat["train"], feat["val"]])
+                y_trv = np.concatenate([y_train, y_val])
+                v_trv = np.concatenate([v_train, v_val])
+                res = run_reg_fixed_split(
+                    X_trv[v_trv], y_trv[v_trv],
+                    feat["test"][v_test], y_test[v_test],
+                    outcome, feat_name, "train+val→test",
+                )
+                all_results.extend(res)
+
+        # --- LOTO-CV ---
+        log.info("--- LOTO-CV for %s ---", outcome)
+        for feat_name, feat in feature_sets.items():
+            loto_res = run_reg_loto_cv(all_s, feat["all"], outcome, feat_name)
+            all_results.extend(loto_res)
+            # Collect aggregates for summary
+            for r in loto_res:
+                if r.get("type") == "loto_aggregate":
+                    loto_summary.append(r)
 
     # ------------------------------------------------------------------
-    # 8. LOTO-CV per feature set
+    # 6. Save results
     # ------------------------------------------------------------------
-    for feat_name, feat in feature_sets.items():
-        log.info("=== LOTO-CV [%s] ===", feat_name)
-        loto_res = run_loto_cv(all_s, feat["all"], feat_name)
-        all_results.extend(loto_res)
-
-    # ------------------------------------------------------------------
-    # 9. Save results
-    # ------------------------------------------------------------------
-    results_path = output_dir / "baseline_au_classification_results.json"
+    results_path = output_dir / "baseline_au_regression_results.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, default=str)
-    log.info("Results saved to %s", results_path)
+    log.info("Results saved to %s  (%d entries)", results_path, len(all_results))
 
     # ------------------------------------------------------------------
-    # 10. Summary table
+    # 7. Summary tables
     # ------------------------------------------------------------------
+
+    # --- 7a. Full LOTO table sorted by R² ---
     log.info("")
-    log.info("=" * 110)
-    log.info("SUMMARY — FIXED SPLITS (Treatment-Type Classification)")
-    log.info("=" * 110)
+    log.info("=" * 120)
+    log.info("SUMMARY — LOTO-CV AGGREGATES (all outcomes × feature sets, sorted by R²)")
+    log.info("=" * 120)
     log.info(
-        "%-20s %-20s %8s %10s %10s %6s",
-        "Classifier", "Split(Features)", "Acc", "F1_macro", "F1_wtd", "n",
+        "%-20s %-12s %8s %10s %10s %10s %6s",
+        "Outcome", "Features", "R²", "Pearson_r", "Pearson_p", "MAE", "n",
     )
-    log.info("-" * 110)
-    for r in all_results:
-        if "classifier" in r:
-            log.info(
-                "%-20s %-20s %8.4f %10.4f %10.4f %6d",
-                r["classifier"], r.get("split", ""),
-                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
-            )
-    log.info("=" * 110)
+    log.info("-" * 120)
 
+    loto_sorted = sorted(loto_summary, key=lambda r: r.get("r2", -999), reverse=True)
+    for r in loto_sorted:
+        log.info(
+            "%-20s %-12s %8.4f %10.4f %10.4f %10.4f %6d",
+            r["outcome"], r["features"],
+            r["r2"], r["pearson_r"], r.get("pearson_p", 0), r["mae"], r["n"],
+        )
+    log.info("=" * 120)
+
+    # --- 7b. Best modality per outcome ---
     log.info("")
-    log.info("=" * 110)
-    log.info("SUMMARY — LOTO-CV AGGREGATES")
-    log.info("=" * 110)
-    for r in all_results:
-        if r.get("type") == "loto_aggregate":
+    log.info("=" * 120)
+    log.info("BEST MODALITY PER OUTCOME (by LOTO R²)")
+    log.info("=" * 120)
+    log.info(
+        "%-20s %-12s %8s %10s %10s %6s",
+        "Outcome", "Best_feat", "R²", "Pearson_r", "MAE", "n",
+    )
+    log.info("-" * 120)
+
+    best_per_outcome: dict[str, dict] = {}
+    for r in loto_summary:
+        oc = r["outcome"]
+        if oc not in best_per_outcome or r["r2"] > best_per_outcome[oc]["r2"]:
+            best_per_outcome[oc] = r
+
+    for oc in OUTCOME_SUFFIXES:
+        if oc in best_per_outcome:
+            r = best_per_outcome[oc]
             log.info(
-                "  %-15s  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
-                r.get("features", ""),
-                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
+                "%-20s %-12s %8.4f %10.4f %10.4f %6d",
+                oc, r["features"], r["r2"], r["pearson_r"], r["mae"], r["n"],
             )
-    log.info("=" * 110)
+        else:
+            log.info("%-20s  (no results — insufficient data)", oc)
+    log.info("=" * 120)
+
+    # --- 7c. Best outcome per modality ---
+    log.info("")
+    log.info("=" * 120)
+    log.info("BEST OUTCOME PER MODALITY (by LOTO R²)")
+    log.info("=" * 120)
+    for feat_name in feature_sets:
+        feat_results = [r for r in loto_summary if r["features"] == feat_name]
+        if feat_results:
+            best = max(feat_results, key=lambda r: r["r2"])
+            log.info(
+                "  %-12s → best outcome: %-20s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d)",
+                feat_name, best["outcome"],
+                best["r2"], best["pearson_r"], best["mae"], best["n"],
+            )
+    log.info("=" * 120)
+
+    # --- 7d. Ablation delta: AU+Text vs individual modalities ---
+    log.info("")
+    log.info("=" * 120)
+    log.info("ABLATION DELTAS (AU+Text R² minus single-modality R²)")
+    log.info("=" * 120)
+    log.info(
+        "%-20s %10s %10s %12s %12s",
+        "Outcome", "AU_only", "Text_only", "AU+Text", "Δ(best→comb)",
+    )
+    log.info("-" * 120)
+
+    loto_by_key: dict[tuple[str, str], dict] = {}
+    for r in loto_summary:
+        loto_by_key[(r["outcome"], r["features"])] = r
+
+    for oc in OUTCOME_SUFFIXES:
+        r_au = loto_by_key.get((oc, "AU_only"))
+        r_tx = loto_by_key.get((oc, "Text_only"))
+        r_at = loto_by_key.get((oc, "AU+Text"))
+
+        au_r2 = r_au["r2"] if r_au else float("nan")
+        tx_r2 = r_tx["r2"] if r_tx else float("nan")
+        at_r2 = r_at["r2"] if r_at else float("nan")
+
+        best_single = max(
+            x for x in [au_r2, tx_r2] if not (x != x)  # filter NaN
+        ) if any(not (x != x) for x in [au_r2, tx_r2]) else float("nan")
+
+        delta = at_r2 - best_single if not (at_r2 != at_r2 or best_single != best_single) else float("nan")
+
+        log.info(
+            "%-20s %10s %10s %12s %12s",
+            oc,
+            f"{au_r2:8.4f}" if not (au_r2 != au_r2) else "   N/A   ",
+            f"{tx_r2:8.4f}" if not (tx_r2 != tx_r2) else "   N/A   ",
+            f"{at_r2:8.4f}" if not (at_r2 != at_r2) else "   N/A   ",
+            f"{delta:+8.4f}" if not (delta != delta) else "   N/A   ",
+        )
+    log.info("=" * 120)
+
+    log.info("\nDone.  %d total result entries saved.", len(all_results))
 
 
 # ---------------------------------------------------------------------------
@@ -911,14 +1037,20 @@ def main():
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Baseline: raw AU (1D Conv) + text summaries for treatment-type classification",
+        description=(
+            "Baseline: raw AU (1D Conv) + text summaries — "
+            "multi-target regression of all T3/T5/T7 outcomes"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Data paths
-    p.add_argument("--data_model", type=Path, required=True, help="Path to data_model.yaml")
-    p.add_argument("--config", type=Path, required=True, help="Path to config.yaml (split definitions)")
-    p.add_argument("--output_dir", type=Path, default=Path("results/baseline_au_classification"),
+    p.add_argument("--data_model", type=Path, required=True,
+                   help="Path to data_model.yaml")
+    p.add_argument("--config", type=Path, required=True,
+                   help="Path to config.yaml (split definitions)")
+    p.add_argument("--output_dir", type=Path,
+                   default=Path("results/baseline_au_regression"),
                    help="Where to save results")
 
     # Conv1D parameters
@@ -936,7 +1068,8 @@ def parse_args() -> argparse.Namespace:
                    help="Batch size for sentence-transformer encoding")
 
     # Misc
-    p.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING"])
+    p.add_argument("--log_level", type=str, default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING"])
 
     return p.parse_args()
 
