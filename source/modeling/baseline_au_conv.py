@@ -174,7 +174,7 @@ class SessionData:
     therapist_id: str
     interview_type: str
     turns: list[TurnInfo]
-    labels: dict[str, float] = field(default_factory=dict)  # outcome_suffix → numeric value
+    labels: dict[str, float] = field(default_factory=dict)  # full yaml key (e.g. T5_BLRI_ges_Pr) → value
     openface_path: Path | None = None
 
 
@@ -272,7 +272,7 @@ def load_sessions(
             for suffix, yaml_key in LABEL_MAP[itype].items():
                 val = labels_raw.get(yaml_key)
                 if not _is_nan(val):
-                    labels[suffix] = float(val)
+                    labels[yaml_key] = float(val)
 
             # --- Transcript (for turn boundaries + optional summaries) ---
             transcript_raw = idata.get("transcript", "")
@@ -575,26 +575,29 @@ def extract_text_features(
 
 
 def extract_targets(
-    sessions: list[SessionData], outcome: str,
+    sessions: list[SessionData], full_key: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return targets and validity mask for a specific outcome.
 
     Parameters
     ----------
     sessions : list of SessionData
-    outcome : str
-        Outcome suffix (e.g. ``"BLRI_ges_Pr"``, ``"PANAS_pos_In"``).
+    full_key : str
+        Full yaml label key (e.g. ``"T5_BLRI_ges_Pr"``, ``"T3_PANAS_pos_In"``).
+        Only sessions whose ``labels`` dict contains this key will have
+        valid entries; effectively this restricts to the matching interview
+        type.
 
     Returns
     -------
     y : np.ndarray of shape (n_sessions,)
-        Target values (NaN where missing).
+        Target values (NaN where missing / wrong interview type).
     valid : np.ndarray of shape (n_sessions,), dtype bool
         True where a valid label exists.
     """
     y = np.full(len(sessions), np.nan, dtype=np.float64)
     for i, s in enumerate(sessions):
-        v = s.labels.get(outcome)
+        v = s.labels.get(full_key)
         if v is not None:
             y[i] = v
     valid = ~np.isnan(y)
@@ -780,11 +783,15 @@ def main():
         len(all_s), n_with_of, n_with_text,
     )
 
-    # Label availability overview
-    log.info("Label availability:")
-    for outcome in OUTCOME_SUFFIXES:
-        _, valid = extract_targets(all_s, outcome)
-        log.info("  %-20s  %d / %d sessions have labels", outcome, int(valid.sum()), len(all_s))
+    # Label availability overview (grouped by interview type)
+    log.info("Label availability (per interview type):")
+    for itype, prefix in INTERVIEW_PREFIX.items():
+        n_type = sum(1 for s in all_s if s.interview_type == itype)
+        log.info("  --- %s (n=%d) ---", itype, n_type)
+        for suffix in OUTCOME_SUFFIXES:
+            full_key = f"{prefix}_{suffix}"
+            _, valid = extract_targets(all_s, full_key)
+            log.info("    %-25s  %d / %d", full_key, int(valid.sum()), n_type)
 
     # Interview type distribution
     for split_name, split_sessions in [("train", train_s), ("val", val_s), ("test", test_s), ("all", all_s)]:
@@ -848,20 +855,39 @@ def main():
         }
 
     # ------------------------------------------------------------------
-    # 5. Multi-target regression: loop over ALL outcomes × feature sets
+    # 5. Multi-target regression: loop over interview types × outcomes
+    #    Each full label key (e.g. T5_BLRI_ges_Pr) is only available for
+    #    sessions of the matching interview type.  The validity mask from
+    #    extract_targets() enforces this automatically since labels are
+    #    stored with the full key.
     # ------------------------------------------------------------------
     all_results: list[dict] = []
     loto_summary: list[dict] = []  # LOTO aggregates for the final ranking
 
-    for outcome in OUTCOME_SUFFIXES:
-        log.info("=" * 80)
-        log.info("OUTCOME: %s", outcome)
-        log.info("=" * 80)
+    # Flat list of all (type, suffix, full_key) triples for summary tables
+    ALL_FULL_KEYS: list[tuple[str, str, str]] = [
+        (itype, suffix, f"{prefix}_{suffix}")
+        for itype, prefix in INTERVIEW_PREFIX.items()
+        for suffix in OUTCOME_SUFFIXES
+    ]
 
-        # --- Fixed-split evaluation ---
-        y_train, v_train = extract_targets(train_s, outcome)
-        y_val, v_val = extract_targets(val_s, outcome)
-        y_test, v_test = extract_targets(test_s, outcome)
+    for itype, prefix in INTERVIEW_PREFIX.items():
+        log.info("")
+        log.info("#" * 80)
+        log.info("INTERVIEW TYPE: %s  (prefix=%s)", itype, prefix)
+        log.info("#" * 80)
+
+        for suffix in OUTCOME_SUFFIXES:
+            full_key = f"{prefix}_{suffix}"
+            log.info("")
+            log.info("=" * 80)
+            log.info("OUTCOME: %s", full_key)
+            log.info("=" * 80)
+
+            # --- Fixed-split evaluation ---
+            y_train, v_train = extract_targets(train_s, full_key)
+            y_val, v_val = extract_targets(val_s, full_key)
+            y_test, v_test = extract_targets(test_s, full_key)
 
         log.info(
             "  Valid labels — train: %d/%d  val: %d/%d  test: %d/%d",
@@ -876,7 +902,7 @@ def main():
                 res = run_reg_fixed_split(
                     feat["train"][v_train], y_train[v_train],
                     feat["val"][v_val], y_val[v_val],
-                    outcome, feat_name, "train→val",
+                    full_key, feat_name, "train→val",
                 )
                 all_results.extend(res)
 
@@ -885,7 +911,7 @@ def main():
                 res = run_reg_fixed_split(
                     feat["train"][v_train], y_train[v_train],
                     feat["test"][v_test], y_test[v_test],
-                    outcome, feat_name, "train→test",
+                    full_key, feat_name, "train→test",
                 )
                 all_results.extend(res)
 
@@ -897,14 +923,14 @@ def main():
                 res = run_reg_fixed_split(
                     X_trv[v_trv], y_trv[v_trv],
                     feat["test"][v_test], y_test[v_test],
-                    outcome, feat_name, "train+val→test",
+                    full_key, feat_name, "train+val→test",
                 )
                 all_results.extend(res)
 
         # --- LOTO-CV ---
-        log.info("--- LOTO-CV for %s ---", outcome)
+        log.info("--- LOTO-CV for %s ---", full_key)
         for feat_name, feat in feature_sets.items():
-            loto_res = run_reg_loto_cv(all_s, feat["all"], outcome, feat_name)
+            loto_res = run_reg_loto_cv(all_s, feat["all"], full_key, feat_name)
             all_results.extend(loto_res)
             # Collect aggregates for summary
             for r in loto_res:
@@ -925,34 +951,34 @@ def main():
 
     # --- 7a. Full LOTO table sorted by R² ---
     log.info("")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info("SUMMARY — LOTO-CV AGGREGATES (all outcomes × feature sets, sorted by R²)")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info(
-        "%-20s %-12s %8s %10s %10s %10s %6s",
+        "%-26s %-12s %8s %10s %10s %10s %6s",
         "Outcome", "Features", "R²", "Pearson_r", "Pearson_p", "MAE", "n",
     )
-    log.info("-" * 120)
+    log.info("-" * 130)
 
     loto_sorted = sorted(loto_summary, key=lambda r: r.get("r2", -999), reverse=True)
     for r in loto_sorted:
         log.info(
-            "%-20s %-12s %8.4f %10.4f %10.4f %10.4f %6d",
+            "%-26s %-12s %8.4f %10.4f %10.4f %10.4f %6d",
             r["outcome"], r["features"],
             r["r2"], r["pearson_r"], r.get("pearson_p", 0), r["mae"], r["n"],
         )
-    log.info("=" * 120)
+    log.info("=" * 130)
 
     # --- 7b. Best modality per outcome ---
     log.info("")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info("BEST MODALITY PER OUTCOME (by LOTO R²)")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info(
-        "%-20s %-12s %8s %10s %10s %6s",
+        "%-26s %-12s %8s %10s %10s %6s",
         "Outcome", "Best_feat", "R²", "Pearson_r", "MAE", "n",
     )
-    log.info("-" * 120)
+    log.info("-" * 130)
 
     best_per_outcome: dict[str, dict] = {}
     for r in loto_summary:
@@ -960,52 +986,52 @@ def main():
         if oc not in best_per_outcome or r["r2"] > best_per_outcome[oc]["r2"]:
             best_per_outcome[oc] = r
 
-    for oc in OUTCOME_SUFFIXES:
-        if oc in best_per_outcome:
-            r = best_per_outcome[oc]
+    for _itype, _suffix, full_key in ALL_FULL_KEYS:
+        if full_key in best_per_outcome:
+            r = best_per_outcome[full_key]
             log.info(
-                "%-20s %-12s %8.4f %10.4f %10.4f %6d",
-                oc, r["features"], r["r2"], r["pearson_r"], r["mae"], r["n"],
+                "%-26s %-12s %8.4f %10.4f %10.4f %6d",
+                full_key, r["features"], r["r2"], r["pearson_r"], r["mae"], r["n"],
             )
         else:
-            log.info("%-20s  (no results — insufficient data)", oc)
-    log.info("=" * 120)
+            log.info("%-26s  (no results — insufficient data)", full_key)
+    log.info("=" * 130)
 
     # --- 7c. Best outcome per modality ---
     log.info("")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info("BEST OUTCOME PER MODALITY (by LOTO R²)")
-    log.info("=" * 120)
+    log.info("=" * 130)
     for feat_name in feature_sets:
         feat_results = [r for r in loto_summary if r["features"] == feat_name]
         if feat_results:
             best = max(feat_results, key=lambda r: r["r2"])
             log.info(
-                "  %-12s → best outcome: %-20s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d)",
+                "  %-12s → best outcome: %-26s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d)",
                 feat_name, best["outcome"],
                 best["r2"], best["pearson_r"], best["mae"], best["n"],
             )
-    log.info("=" * 120)
+    log.info("=" * 130)
 
     # --- 7d. Ablation delta: AU+Text vs individual modalities ---
     log.info("")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info("ABLATION DELTAS (AU+Text R² minus single-modality R²)")
-    log.info("=" * 120)
+    log.info("=" * 130)
     log.info(
-        "%-20s %10s %10s %12s %12s",
+        "%-26s %10s %10s %12s %12s",
         "Outcome", "AU_only", "Text_only", "AU+Text", "Δ(best→comb)",
     )
-    log.info("-" * 120)
+    log.info("-" * 130)
 
     loto_by_key: dict[tuple[str, str], dict] = {}
     for r in loto_summary:
         loto_by_key[(r["outcome"], r["features"])] = r
 
-    for oc in OUTCOME_SUFFIXES:
-        r_au = loto_by_key.get((oc, "AU_only"))
-        r_tx = loto_by_key.get((oc, "Text_only"))
-        r_at = loto_by_key.get((oc, "AU+Text"))
+    for _itype, _suffix, full_key in ALL_FULL_KEYS:
+        r_au = loto_by_key.get((full_key, "AU_only"))
+        r_tx = loto_by_key.get((full_key, "Text_only"))
+        r_at = loto_by_key.get((full_key, "AU+Text"))
 
         au_r2 = r_au["r2"] if r_au else float("nan")
         tx_r2 = r_tx["r2"] if r_tx else float("nan")
@@ -1018,14 +1044,14 @@ def main():
         delta = at_r2 - best_single if not (at_r2 != at_r2 or best_single != best_single) else float("nan")
 
         log.info(
-            "%-20s %10s %10s %12s %12s",
-            oc,
+            "%-26s %10s %10s %12s %12s",
+            full_key,
             f"{au_r2:8.4f}" if not (au_r2 != au_r2) else "   N/A   ",
             f"{tx_r2:8.4f}" if not (tx_r2 != tx_r2) else "   N/A   ",
             f"{at_r2:8.4f}" if not (at_r2 != at_r2) else "   N/A   ",
             f"{delta:+8.4f}" if not (delta != delta) else "   N/A   ",
         )
-    log.info("=" * 120)
+    log.info("=" * 130)
 
     log.info("\nDone.  %d total result entries saved.", len(all_results))
 
