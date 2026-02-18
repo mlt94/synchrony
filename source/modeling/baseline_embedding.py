@@ -1,46 +1,20 @@
 """
-Embedding-baseline diagnostic for BLRI prediction and treatment-type
-classification.
+Embedding baseline: multi-target regression for all numeric T3/T5/T7 outcomes
+with modality ablation (AU-text only, speech-text only, combined).
 
-Purpose
--------
-Before investing in complex architectures (HMAN), this script tests whether
-the text features (speech summaries + AU descriptions) carry *any* signal
-predictive of BLRI scores **and** whether they can discriminate between
-treatment types (bindung / personal / wunder).
+Compared to baseline_au_conv.py, this script differs only in AU modality
+representation: AU is treated as text (generated per-turn AU descriptions),
+encoded with a sentence-transformer.
 
-It does so by:
+Evaluated feature sets:
+- AU_only   : per-turn AU descriptions (text) -> session embedding
+- Text_only : per-turn speech summaries (text) -> session embedding
+- AU+Text   : concatenation of AU_only and Text_only session embeddings
 
-1. Encoding every turn's speech summary and AU description with a frozen
-   sentence-transformer (``all-MiniLM-L6-v2`` by default).
-2. Mean-pooling across turns to get a fixed-size session vector.
-3. Fitting simple regressors (Ridge, SVR, Lasso, RF) for BLRI and simple
-   classifiers (LogReg, SVC, RF, GBC) for treatment type on the training
-   split and evaluating on val/test.
-
-Additionally performs leave-one-therapist-out cross-validation as a
-robustness check for both tasks.
-
-Usage
------
-    # Run as module (recommended):
-    python -m source.modeling.baseline_embedding \
-        --data_model data_model.yaml \
-        --config config.yaml \
-        --au_descriptions_dir <path_to_au_jsons>
-
-    # Or run directly:
-    python source/modeling/baseline_embedding.py \
-        --data_model data_model.yaml \
-        --config config.yaml \
-        --au_descriptions_dir <path_to_au_jsons>
-
-    # On HPC (paths are WSL-style in data_model.yaml):
-    python source/modeling/baseline_embedding.py \
-        --data_model data_model.yaml \
-        --config config.yaml \
-        --au_descriptions_dir /home/mlut/PsyTSLM/au_descriptions \
-        --output_dir results/baseline
+Targets:
+All numeric outcomes for each interview type prefix (T5/T3/T7):
+PANAS_pos_Pr, PANAS_neg_Pr, IRF_self_Pr, IRF_other_Pr, BLRI_ges_Pr,
+PANAS_pos_In, PANAS_neg_In, IRF_self_In, IRF_other_In, BLRI_ges_In.
 """
 
 from __future__ import annotations
@@ -49,44 +23,22 @@ import argparse
 import json
 import logging
 import sys
-import time
-from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml
 
-# Reuse the data-loading machinery from the HMAN dataset module.
-# This keeps the exact same data pipeline and avoids bugs from
-# re-implementing path resolution, BLRI label mapping, modality
-# completeness checks, etc.
+# Reuse robust path/data helpers from dataset module
 try:
-    from source.modeling.dataset import (
-        PsychotherapyDataset,
-        SessionSample,
-        BLRI_LABEL_MAP,
-        load_au_descriptions,
-        _resolve_path,
-        _is_nan,
-        _load_json,
-    )
+    from source.modeling.dataset import load_au_descriptions, _resolve_path, _is_nan
 except ModuleNotFoundError:
-    # Script mode fallback (e.g., `python source/modeling/baseline_embedding.py`)
-    # requires project root on sys.path so `source.*` can be resolved.
     repo_root = Path(__file__).resolve().parents[2]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from source.modeling.dataset import (
-        PsychotherapyDataset,
-        SessionSample,
-        BLRI_LABEL_MAP,
-        load_au_descriptions,
-        _resolve_path,
-        _is_nan,
-        _load_json,
-    )
+    from source.modeling.dataset import load_au_descriptions, _resolve_path, _is_nan
 
-import yaml
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -98,240 +50,254 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stderr,
 )
-log = logging.getLogger("baseline")
-
-# ---------------------------------------------------------------------------
-# Treatment-type classification constants
-# ---------------------------------------------------------------------------
-
-CLASS_LABELS: list[str] = ["bindung", "personal", "wunder"]
-CLASS_TO_IDX: dict[str, int] = {c: i for i, c in enumerate(CLASS_LABELS)}
-N_CLASSES: int = len(CLASS_LABELS)
+log = logging.getLogger("baseline_embedding")
 
 
 # ---------------------------------------------------------------------------
-# Embedding utilities
+# Label mapping (same target space as baseline_au_conv.py)
+# ---------------------------------------------------------------------------
+
+INTERVIEW_PREFIX: dict[str, str] = {
+    "bindung": "T5",
+    "personal": "T3",
+    "wunder": "T7",
+}
+
+OUTCOME_SUFFIXES: list[str] = [
+    "PANAS_pos_Pr", "PANAS_neg_Pr",
+    "IRF_self_Pr", "IRF_other_Pr",
+    "BLRI_ges_Pr",
+    "PANAS_pos_In", "PANAS_neg_In",
+    "IRF_self_In", "IRF_other_In",
+    "BLRI_ges_In",
+]
+
+LABEL_MAP: dict[str, dict[str, str]] = {
+    itype: {suffix: f"{prefix}_{suffix}" for suffix in OUTCOME_SUFFIXES}
+    for itype, prefix in INTERVIEW_PREFIX.items()
+}
+
+
+# ---------------------------------------------------------------------------
+# Data containers
 # ---------------------------------------------------------------------------
 
 
-def embed_sessions(
-    sessions: list[SessionSample],
-    model_name: str = "all-MiniLM-L6-v2",
-    batch_size: int = 256,
-    combine: str = "concat",
+@dataclass
+class SessionTextData:
+    patient_id: str
+    therapist_id: str
+    interview_type: str
+    speech_summaries: list[str] = field(default_factory=list)
+    au_descriptions: list[str] = field(default_factory=list)
+    labels: dict[str, float] = field(default_factory=dict)  # full key -> value
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+
+def load_sessions(
+    data_model_path: Path,
+    config_path: Path,
+    au_descriptions_dir: Path,
+    split: str,
+) -> list[SessionTextData]:
+    """Load sessions with per-turn speech + AU-description texts and full labels."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    allowed = set(config["psychotherapy_splits"][split])
+
+    with open(data_model_path, "r", encoding="utf-8") as f:
+        data_model = yaml.safe_load(f)
+
+    au_index = load_au_descriptions(au_descriptions_dir)
+
+    sessions: list[SessionTextData] = []
+    skipped_unknown_type = 0
+    skipped_no_transcript = 0
+    skipped_no_turns = 0
+
+    for interview in data_model["interviews"]:
+        therapist_id = interview["therapist"]["therapist_id"]
+        if therapist_id not in allowed:
+            continue
+
+        patient_id = interview["patient"]["patient_id"]
+
+        for itype, idata in interview.get("types", {}).items():
+            if itype not in INTERVIEW_PREFIX:
+                skipped_unknown_type += 1
+                continue
+
+            labels_raw = idata.get("labels", {})
+            labels: dict[str, float] = {}
+            for _suffix, full_key in LABEL_MAP[itype].items():
+                value = labels_raw.get(full_key)
+                if not _is_nan(value):
+                    labels[full_key] = float(value)
+
+            transcript_raw = idata.get("transcript", "")
+            transcript_path = _resolve_path(transcript_raw) if transcript_raw else None
+            if transcript_path is None or not transcript_path.exists():
+                skipped_no_transcript += 1
+                continue
+
+            try:
+                with open(transcript_path, "r", encoding="utf-8") as f:
+                    turns_data = json.load(f)
+            except Exception:
+                skipped_no_transcript += 1
+                continue
+
+            if not isinstance(turns_data, list) or len(turns_data) == 0:
+                skipped_no_turns += 1
+                continue
+
+            turns_data = sorted(turns_data, key=lambda t: t.get("turn_index", 0))
+
+            speech_summaries: list[str] = []
+            au_descriptions: list[str] = []
+
+            for turn in turns_data:
+                turn_index = turn.get("turn_index")
+                summary = (turn.get("summary", "") or "").strip()
+
+                try:
+                    turn_index_int = int(turn_index)
+                except (TypeError, ValueError):
+                    continue
+
+                au_desc = (au_index.get((patient_id, itype, turn_index_int), "") or "").strip()
+
+                # Keep alignment between modalities; if missing text, keep empty string.
+                speech_summaries.append(summary)
+                au_descriptions.append(au_desc)
+
+            # Keep sessions with at least one turn.
+            if len(speech_summaries) == 0:
+                skipped_no_turns += 1
+                continue
+
+            sessions.append(
+                SessionTextData(
+                    patient_id=patient_id,
+                    therapist_id=therapist_id,
+                    interview_type=itype,
+                    speech_summaries=speech_summaries,
+                    au_descriptions=au_descriptions,
+                    labels=labels,
+                )
+            )
+
+    log.info(
+        "[%s] Loaded %d sessions (skipped: %d unknown type, %d no transcript, %d no turns)",
+        split.upper(), len(sessions), skipped_unknown_type, skipped_no_transcript, skipped_no_turns,
+    )
+    return sessions
+
+
+# ---------------------------------------------------------------------------
+# Embedding extraction
+# ---------------------------------------------------------------------------
+
+
+def _safe_text(x: str) -> str:
+    x = (x or "").strip()
+    return x if x else "[UNK]"
+
+
+def embed_session_texts(
+    sessions: list[SessionTextData],
+    field: str,
+    model_name: str,
+    batch_size: int,
 ) -> np.ndarray:
-    """Embed all sessions into fixed-size vectors.
-
-    Parameters
-    ----------
-    sessions : list[SessionSample]
-        Sessions to embed.
-    model_name : str
-        Sentence-transformer model name.
-    batch_size : int
-        Encoding batch size for the sentence transformer.
-    combine : str
-        How to combine the two modality embeddings per turn.
-        ``"concat"`` → [speech; au] (2*dim), ``"mean"`` → mean (dim).
-
-    Returns
-    -------
-    np.ndarray of shape ``(len(sessions), embed_dim)``
-    """
+    """Embed one modality ('speech' or 'au') and mean-pool per session."""
     from sentence_transformers import SentenceTransformer
 
-    log.info(
-        "Loading sentence-transformer '%s' …", model_name
-    )
+    if field not in {"speech", "au"}:
+        raise ValueError("field must be 'speech' or 'au'")
+
+    log.info("Loading sentence-transformer '%s' for %s texts ...", model_name, field)
     st_model = SentenceTransformer(model_name)
     dim = st_model.get_sentence_embedding_dimension()
-    log.info("Embedding dim = %d", dim)
 
-    # Collect ALL texts across all sessions so we can batch-encode once.
-    all_speech: list[str] = []
-    all_au: list[str] = []
-    boundaries: list[tuple[int, int]] = []  # (start, end) per session
-
+    all_texts: list[str] = []
+    boundaries: list[tuple[int, int]] = []
     offset = 0
-    for s in sessions:
-        n = s.num_turns
-        all_speech.extend(s.speech_summaries)
-        all_au.extend(s.au_descriptions)
-        boundaries.append((offset, offset + n))
-        offset += n
 
-    total_turns = offset
-    log.info(
-        "Encoding %d turns (%d sessions) …", total_turns, len(sessions)
+    for s in sessions:
+        if field == "speech":
+            texts = [_safe_text(t) for t in s.speech_summaries]
+        else:
+            texts = [_safe_text(t) for t in s.au_descriptions]
+
+        all_texts.extend(texts)
+        boundaries.append((offset, offset + len(texts)))
+        offset += len(texts)
+
+    if offset == 0:
+        return np.zeros((len(sessions), dim), dtype=np.float32)
+
+    log.info("Encoding %d %s turns ...", offset, field)
+    emb = st_model.encode(
+        all_texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
     )
 
-    t0 = time.time()
-    speech_embs = st_model.encode(
-        all_speech, batch_size=batch_size, show_progress_bar=True,
-        convert_to_numpy=True,
-    )  # (total_turns, dim)
-    au_embs = st_model.encode(
-        all_au, batch_size=batch_size, show_progress_bar=True,
-        convert_to_numpy=True,
-    )  # (total_turns, dim)
-    elapsed = time.time() - t0
-    log.info("Encoding done in %.1f s", elapsed)
-
-    # Per-session mean-pool → session vector
-    if combine == "concat":
-        session_dim = 2 * dim
-    else:
-        session_dim = dim
-
-    X = np.zeros((len(sessions), session_dim), dtype=np.float32)
-
+    X = np.zeros((len(sessions), dim), dtype=np.float32)
     for i, (start, end) in enumerate(boundaries):
-        sp = speech_embs[start:end].mean(axis=0)   # (dim,)
-        au = au_embs[start:end].mean(axis=0)        # (dim,)
-        if combine == "concat":
-            X[i] = np.concatenate([sp, au])
-        else:
-            X[i] = (sp + au) / 2.0
+        if end > start:
+            X[i] = emb[start:end].mean(axis=0)
 
     return X
 
 
 # ---------------------------------------------------------------------------
-# Metrics
+# Targets & metrics
 # ---------------------------------------------------------------------------
 
 
-def compute_metrics(
-    y_true: np.ndarray, y_pred: np.ndarray
-) -> dict[str, float]:
-    """Compute MSE, MAE, R² for a single target."""
-    mse = float(np.mean((y_true - y_pred) ** 2))
-    mae = float(np.mean(np.abs(y_true - y_pred)))
-    ss_res = float(np.sum((y_true - y_pred) ** 2))
-    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-    r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
-    corr = float(np.corrcoef(y_true, y_pred)[0, 1]) if len(y_true) > 2 else float("nan")
-    return {"mse": mse, "mae": mae, "r2": r2, "pearson_r": corr, "n": len(y_true)}
+def extract_targets(
+    sessions: list[SessionTextData],
+    full_key: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    y = np.full(len(sessions), np.nan, dtype=np.float64)
+    for i, s in enumerate(sessions):
+        v = s.labels.get(full_key)
+        if v is not None:
+            y[i] = v
+    valid = ~np.isnan(y)
+    return y, valid
 
 
-# ---------------------------------------------------------------------------
-# Classification metrics & classifiers
-# ---------------------------------------------------------------------------
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+    from scipy.stats import pearsonr
 
+    n = len(y_true)
+    mse = float(mean_squared_error(y_true, y_pred))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred)) if n > 1 else float("nan")
 
-def compute_clf_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, Any]:
-    """Classification metrics: accuracy, macro-F1, per-class F1, confusion matrix."""
-    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-
-    acc = float(accuracy_score(y_true, y_pred))
-    f1_macro = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
-    f1_weighted = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
-    f1_per = f1_score(y_true, y_pred, average=None, labels=list(range(N_CLASSES)), zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=list(range(N_CLASSES)))
+    if n > 2 and np.std(y_true) > 1e-12 and np.std(y_pred) > 1e-12:
+        r, p = pearsonr(y_true, y_pred)
+        r, p = float(r), float(p)
+    else:
+        r, p = 0.0, 1.0
 
     return {
-        "accuracy": acc,
-        "f1_macro": f1_macro,
-        "f1_weighted": f1_weighted,
-        **{f"f1_{CLASS_LABELS[i]}": float(f1_per[i]) for i in range(N_CLASSES)},
-        "confusion_matrix": cm.tolist(),
-        "n": len(y_true),
+        "mse": mse,
+        "mae": mae,
+        "r2": r2,
+        "pearson_r": r,
+        "pearson_p": p,
+        "n": n,
     }
-
-
-def get_classifiers() -> dict[str, Any]:
-    """Return a dict of name → sklearn classifier (unfitted)."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.svm import SVC
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    return {
-        "LogReg(C=1)": make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=42)),
-        "LogReg(C=10)": make_pipeline(StandardScaler(), LogisticRegression(C=10.0, max_iter=2000, random_state=42)),
-        "LogReg(C=0.1)": make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=2000, random_state=42)),
-        "SVC(rbf)": make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, random_state=42)),
-        "SVC(rbf,C=10)": make_pipeline(StandardScaler(), SVC(kernel="rbf", C=10.0, random_state=42)),
-        "RF(100)": RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
-        "GBC(100)": GradientBoostingClassifier(n_estimators=100, max_depth=3, random_state=42),
-    }
-
-
-def extract_class_targets(sessions: list[SessionSample]) -> np.ndarray:
-    """Return integer class labels from interview_type."""
-    return np.array([CLASS_TO_IDX[s.interview_type] for s in sessions], dtype=np.int64)
-
-
-def run_clf_fixed_split(
-    X_train: np.ndarray, y_train: np.ndarray,
-    X_test: np.ndarray, y_test: np.ndarray,
-    label: str = "",
-) -> list[dict]:
-    """Fit all classifiers on (X_train, y_train), evaluate on (X_test, y_test)."""
-    results = []
-    for name, clf in get_classifiers().items():
-        clf.fit(X_train, y_train)
-        pred = clf.predict(X_test)
-        m = compute_clf_metrics(y_test, pred)
-        m.update(classifier=name, split=label)
-        results.append(m)
-        log.info(
-            "  %-20s %-15s  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
-            name, label, m["accuracy"], m["f1_macro"], m["f1_weighted"], m["n"],
-        )
-    return results
-
-
-def run_clf_loto_cv(
-    all_sessions: list[SessionSample],
-    X_all: np.ndarray,
-) -> list[dict]:
-    """Leave-one-therapist-out CV for treatment-type classification."""
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    therapist_ids = sorted(set(s.therapist_id for s in all_sessions))
-    log.info("LOTO-CV (classification) across %d therapists", len(therapist_ids))
-
-    y_all = extract_class_targets(all_sessions)
-    all_true: list[int] = []
-    all_pred: list[int] = []
-    results: list[dict] = []
-
-    for held_out in therapist_ids:
-        tr_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out]
-        te_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out]
-        if len(tr_idx) < 5 or len(te_idx) == 0:
-            continue
-        if len(set(y_all[tr_idx])) < 2:
-            continue
-
-        clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000, random_state=42))
-        clf.fit(X_all[tr_idx], y_all[tr_idx])
-        pred = clf.predict(X_all[te_idx])
-
-        m = compute_clf_metrics(y_all[te_idx], pred)
-        m.update(held_out_therapist=held_out, n_train=len(tr_idx), n_test=len(te_idx))
-        results.append(m)
-        all_true.extend(y_all[te_idx].tolist())
-        all_pred.extend(pred.tolist())
-        log.info(
-            "  LOTO held=%s  Acc=%.4f  F1_macro=%.4f  n_test=%d",
-            held_out, m["accuracy"], m["f1_macro"], len(te_idx),
-        )
-
-    if all_true:
-        agg = compute_clf_metrics(np.array(all_true), np.array(all_pred))
-        agg["type"] = "loto_aggregate_clf"
-        results.append(agg)
-        log.info(
-            "  LOTO AGG  Acc=%.4f  F1_macro=%.4f  F1_w=%.4f  (n=%d)",
-            agg["accuracy"], agg["f1_macro"], agg["f1_weighted"], agg["n"],
-        )
-
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +306,6 @@ def run_clf_loto_cv(
 
 
 def get_regressors() -> dict[str, Any]:
-    """Return a dict of name → sklearn regressor (unfitted)."""
     from sklearn.linear_model import Ridge, Lasso
     from sklearn.svm import SVR
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -350,130 +315,115 @@ def get_regressors() -> dict[str, Any]:
     return {
         "Ridge(a=1)": make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
         "Ridge(a=10)": make_pipeline(StandardScaler(), Ridge(alpha=10.0)),
-        "Ridge(a=100)": make_pipeline(StandardScaler(), Ridge(alpha=100.0)),
-        "Lasso(a=1)": make_pipeline(StandardScaler(), Lasso(alpha=1.0, max_iter=5000)),
+        "Ridge(a=0.1)": make_pipeline(StandardScaler(), Ridge(alpha=0.1)),
+        "Lasso(a=0.1)": make_pipeline(StandardScaler(), Lasso(alpha=0.1, max_iter=5000)),
         "SVR(rbf)": make_pipeline(StandardScaler(), SVR(kernel="rbf", C=1.0)),
-        "SVR(rbf,C=10)": make_pipeline(StandardScaler(), SVR(kernel="rbf", C=10.0)),
         "RF(100)": RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1),
         "GBR(100)": GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42),
     }
 
 
 # ---------------------------------------------------------------------------
-# Evaluation helpers
+# Evaluation routines
 # ---------------------------------------------------------------------------
 
 
-def extract_targets(sessions: list[SessionSample]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Extract BLRI target arrays and valid masks.
-
-    Returns (y_pr, y_in, mask_pr, mask_in).
-    """
-    y_pr = np.array([s.blri_pr if s.blri_pr is not None else np.nan for s in sessions])
-    y_in = np.array([s.blri_in if s.blri_in is not None else np.nan for s in sessions])
-    mask_pr = ~np.isnan(y_pr)
-    mask_in = ~np.isnan(y_in)
-    return y_pr, y_in, mask_pr, mask_in
-
-
-def run_fixed_split(
-    X_train: np.ndarray, y_train: np.ndarray,
-    X_test: np.ndarray, y_test: np.ndarray,
-    target_name: str,
-    label: str = "",
+def run_reg_fixed_split(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    outcome: str,
+    feature_label: str,
+    split_label: str,
 ) -> list[dict]:
-    """Fit all regressors on (X_train, y_train), evaluate on (X_test, y_test)."""
-    results = []
-    regressors = get_regressors()
+    results: list[dict] = []
+    best_r2 = -np.inf
+    best_name = ""
 
-    for name, reg in regressors.items():
-        reg.fit(X_train, y_train)
-        pred = reg.predict(X_test)
-        m = compute_metrics(y_test, pred)
-        m["regressor"] = name
-        m["target"] = target_name
-        m["split"] = label
-        results.append(m)
+    for name, reg in get_regressors().items():
+        try:
+            reg.fit(X_train, y_train)
+            pred = reg.predict(X_test)
+            m = compute_metrics(y_test, pred)
+            m.update(regressor=name, outcome=outcome, features=feature_label, split=split_label)
+            results.append(m)
+            if m["r2"] > best_r2:
+                best_r2 = m["r2"]
+                best_name = name
+        except Exception as e:
+            log.warning("  %s failed on %s/%s: %s", name, outcome, feature_label, e)
+
+    if best_name:
+        best_r = next((r["pearson_r"] for r in results if r["regressor"] == best_name), 0)
         log.info(
-            "  %-20s %s %-8s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  r=%+.4f  (n=%d)",
-            name, label, target_name, m["r2"], m["mse"], m["mae"], m["pearson_r"], m["n"],
+            "  %-22s %-10s %-16s best=%-14s R²=%7.4f  r=%7.4f  (n=%d)",
+            outcome, feature_label, split_label, best_name, best_r2, best_r, len(y_test),
         )
 
     return results
 
 
-# ---------------------------------------------------------------------------
-# Leave-one-therapist-out CV
-# ---------------------------------------------------------------------------
-
-
-def run_loto_cv(
-    all_sessions: list[SessionSample],
+def run_reg_loto_cv(
+    all_sessions: list[SessionTextData],
     X_all: np.ndarray,
-    model_name: str,
+    outcome: str,
+    feature_label: str,
 ) -> list[dict]:
-    """Leave-one-therapist-out cross-validation across all data."""
     from sklearn.linear_model import Ridge
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
-    # Group sessions by therapist
+    y_all, valid = extract_targets(all_sessions, outcome)
+    n_valid = int(valid.sum())
+    if n_valid < 10:
+        log.info("  LOTO [%s/%s] skipped — only %d valid samples", outcome, feature_label, n_valid)
+        return []
+
     therapist_ids = sorted(set(s.therapist_id for s in all_sessions))
-    log.info("LOTO-CV across %d therapists: %s", len(therapist_ids), therapist_ids)
 
-    y_pr_all, y_in_all, mask_pr_all, mask_in_all = extract_targets(all_sessions)
+    all_true: list[float] = []
+    all_pred: list[float] = []
+    fold_results: list[dict] = []
 
-    results = []
+    for held_out in therapist_ids:
+        tr_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out and valid[i]]
+        te_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out and valid[i]]
 
-    for target_name, y_all, mask_all in [("BLRI_Pr", y_pr_all, mask_pr_all), ("BLRI_In", y_in_all, mask_in_all)]:
-        all_true = []
-        all_pred = []
-        per_therapist_results = []
+        if len(tr_idx) < 5 or len(te_idx) == 0:
+            continue
 
-        for held_out in therapist_ids:
-            train_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id != held_out and mask_all[i]]
-            test_idx = [i for i, s in enumerate(all_sessions) if s.therapist_id == held_out and mask_all[i]]
+        reg = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+        reg.fit(X_all[tr_idx], y_all[tr_idx])
+        pred = reg.predict(X_all[te_idx])
 
-            if len(train_idx) < 5 or len(test_idx) == 0:
-                continue
+        m = compute_metrics(y_all[te_idx], pred)
+        m.update(
+            held_out_therapist=held_out,
+            n_train=len(tr_idx),
+            n_test=len(te_idx),
+            outcome=outcome,
+            features=feature_label,
+        )
+        fold_results.append(m)
+        all_true.extend(y_all[te_idx].tolist())
+        all_pred.extend(pred.tolist())
 
-            X_tr = X_all[train_idx]
-            y_tr = y_all[train_idx]
-            X_te = X_all[test_idx]
-            y_te = y_all[test_idx]
-
-            # Use Ridge(alpha=10) as a reasonable default for CV
-            reg = make_pipeline(StandardScaler(), Ridge(alpha=10.0))
-            reg.fit(X_tr, y_tr)
-            pred = reg.predict(X_te)
-
-            m = compute_metrics(y_te, pred)
-            m["held_out_therapist"] = held_out
-            m["target"] = target_name
-            m["n_train"] = len(train_idx)
-            m["n_test"] = len(test_idx)
-            per_therapist_results.append(m)
-
-            all_true.extend(y_te.tolist())
-            all_pred.extend(pred.tolist())
-
-            log.info(
-                "  LOTO held_out=%s  %s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  n_train=%d  n_test=%d",
-                held_out, target_name, m["r2"], m["mse"], m["mae"], len(train_idx), len(test_idx),
-            )
-
-        # Aggregate across all folds
-        if all_true:
-            agg = compute_metrics(np.array(all_true), np.array(all_pred))
-            agg["target"] = target_name
-            agg["type"] = "loto_aggregate"
-            results.append(agg)
-            log.info(
-                "  LOTO AGGREGATE  %s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  r=%+.4f  (n=%d)",
-                target_name, agg["r2"], agg["mse"], agg["mae"], agg["pearson_r"], agg["n"],
-            )
-
-        results.extend(per_therapist_results)
+    results: list[dict] = list(fold_results)
+    if len(all_true) > 2:
+        agg = compute_metrics(np.array(all_true), np.array(all_pred))
+        agg.update(
+            type="loto_aggregate",
+            outcome=outcome,
+            features=feature_label,
+            n_valid=n_valid,
+            n_folds=len(fold_results),
+        )
+        results.append(agg)
+        log.info(
+            "  LOTO AGG  %-22s %-10s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d, %d folds)",
+            outcome, feature_label, agg["r2"], agg["pearson_r"], agg["mae"], agg["n"], len(fold_results),
+        )
 
     return results
 
@@ -490,254 +440,216 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 1. Load data using the same pipeline as HMAN
-    # ------------------------------------------------------------------
-    log.info("Loading datasets …")
-    datasets: dict[str, PsychotherapyDataset] = {}
+    # 1) Load sessions
+    log.info("Loading sessions ...")
+    datasets: dict[str, list[SessionTextData]] = {}
     for split in ("train", "val", "test"):
-        ds = PsychotherapyDataset(
+        datasets[split] = load_sessions(
             data_model_path=args.data_model,
+            config_path=args.config,
             au_descriptions_dir=args.au_descriptions_dir,
             split=split,
-            config_path=args.config,
         )
-        datasets[split] = ds
-        log.info("  %s: %d sessions", split, len(ds))
 
-    train_sessions = datasets["train"].sessions
-    val_sessions = datasets["val"].sessions
-    test_sessions = datasets["test"].sessions
-    all_sessions = train_sessions + val_sessions + test_sessions
+    train_s = datasets["train"]
+    val_s = datasets["val"]
+    test_s = datasets["test"]
+    all_s = train_s + val_s + test_s
 
-    if len(train_sessions) == 0:
-        log.error("Train split is empty — aborting.")
+    if not train_s:
+        log.error("Train split empty — aborting.")
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # 2. Embed all sessions
-    # ------------------------------------------------------------------
-    log.info("=== EMBEDDING (model=%s, combine=%s) ===", args.embed_model, args.combine)
-    X_all = embed_sessions(
-        all_sessions,
+    n_with_text = sum(1 for s in all_s if any((t or "").strip() for t in s.speech_summaries))
+    n_with_au_text = sum(1 for s in all_s if any((t or "").strip() for t in s.au_descriptions))
+    log.info(
+        "Total sessions: %d  (with speech summaries: %d, with AU descriptions: %d)",
+        len(all_s), n_with_text, n_with_au_text,
+    )
+
+    # Label availability overview
+    log.info("Label availability (per interview type):")
+    for itype, prefix in INTERVIEW_PREFIX.items():
+        n_type = sum(1 for s in all_s if s.interview_type == itype)
+        log.info("  --- %s (n=%d) ---", itype, n_type)
+        for suffix in OUTCOME_SUFFIXES:
+            full_key = f"{prefix}_{suffix}"
+            _, valid = extract_targets(all_s, full_key)
+            log.info("    %-25s  %d / %d", full_key, int(valid.sum()), n_type)
+
+    # 2) Embeddings for each modality
+    log.info("=== EXTRACTING TEXT EMBEDDINGS (speech summaries) ===")
+    X_text_all = embed_session_texts(
+        all_s,
+        field="speech",
         model_name=args.embed_model,
         batch_size=args.embed_batch_size,
-        combine=args.combine,
     )
 
-    n_train = len(train_sessions)
-    n_val = len(val_sessions)
-    n_test = len(test_sessions)
-
-    X_train = X_all[:n_train]
-    X_val = X_all[n_train:n_train + n_val]
-    X_test = X_all[n_train + n_val:]
-
-    log.info("Embedding shapes: train=%s  val=%s  test=%s", X_train.shape, X_val.shape, X_test.shape)
-
-    # ------------------------------------------------------------------
-    # 3. Extract targets
-    # ------------------------------------------------------------------
-    y_pr_train, y_in_train, m_pr_train, m_in_train = extract_targets(train_sessions)
-    y_pr_val, y_in_val, m_pr_val, m_in_val = extract_targets(val_sessions)
-    y_pr_test, y_in_test, m_pr_test, m_in_test = extract_targets(test_sessions)
-
-    log.info(
-        "Valid targets — train: Pr=%d In=%d  val: Pr=%d In=%d  test: Pr=%d In=%d",
-        m_pr_train.sum(), m_in_train.sum(),
-        m_pr_val.sum(), m_in_val.sum(),
-        m_pr_test.sum(), m_in_test.sum(),
+    log.info("=== EXTRACTING AU-TEXT EMBEDDINGS (AU descriptions) ===")
+    X_au_text_all = embed_session_texts(
+        all_s,
+        field="au",
+        model_name=args.embed_model,
+        batch_size=args.embed_batch_size,
     )
 
-    # ------------------------------------------------------------------
-    # 4. Mean-predictor baseline (for reference)
-    # ------------------------------------------------------------------
-    log.info("=== MEAN-PREDICTOR BASELINE ===")
-    for tgt, y_tr, mask_tr, y_te, mask_te, split_name in [
-        ("BLRI_Pr", y_pr_train, m_pr_train, y_pr_test, m_pr_test, "test"),
-        ("BLRI_In", y_in_train, m_in_train, y_in_test, m_in_test, "test"),
-        ("BLRI_Pr", y_pr_train, m_pr_train, y_pr_val, m_pr_val, "val"),
-        ("BLRI_In", y_in_train, m_in_train, y_in_val, m_in_val, "val"),
-    ]:
-        if mask_tr.sum() == 0 or mask_te.sum() == 0:
-            continue
-        train_mean = y_tr[mask_tr].mean()
-        pred_mean = np.full(mask_te.sum(), train_mean)
-        m = compute_metrics(y_te[mask_te], pred_mean)
-        log.info(
-            "  Mean-predictor  %-5s %-8s  R2=%+.4f  MSE=%7.2f  MAE=%5.2f  (train_mean=%.2f, n=%d)",
-            split_name, tgt, m["r2"], m["mse"], m["mae"], train_mean, m["n"],
-        )
+    n_tr = len(train_s)
+    n_va = len(val_s)
 
-    # ------------------------------------------------------------------
-    # 5. Fixed-split evaluation (train→val, train→test)
-    # ------------------------------------------------------------------
-    all_results = []
+    X_text_train = X_text_all[:n_tr]
+    X_text_val = X_text_all[n_tr:n_tr + n_va]
+    X_text_test = X_text_all[n_tr + n_va:]
 
-    for tgt, y_tr, mask_tr, y_te, mask_te, split_name in [
-        ("BLRI_Pr", y_pr_train, m_pr_train, y_pr_val, m_pr_val, "val"),
-        ("BLRI_In", y_in_train, m_in_train, y_in_val, m_in_val, "val"),
-        ("BLRI_Pr", y_pr_train, m_pr_train, y_pr_test, m_pr_test, "test"),
-        ("BLRI_In", y_in_train, m_in_train, y_in_test, m_in_test, "test"),
-    ]:
-        if mask_tr.sum() < 3 or mask_te.sum() == 0:
-            log.warning("Skipping %s/%s — not enough valid targets", tgt, split_name)
-            continue
+    X_au_train = X_au_text_all[:n_tr]
+    X_au_val = X_au_text_all[n_tr:n_tr + n_va]
+    X_au_test = X_au_text_all[n_tr + n_va:]
 
-        log.info("=== %s → %s ===", tgt, split_name)
-        res = run_fixed_split(
-            X_train[mask_tr], y_tr[mask_tr],
-            X_test=X_test[mask_te] if split_name == "test" else X_val[mask_te],
-            y_test=y_te[mask_te],
-            target_name=tgt,
-            label=split_name,
-        )
-        all_results.extend(res)
+    # 3) Ablation feature sets
+    feature_sets: dict[str, dict[str, np.ndarray]] = {
+        "AU_only": {
+            "train": X_au_train,
+            "val": X_au_val,
+            "test": X_au_test,
+            "all": X_au_text_all,
+        },
+        "Text_only": {
+            "train": X_text_train,
+            "val": X_text_val,
+            "test": X_text_test,
+            "all": X_text_all,
+        },
+        "AU+Text": {
+            "train": np.hstack([X_au_train, X_text_train]),
+            "val": np.hstack([X_au_val, X_text_val]),
+            "test": np.hstack([X_au_test, X_text_test]),
+            "all": np.hstack([X_au_text_all, X_text_all]),
+        },
+    }
 
-    # Also try train+val → test
-    if m_pr_test.sum() > 0:
-        log.info("=== BLRI_Pr → test (train+val) ===")
-        X_trainval = np.vstack([X_train[m_pr_train], X_val[m_pr_val]]) if m_pr_val.sum() > 0 else X_train[m_pr_train]
-        y_trainval = np.concatenate([y_pr_train[m_pr_train], y_pr_val[m_pr_val]]) if m_pr_val.sum() > 0 else y_pr_train[m_pr_train]
-        res = run_fixed_split(
-            X_trainval, y_trainval,
-            X_test[m_pr_test], y_pr_test[m_pr_test],
-            target_name="BLRI_Pr", label="test(tr+val)",
-        )
-        all_results.extend(res)
+    # 4) Multi-target regression over same target space as baseline_au_conv.py
+    all_results: list[dict] = []
+    loto_summary: list[dict] = []
 
-    if m_in_test.sum() > 0:
-        log.info("=== BLRI_In → test (train+val) ===")
-        X_trainval = np.vstack([X_train[m_in_train], X_val[m_in_val]]) if m_in_val.sum() > 0 else X_train[m_in_train]
-        y_trainval = np.concatenate([y_in_train[m_in_train], y_in_val[m_in_val]]) if m_in_val.sum() > 0 else y_in_train[m_in_train]
-        res = run_fixed_split(
-            X_trainval, y_trainval,
-            X_test[m_in_test], y_in_test[m_in_test],
-            target_name="BLRI_In", label="test(tr+val)",
-        )
-        all_results.extend(res)
+    all_full_keys: list[tuple[str, str, str]] = [
+        (itype, suffix, f"{prefix}_{suffix}")
+        for itype, prefix in INTERVIEW_PREFIX.items()
+        for suffix in OUTCOME_SUFFIXES
+    ]
 
-    # ------------------------------------------------------------------
-    # 6. Leave-one-therapist-out CV (regression)
-    # ------------------------------------------------------------------
-    log.info("=== LEAVE-ONE-THERAPIST-OUT CV (BLRI) ===")
-    loto_results = run_loto_cv(all_sessions, X_all, args.embed_model)
-    all_results.extend(loto_results)
+    for itype, prefix in INTERVIEW_PREFIX.items():
+        log.info("")
+        log.info("#" * 88)
+        log.info("INTERVIEW TYPE: %s  (prefix=%s)", itype, prefix)
+        log.info("#" * 88)
 
-    # ------------------------------------------------------------------
-    # 7. Treatment-type classification
-    # ------------------------------------------------------------------
-    log.info("")
-    log.info("=" * 90)
-    log.info("TREATMENT-TYPE CLASSIFICATION (bindung / personal / wunder)")
-    log.info("=" * 90)
+        for suffix in OUTCOME_SUFFIXES:
+            full_key = f"{prefix}_{suffix}"
+            log.info("")
+            log.info("=" * 88)
+            log.info("OUTCOME: %s", full_key)
+            log.info("=" * 88)
 
-    y_cls_train = extract_class_targets(train_sessions)
-    y_cls_val = extract_class_targets(val_sessions)
-    y_cls_test = extract_class_targets(test_sessions)
+            y_train, v_train = extract_targets(train_s, full_key)
+            y_val, v_val = extract_targets(val_s, full_key)
+            y_test, v_test = extract_targets(test_s, full_key)
 
-    from collections import Counter
-    for sn, y_c in [("train", y_cls_train), ("val", y_cls_val), ("test", y_cls_test)]:
-        dist = Counter(y_c.tolist())
-        log.info("  [%s] class dist: %s", sn, {CLASS_LABELS[k]: v for k, v in sorted(dist.items())})
+            log.info(
+                "  Valid labels — train: %d/%d  val: %d/%d  test: %d/%d",
+                int(v_train.sum()), len(train_s),
+                int(v_val.sum()), len(val_s),
+                int(v_test.sum()), len(test_s),
+            )
 
-    # Majority-class baseline
-    majority_class = Counter(y_cls_train.tolist()).most_common(1)[0][0]
-    for sn, y_eval in [("val", y_cls_val), ("test", y_cls_test)]:
-        if len(y_eval) == 0:
-            continue
-        pred = np.full_like(y_eval, majority_class)
-        m = compute_clf_metrics(y_eval, pred)
-        log.info("  Majority(%s) %s  Acc=%.4f  F1m=%.4f", CLASS_LABELS[majority_class], sn, m["accuracy"], m["f1_macro"])
+            for feat_name, feat in feature_sets.items():
+                # train -> val
+                if v_train.sum() >= 5 and v_val.sum() >= 2:
+                    res = run_reg_fixed_split(
+                        feat["train"][v_train], y_train[v_train],
+                        feat["val"][v_val], y_val[v_val],
+                        outcome=full_key,
+                        feature_label=feat_name,
+                        split_label="train→val",
+                    )
+                    all_results.extend(res)
 
-    clf_results: list[dict] = []
+                # train -> test
+                if v_train.sum() >= 5 and v_test.sum() >= 2:
+                    res = run_reg_fixed_split(
+                        feat["train"][v_train], y_train[v_train],
+                        feat["test"][v_test], y_test[v_test],
+                        outcome=full_key,
+                        feature_label=feat_name,
+                        split_label="train→test",
+                    )
+                    all_results.extend(res)
 
-    # train → val
-    if len(y_cls_val) > 0:
-        log.info("--- train → val (classification) ---")
-        clf_results.extend(run_clf_fixed_split(X_train, y_cls_train, X_val, y_cls_val, "val"))
+                # train+val -> test
+                if v_train.sum() + v_val.sum() >= 5 and v_test.sum() >= 2:
+                    X_trv = np.vstack([feat["train"], feat["val"]])
+                    y_trv = np.concatenate([y_train, y_val])
+                    v_trv = np.concatenate([v_train, v_val])
+                    res = run_reg_fixed_split(
+                        X_trv[v_trv], y_trv[v_trv],
+                        feat["test"][v_test], y_test[v_test],
+                        outcome=full_key,
+                        feature_label=feat_name,
+                        split_label="train+val→test",
+                    )
+                    all_results.extend(res)
 
-    # train → test
-    if len(y_cls_test) > 0:
-        log.info("--- train → test (classification) ---")
-        clf_results.extend(run_clf_fixed_split(X_train, y_cls_train, X_test, y_cls_test, "test"))
+            log.info("--- LOTO-CV for %s ---", full_key)
+            for feat_name, feat in feature_sets.items():
+                loto_res = run_reg_loto_cv(all_s, feat["all"], full_key, feat_name)
+                all_results.extend(loto_res)
+                for r in loto_res:
+                    if r.get("type") == "loto_aggregate":
+                        loto_summary.append(r)
 
-    # train+val → test
-    if len(y_cls_test) > 0 and len(y_cls_val) > 0:
-        X_trv = np.vstack([X_train, X_val])
-        y_trv = np.concatenate([y_cls_train, y_cls_val])
-        log.info("--- train+val → test (classification) ---")
-        clf_results.extend(run_clf_fixed_split(X_trv, y_trv, X_test, y_cls_test, "test_tv"))
-
-    # LOTO-CV classification
-    log.info("=== LEAVE-ONE-THERAPIST-OUT CV (Classification) ===")
-    clf_loto = run_clf_loto_cv(all_sessions, X_all)
-    clf_results.extend(clf_loto)
-
-    # ------------------------------------------------------------------
-    # 8. Save results
-    # ------------------------------------------------------------------
-    results_path = output_dir / "baseline_results.json"
+    # 5) Save
+    results_path = output_dir / "baseline_embedding_regression_results.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2, default=str)
-    log.info("Regression results saved to %s", results_path)
+    log.info("Results saved to %s (%d entries)", results_path, len(all_results))
 
-    clf_results_path = output_dir / "baseline_classification_results.json"
-    with open(clf_results_path, "w", encoding="utf-8") as f:
-        json.dump(clf_results, f, indent=2, default=str)
-    log.info("Classification results saved to %s", clf_results_path)
-
-    # ------------------------------------------------------------------
-    # 9. Summary tables
-    # ------------------------------------------------------------------
+    # 6) Summary tables
     log.info("")
-    log.info("=" * 90)
-    log.info("SUMMARY — BLRI REGRESSION")
-    log.info("=" * 90)
-    log.info(
-        "%-25s %-10s %-15s %8s %8s %8s %8s",
-        "Regressor", "Target", "Split", "R2", "MSE", "MAE", "r",
-    )
-    log.info("-" * 90)
-    for r in all_results:
-        if "regressor" in r:
-            log.info(
-                "%-25s %-10s %-15s %+8.4f %8.2f %8.2f %+8.4f",
-                r["regressor"], r["target"], r.get("split", ""),
-                r["r2"], r["mse"], r["mae"], r.get("pearson_r", float("nan")),
-            )
-        elif r.get("type") == "loto_aggregate":
-            log.info(
-                "%-25s %-10s %-15s %+8.4f %8.2f %8.2f %+8.4f",
-                "LOTO-Ridge(a=10)", r["target"], "aggregate",
-                r["r2"], r["mse"], r["mae"], r.get("pearson_r", float("nan")),
-            )
-    log.info("=" * 90)
+    log.info("=" * 132)
+    log.info("SUMMARY — LOTO-CV AGGREGATES (all outcomes × modalities, sorted by R²)")
+    log.info("=" * 132)
+    log.info("%-26s %-12s %8s %10s %10s %10s %6s", "Outcome", "Features", "R²", "Pearson_r", "Pearson_p", "MAE", "n")
+    log.info("-" * 132)
 
+    loto_sorted = sorted(loto_summary, key=lambda r: r.get("r2", -999), reverse=True)
+    for r in loto_sorted:
+        log.info(
+            "%-26s %-12s %8.4f %10.4f %10.4f %10.4f %6d",
+            r["outcome"], r["features"], r["r2"], r["pearson_r"], r.get("pearson_p", 0.0), r["mae"], r["n"],
+        )
+
+    log.info("=" * 132)
     log.info("")
-    log.info("=" * 110)
-    log.info("SUMMARY — TREATMENT-TYPE CLASSIFICATION")
-    log.info("=" * 110)
-    log.info(
-        "%-20s %-15s %8s %10s %10s %6s",
-        "Classifier", "Split", "Acc", "F1_macro", "F1_wtd", "n",
-    )
-    log.info("-" * 110)
-    for r in clf_results:
-        if "classifier" in r:
+    log.info("=" * 132)
+    log.info("BEST MODALITY PER OUTCOME (by LOTO R²)")
+    log.info("=" * 132)
+
+    best_per_outcome: dict[str, dict] = {}
+    for r in loto_summary:
+        key = r["outcome"]
+        if key not in best_per_outcome or r["r2"] > best_per_outcome[key]["r2"]:
+            best_per_outcome[key] = r
+
+    for _itype, _suffix, full_key in all_full_keys:
+        if full_key in best_per_outcome:
+            r = best_per_outcome[full_key]
             log.info(
-                "%-20s %-15s %8.4f %10.4f %10.4f %6d",
-                r["classifier"], r.get("split", ""),
-                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
+                "  %-26s -> %-10s  R²=%7.4f  r=%7.4f  MAE=%7.4f  (n=%d)",
+                full_key, r["features"], r["r2"], r["pearson_r"], r["mae"], r["n"],
             )
-    for r in clf_results:
-        if r.get("type") == "loto_aggregate_clf":
-            log.info(
-                "%-20s %-15s %8.4f %10.4f %10.4f %6d",
-                "LOTO-LogReg(C=1)", "aggregate",
-                r["accuracy"], r["f1_macro"], r["f1_weighted"], r["n"],
-            )
-    log.info("=" * 110)
+        else:
+            log.info("  %-26s -> no results", full_key)
+
+    log.info("=" * 132)
 
 
 # ---------------------------------------------------------------------------
@@ -747,31 +659,21 @@ def main():
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Embedding-baseline diagnostic for BLRI prediction and treatment-type classification",
+        description=(
+            "Embedding baseline (AU-as-text + speech) for multi-target regression "
+            "over all T3/T5/T7 numeric outcomes"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Data paths
     p.add_argument("--data_model", type=Path, required=True, help="Path to data_model.yaml")
-    p.add_argument("--config", type=Path, required=True, help="Path to config.yaml (split definitions)")
-    p.add_argument("--au_descriptions_dir", type=Path, required=True, help="Directory with AU-description JSONs")
-    p.add_argument("--output_dir", type=Path, default=Path("results/baseline"), help="Where to save results")
+    p.add_argument("--config", type=Path, required=True, help="Path to config.yaml")
+    p.add_argument("--au_descriptions_dir", type=Path, required=True, help="Directory containing AU-description JSON files")
+    p.add_argument("--output_dir", type=Path, default=Path("results/baseline_embedding_regression"), help="Directory to save outputs")
 
-    # Embedding
-    p.add_argument(
-        "--embed_model", type=str, default="all-MiniLM-L6-v2",
-        help="Sentence-transformer model for encoding turns",
-    )
-    p.add_argument(
-        "--embed_batch_size", type=int, default=256,
-        help="Batch size for sentence-transformer encoding",
-    )
-    p.add_argument(
-        "--combine", type=str, default="concat", choices=["concat", "mean"],
-        help="How to combine speech and AU embeddings per turn: 'concat' (2*dim) or 'mean' (dim)",
-    )
+    p.add_argument("--embed_model", type=str, default="all-MiniLM-L6-v2", help="Sentence-transformer model")
+    p.add_argument("--embed_batch_size", type=int, default=256, help="Batch size for embedding")
 
-    # Misc
     p.add_argument("--log_level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING"])
 
     return p.parse_args()
