@@ -3,6 +3,7 @@ Baseline diagnostic: raw AU time-series (Conv1D) + text summaries with
 mixed-task outcome evaluation.
 
 Refactor highlights:
+- LOTO-only evaluation (no fixed split metrics are emitted).
 - Predicts all post-treatment outcomes (T3/T5/T7 labels under interview types)
   AND all baseline outcomes under interview['baseline'] (e.g., T0_*).
 - Handles mixed target types automatically:
@@ -14,6 +15,8 @@ Refactor highlights:
   - T7: personal + bindung + wunder
   - baseline (T0/T1): all available session types
 - Ablation remains explicit: AU_only, Text_only, AU+Text.
+- Uses all transcript turns available in each session (no therapist/client role filtering).
+- Uses both patient and therapist AU streams when available.
 """
 
 from __future__ import annotations
@@ -39,8 +42,6 @@ try:
         compute_clf_metrics,
         compute_reg_metrics,
         discover_target_specs,
-        get_classifiers,
-        get_regressors,
     )
 except ModuleNotFoundError:
     repo_root = Path(__file__).resolve().parents[2]
@@ -53,8 +54,6 @@ except ModuleNotFoundError:
         compute_clf_metrics,
         compute_reg_metrics,
         discover_target_specs,
-        get_classifiers,
-        get_regressors,
     )
 
 # ---------------------------------------------------------------------------
@@ -167,7 +166,8 @@ class SessionData:
     turns: list[TurnInfo]
     labels: dict[str, float] = field(default_factory=dict)
     baseline_labels: dict[str, Any] = field(default_factory=dict)
-    openface_path: Path | None = None
+    patient_openface_path: Path | None = None
+    therapist_openface_path: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +253,10 @@ def load_sessions(data_model_path: Path, config_path: Path, split: str) -> list[
                     )
                 )
 
-            of_raw = idata.get("patient_openface", "")
-            of_path = _resolve_path(of_raw) if of_raw else None
+            of_patient_raw = idata.get("patient_openface", "")
+            of_therapist_raw = idata.get("therapist_openface", "")
+            of_patient_path = _resolve_path(of_patient_raw) if of_patient_raw else None
+            of_therapist_path = _resolve_path(of_therapist_raw) if of_therapist_raw else None
 
             sessions.append(
                 SessionData(
@@ -265,7 +267,8 @@ def load_sessions(data_model_path: Path, config_path: Path, split: str) -> list[
                     turns=turns,
                     labels=labels,
                     baseline_labels=baseline_labels,
-                    openface_path=of_path,
+                    patient_openface_path=of_patient_path,
+                    therapist_openface_path=of_therapist_path,
                 )
             )
 
@@ -348,40 +351,49 @@ def segment_au_by_turns(aus: np.ndarray, timestamps: np.ndarray, turns: list[Tur
 def extract_au_features(sessions: list[SessionData], au_extractor: DepthwiseConv1DExtractor) -> np.ndarray:
     conv_dim = au_extractor.output_dim
     stats_dim = N_AUS * 6
-    out_dim = conv_dim + stats_dim
+    single_dim = conv_dim + stats_dim
+    out_dim = single_dim * 2
 
     X = np.zeros((len(sessions), out_dim), dtype=np.float32)
     cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
     for i, s in enumerate(sessions):
-        if s.openface_path is None:
-            continue
-
-        key = str(s.openface_path)
-        if key not in cache:
-            try:
-                cache[key] = load_openface_au(s.openface_path)
-            except Exception as e:
-                log.warning("Failed OpenFace load (%s): %s", s.openface_path, e)
+        session_feat_parts: list[np.ndarray] = []
+        for path in (s.patient_openface_path, s.therapist_openface_path):
+            if path is None:
+                session_feat_parts.append(np.zeros(single_dim, dtype=np.float32))
                 continue
 
-        aus, timestamps = cache[key]
-        segments = segment_au_by_turns(aus, timestamps, s.turns)
+            key = str(path)
+            if key not in cache:
+                try:
+                    cache[key] = load_openface_au(path)
+                except Exception as e:
+                    log.warning("Failed OpenFace load (%s): %s", path, e)
+                    session_feat_parts.append(np.zeros(single_dim, dtype=np.float32))
+                    continue
 
-        turn_vecs: list[np.ndarray] = []
-        for seg in segments:
-            parts: list[np.ndarray] = []
-            if seg.shape[0] >= MIN_FRAMES_FOR_CONV:
-                x = torch.tensor(seg.T, dtype=torch.float32).unsqueeze(0)
-                feat = au_extractor(x).squeeze(0).cpu().numpy().astype(np.float32)
+            aus, timestamps = cache[key]
+            segments = segment_au_by_turns(aus, timestamps, s.turns)
+
+            turn_vecs: list[np.ndarray] = []
+            for seg in segments:
+                parts: list[np.ndarray] = []
+                if seg.shape[0] >= MIN_FRAMES_FOR_CONV:
+                    x = torch.tensor(seg.T, dtype=torch.float32).unsqueeze(0)
+                    feat = au_extractor(x).squeeze(0).cpu().numpy().astype(np.float32)
+                else:
+                    feat = np.zeros(conv_dim, dtype=np.float32)
+                parts.append(feat)
+                parts.append(_au_stats(seg))
+                turn_vecs.append(np.concatenate(parts))
+
+            if turn_vecs:
+                session_feat_parts.append(np.mean(turn_vecs, axis=0))
             else:
-                feat = np.zeros(conv_dim, dtype=np.float32)
-            parts.append(feat)
-            parts.append(_au_stats(seg))
-            turn_vecs.append(np.concatenate(parts))
+                session_feat_parts.append(np.zeros(single_dim, dtype=np.float32))
 
-        if turn_vecs:
-            X[i] = np.mean(turn_vecs, axis=0)
+        X[i] = np.concatenate(session_feat_parts, axis=0)
 
     return X
 
@@ -452,45 +464,11 @@ def run_all_evaluations(records: list, output_path: Path) -> list[dict]:
             X_tr, y_tr, _ = build_features_and_targets(train_records, spec.name, feat, class_to_idx)
             X_va, y_va, _ = build_features_and_targets(val_records, spec.name, feat, class_to_idx)
             X_te, y_te, _ = build_features_and_targets(test_records, spec.name, feat, class_to_idx)
+            y_all_split = np.concatenate([y_tr, y_va, y_te]) if len(y_tr) + len(y_va) + len(y_te) > 0 else np.array([])
 
-            log.info("  [%s] valid n: train=%d val=%d test=%d", feat, len(y_tr), len(y_va), len(y_te))
+            log.info("  [%s] LOTO pool n (train+val+test)=%d", feat, len(y_all_split))
 
             if spec.task == "regression":
-                if len(y_tr) >= 5 and len(y_va) >= 2:
-                    for name, reg in get_regressors().items():
-                        try:
-                            reg.fit(X_tr, y_tr)
-                            pred = reg.predict(X_va)
-                            m = compute_reg_metrics(y_va, pred)
-                            m.update(task="regression", target=spec.name, features=feat, split="train→val", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if len(y_tr) >= 5 and len(y_te) >= 2:
-                    for name, reg in get_regressors().items():
-                        try:
-                            reg.fit(X_tr, y_tr)
-                            pred = reg.predict(X_te)
-                            m = compute_reg_metrics(y_te, pred)
-                            m.update(task="regression", target=spec.name, features=feat, split="train→test", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if (len(y_tr) + len(y_va)) >= 5 and len(y_te) >= 2:
-                    X_trv = np.vstack([X_tr, X_va]) if len(y_va) > 0 else X_tr
-                    y_trv = np.concatenate([y_tr, y_va]) if len(y_va) > 0 else y_tr
-                    for name, reg in get_regressors().items():
-                        try:
-                            reg.fit(X_trv, y_trv)
-                            pred = reg.predict(X_te)
-                            m = compute_reg_metrics(y_te, pred)
-                            m.update(task="regression", target=spec.name, features=feat, split="train+val→test", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
                 # LOTO (Ridge default)
                 from sklearn.linear_model import Ridge
                 from sklearn.pipeline import make_pipeline
@@ -523,43 +501,6 @@ def run_all_evaluations(records: list, output_path: Path) -> list[dict]:
                         all_results.append(agg)
 
             else:
-                # classification
-                if len(y_tr) >= 8 and len(set(y_tr.tolist())) >= 2 and len(y_va) >= 2:
-                    for name, clf in get_classifiers().items():
-                        try:
-                            clf.fit(X_tr, y_tr)
-                            pred = clf.predict(X_va)
-                            m = compute_clf_metrics(y_va, pred, spec.classes)
-                            m.update(task="classification", target=spec.name, features=feat, split="train→val", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if len(y_tr) >= 8 and len(set(y_tr.tolist())) >= 2 and len(y_te) >= 2:
-                    for name, clf in get_classifiers().items():
-                        try:
-                            clf.fit(X_tr, y_tr)
-                            pred = clf.predict(X_te)
-                            m = compute_clf_metrics(y_te, pred, spec.classes)
-                            m.update(task="classification", target=spec.name, features=feat, split="train→test", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if (len(y_tr) + len(y_va)) >= 8 and len(y_te) >= 2:
-                    X_trv = np.vstack([X_tr, X_va]) if len(y_va) > 0 else X_tr
-                    y_trv = np.concatenate([y_tr, y_va]) if len(y_va) > 0 else y_tr
-                    if len(set(y_trv.tolist())) >= 2:
-                        for name, clf in get_classifiers().items():
-                            try:
-                                clf.fit(X_trv, y_trv)
-                                pred = clf.predict(X_te)
-                                m = compute_clf_metrics(y_te, pred, spec.classes)
-                                m.update(task="classification", target=spec.name, features=feat, split="train+val→test", model=name)
-                                all_results.append(m)
-                            except Exception:
-                                pass
-
                 # LOTO (LogReg default)
                 from sklearn.linear_model import LogisticRegression
                 from sklearn.pipeline import make_pipeline

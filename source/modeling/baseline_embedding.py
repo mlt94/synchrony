@@ -4,6 +4,7 @@ Embedding baseline with mixed-task outcomes and cumulative-session feature rules
 This script evaluates:
 - Post-treatment outcomes under interview type labels (T3/T5/T7)
 - Baseline outcomes under interview['baseline'] (T0/T1 and any additional keys)
+- LOTO-only therapist holdout evaluation (no fixed split metrics are emitted)
 
 It supports mixed targets automatically:
 - numeric -> regression
@@ -13,6 +14,9 @@ Ablation modalities:
 - AU_only   (AU descriptions as text embeddings)
 - Text_only (speech summaries embeddings)
 - AU+Text   (concatenation)
+
+All available transcript turns are used per session (no therapist/client role filtering).
+AU text now combines patient and therapist AU descriptions per turn when available.
 """
 
 from __future__ import annotations
@@ -36,8 +40,6 @@ try:
         compute_clf_metrics,
         compute_reg_metrics,
         discover_target_specs,
-        get_classifiers,
-        get_regressors,
     )
 except ModuleNotFoundError:
     repo_root = Path(__file__).resolve().parents[2]
@@ -50,8 +52,6 @@ except ModuleNotFoundError:
         compute_clf_metrics,
         compute_reg_metrics,
         discover_target_specs,
-        get_classifiers,
-        get_regressors,
     )
 
 try:
@@ -176,7 +176,12 @@ def load_sessions(
                     continue
 
                 speech.append((turn.get("summary", "") or "").strip())
-                au_text.append((au_index.get((patient_id, itype, tidx_i), "") or "").strip())
+                patient_au = (au_index.get((str(patient_id), itype, tidx_i), "") or "").strip()
+                therapist_au = (au_index.get((str(therapist_id), itype, tidx_i), "") or "").strip()
+                if patient_au and therapist_au:
+                    au_text.append(f"Patient AU: {patient_au}\nTherapist AU: {therapist_au}")
+                else:
+                    au_text.append(patient_au or therapist_au)
 
             if not speech:
                 continue
@@ -263,45 +268,11 @@ def run_all_evaluations(records: list, output_path: Path) -> list[dict]:
             X_tr, y_tr, _ = build_features_and_targets(train_records, spec.name, feat, class_to_idx)
             X_va, y_va, _ = build_features_and_targets(val_records, spec.name, feat, class_to_idx)
             X_te, y_te, _ = build_features_and_targets(test_records, spec.name, feat, class_to_idx)
+            y_all_split = np.concatenate([y_tr, y_va, y_te]) if len(y_tr) + len(y_va) + len(y_te) > 0 else np.array([])
 
-            log.info("  [%s] valid n: train=%d val=%d test=%d", feat, len(y_tr), len(y_va), len(y_te))
+            log.info("  [%s] LOTO pool n (train+val+test)=%d", feat, len(y_all_split))
 
             if spec.task == "regression":
-                if len(y_tr) >= 5 and len(y_va) >= 2:
-                    for name, reg in get_regressors().items():
-                        try:
-                            reg.fit(X_tr, y_tr)
-                            pred = reg.predict(X_va)
-                            m = compute_reg_metrics(y_va, pred)
-                            m.update(task="regression", target=spec.name, features=feat, split="train→val", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if len(y_tr) >= 5 and len(y_te) >= 2:
-                    for name, reg in get_regressors().items():
-                        try:
-                            reg.fit(X_tr, y_tr)
-                            pred = reg.predict(X_te)
-                            m = compute_reg_metrics(y_te, pred)
-                            m.update(task="regression", target=spec.name, features=feat, split="train→test", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if (len(y_tr) + len(y_va)) >= 5 and len(y_te) >= 2:
-                    X_trv = np.vstack([X_tr, X_va]) if len(y_va) > 0 else X_tr
-                    y_trv = np.concatenate([y_tr, y_va]) if len(y_va) > 0 else y_tr
-                    for name, reg in get_regressors().items():
-                        try:
-                            reg.fit(X_trv, y_trv)
-                            pred = reg.predict(X_te)
-                            m = compute_reg_metrics(y_te, pred)
-                            m.update(task="regression", target=spec.name, features=feat, split="train+val→test", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
                 from sklearn.linear_model import Ridge
                 from sklearn.pipeline import make_pipeline
                 from sklearn.preprocessing import StandardScaler
@@ -333,42 +304,6 @@ def run_all_evaluations(records: list, output_path: Path) -> list[dict]:
                         all_results.append(agg)
 
             else:
-                if len(y_tr) >= 8 and len(set(y_tr.tolist())) >= 2 and len(y_va) >= 2:
-                    for name, clf in get_classifiers().items():
-                        try:
-                            clf.fit(X_tr, y_tr)
-                            pred = clf.predict(X_va)
-                            m = compute_clf_metrics(y_va, pred, spec.classes)
-                            m.update(task="classification", target=spec.name, features=feat, split="train→val", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if len(y_tr) >= 8 and len(set(y_tr.tolist())) >= 2 and len(y_te) >= 2:
-                    for name, clf in get_classifiers().items():
-                        try:
-                            clf.fit(X_tr, y_tr)
-                            pred = clf.predict(X_te)
-                            m = compute_clf_metrics(y_te, pred, spec.classes)
-                            m.update(task="classification", target=spec.name, features=feat, split="train→test", model=name)
-                            all_results.append(m)
-                        except Exception:
-                            pass
-
-                if (len(y_tr) + len(y_va)) >= 8 and len(y_te) >= 2:
-                    X_trv = np.vstack([X_tr, X_va]) if len(y_va) > 0 else X_tr
-                    y_trv = np.concatenate([y_tr, y_va]) if len(y_va) > 0 else y_tr
-                    if len(set(y_trv.tolist())) >= 2:
-                        for name, clf in get_classifiers().items():
-                            try:
-                                clf.fit(X_trv, y_trv)
-                                pred = clf.predict(X_te)
-                                m = compute_clf_metrics(y_te, pred, spec.classes)
-                                m.update(task="classification", target=spec.name, features=feat, split="train+val→test", model=name)
-                                all_results.append(m)
-                            except Exception:
-                                pass
-
                 from sklearn.linear_model import LogisticRegression
                 from sklearn.pipeline import make_pipeline
                 from sklearn.preprocessing import StandardScaler

@@ -134,8 +134,10 @@ def load_au_descriptions(
 ) -> dict[tuple[str, str, int], str]:
     """Load all AU-description JSONs from *au_dir* into a lookup table.
 
-    Returns a dict keyed by ``(patient_id, interview_type, turn_index)``
-    mapping to the description string.  Supports both the raw
+    Returns a dict keyed by ``(subject_id, interview_type, turn_index)``
+    mapping to the description string. ``subject_id`` may be the patient id,
+    therapist id, or another id field present in the AU-description entries.
+    Supports both the raw
     ``generated_descriptions`` key and the combined
     ``original_timeseries_description`` key.
     """
@@ -152,10 +154,15 @@ def load_au_descriptions(
             continue
 
         for entry in data:
-            pid = entry.get("patient_id")
+            subject_id = (
+                entry.get("patient_id")
+                or entry.get("therapist_id")
+                or entry.get("subject_id")
+                or entry.get("speaker_id")
+            )
             itype = entry.get("interview_type")
             tidx = entry.get("turn_index")
-            if pid is None or itype is None or tidx is None:
+            if subject_id is None or itype is None or tidx is None:
                 continue
             # Prefer raw description, fall back to combined key
             desc = (
@@ -165,7 +172,7 @@ def load_au_descriptions(
                 or ""
             )
             if isinstance(desc, str) and desc.strip():
-                index[(pid, itype, int(tidx))] = desc.strip()
+                index[(str(subject_id), str(itype), int(tidx))] = desc.strip()
 
     return index
 
