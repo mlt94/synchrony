@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import List
 
@@ -121,6 +122,86 @@ def load_translation_pipeline(device: str = "auto"):
     return text_pipe, device_name
 
 
+def _safe_model_max_length(text_pipe, default: int = 512) -> int:
+    tokenizer = getattr(text_pipe, "tokenizer", None)
+    if tokenizer is None:
+        return default
+
+    model_max = getattr(tokenizer, "model_max_length", default)
+    if not isinstance(model_max, int) or model_max <= 0 or model_max > 16384:
+        return default
+    return model_max
+
+
+def _token_len(text: str, text_pipe) -> int:
+    tokenizer = getattr(text_pipe, "tokenizer", None)
+    if tokenizer is None:
+        return len(text.split())
+    try:
+        ids = tokenizer(text, add_special_tokens=False, truncation=False).get("input_ids", [])
+        return len(ids)
+    except Exception:
+        return len(text.split())
+
+
+def _split_oversized_sentence(sentence: str, max_tokens: int, text_pipe) -> list[str]:
+    words = sentence.split()
+    if not words:
+        return []
+
+    chunks: list[str] = []
+    current: list[str] = []
+
+    for w in words:
+        candidate = " ".join(current + [w])
+        if not current or _token_len(candidate, text_pipe) <= max_tokens:
+            current.append(w)
+            continue
+
+        chunks.append(" ".join(current))
+        current = [w]
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks
+
+
+def chunk_text_for_translation(text: str, text_pipe, max_input_tokens: int) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if _token_len(text, text_pipe) <= max_input_tokens:
+        return [text]
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if not sentences:
+        sentences = [text]
+
+    chunks: list[str] = []
+    current = ""
+
+    for sentence in sentences:
+        if _token_len(sentence, text_pipe) > max_input_tokens:
+            sub_sentences = _split_oversized_sentence(sentence, max_input_tokens, text_pipe)
+        else:
+            sub_sentences = [sentence]
+
+        for sub in sub_sentences:
+            candidate = f"{current} {sub}".strip() if current else sub
+            if current and _token_len(candidate, text_pipe) > max_input_tokens:
+                chunks.append(current)
+                current = sub
+            else:
+                current = candidate
+
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else [text]
+
+
 def translate_file(
     input_path: Path,
     output_path: Path,
@@ -139,18 +220,26 @@ def translate_file(
     )
 
     translated_records = []
+    model_max_len = _safe_model_max_length(text_pipe, default=512)
+    max_input_tokens = max(32, int(model_max_len * 0.9))
+    generation_max_len = max_new_tokens or model_max_len
+
     for idx, entry in enumerate(grouped_records):
         text = (entry.get("text") or "").strip()
         if not text:
             translated_text = ""
         else:
             try:
-                # Helsinki models expect plain text input and return [{'translation_text': '...'}]
-                outputs = text_pipe(text, max_length=max_new_tokens or 512)
-                if isinstance(outputs, list) and outputs:
-                    translated_text = outputs[0].get("translation_text", text).strip()
-                else:
-                    translated_text = text
+                chunks = chunk_text_for_translation(text, text_pipe, max_input_tokens=max_input_tokens)
+                translated_chunks: list[str] = []
+                for chunk in chunks:
+                    outputs = text_pipe(chunk, max_length=generation_max_len, truncation=True)
+                    if isinstance(outputs, list) and outputs:
+                        translated_chunks.append(outputs[0].get("translation_text", chunk).strip())
+                    else:
+                        translated_chunks.append(chunk)
+
+                translated_text = " ".join(x for x in translated_chunks if x).strip()
             except Exception as exc:
                 print(f"[translate] Error translating segment {idx} in {input_path}: {exc}")
                 translated_text = text
