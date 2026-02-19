@@ -10,6 +10,80 @@ from transformers import pipeline
 DEFAULT_MODEL_NAME = "Helsinki-NLP/opus-mt-de-en"
 
 
+def _coerce_ms(value, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return default
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return default
+
+
+def group_text_by_speaker_turns(turns: List[dict]) -> List[dict]:
+    """Group consecutive turns by the same speaker.
+
+    Mirrors summarize.py grouping so translated snippets align to the same
+    start/end windows used for summaries.
+    """
+    if not turns:
+        return []
+
+    speaker_turns: list[dict] = []
+    current_speaker = None
+    current_texts: list[str] = []
+    current_start_ms = None
+    current_end_ms = None
+    current_turn_indices: list[int] = []
+
+    for idx, turn in enumerate(turns):
+        text = str(turn.get("text", "")).strip()
+        if not text:
+            continue
+
+        speaker_id = str(turn.get("speaker_id", "unknown")).strip().lower()
+        start_ms = max(0, _coerce_ms(turn.get("start"), 0))
+        end_ms = max(_coerce_ms(turn.get("end"), start_ms), start_ms)
+
+        if speaker_id != current_speaker:
+            if current_speaker is not None and current_texts:
+                speaker_turns.append(
+                    {
+                        "speaker_id": current_speaker,
+                        "text": " ".join(current_texts),
+                        "start_ms": current_start_ms,
+                        "end_ms": current_end_ms,
+                        "original_turn_indices": current_turn_indices,
+                    }
+                )
+
+            current_speaker = speaker_id
+            current_texts = [text]
+            current_start_ms = start_ms
+            current_end_ms = end_ms
+            current_turn_indices = [idx]
+        else:
+            current_texts.append(text)
+            current_end_ms = end_ms
+            current_turn_indices.append(idx)
+
+    if current_speaker is not None and current_texts:
+        speaker_turns.append(
+            {
+                "speaker_id": current_speaker,
+                "text": " ".join(current_texts),
+                "start_ms": current_start_ms,
+                "end_ms": current_end_ms,
+                "original_turn_indices": current_turn_indices,
+            }
+        )
+
+    return speaker_turns
+
+
 def discover_result_jsons(root: Path) -> List[Path]:
     return sorted(root.rglob("results_*.json"))
 
@@ -59,8 +133,13 @@ def translate_file(
     if not isinstance(records, list):
         raise ValueError(f"Expected list in {input_path}, found {type(records).__name__}")
 
+    grouped_records = group_text_by_speaker_turns(records)
+    print(
+        f"[translate] Grouped {len(records)} raw turns into {len(grouped_records)} speaker turns for {input_path.name}"
+    )
+
     translated_records = []
-    for idx, entry in enumerate(records):
+    for idx, entry in enumerate(grouped_records):
         text = (entry.get("text") or "").strip()
         if not text:
             translated_text = ""
@@ -78,10 +157,12 @@ def translate_file(
 
         translated_records.append(
             {
+                "turn_index": idx,
                 "text": translated_text,
-                "start": entry.get("start"),
-                "end": entry.get("end"),
+                "start_ms": entry.get("start_ms"),
+                "end_ms": entry.get("end_ms"),
                 "speaker_id": entry.get("speaker_id"),
+                "original_turn_indices": entry.get("original_turn_indices", []),
             }
         )
 
