@@ -306,13 +306,6 @@ def load_sessions(
 
         patient_id = interview["patient"]["patient_id"]
 
-        baseline_raw = interview.get("baseline", {}) or {}
-        baseline_labels: dict[str, Any] = {}
-        for k, v in baseline_raw.items():
-            if v is None:
-                continue
-            baseline_labels[k] = v
-
         for itype, idata in interview.get("types", {}).items():
             if itype not in INTERVIEW_PREFIX:
                 continue
@@ -389,7 +382,6 @@ def load_sessions(
                     speech_unsummaries=speech_unsummaries,
                     au_descriptions=au_text,
                     labels=labels,
-                    baseline_labels=baseline_labels,
                     patient_openface_path=of_patient_path,
                     therapist_openface_path=of_therapist_path,
                 )
@@ -558,13 +550,16 @@ def embed_session_texts(
 
 def evaluate_records(
     records: list,
-    output_path: Path,
     ablation_name: str,
     text_input: str,
     au_input: str,
 ) -> list[dict]:
     all_results: list[dict] = []
-    specs = discover_target_specs(records)
+    specs = [
+        s
+        for s in discover_target_specs(records)
+        if s.name.split("_", 1)[0] not in {"T0", "T1"}
+    ]
 
     log.info("[%s] Discovered %d targets (%d regression, %d classification)",
              ablation_name,
@@ -677,8 +672,79 @@ def evaluate_records(
                     )
                     all_results.append(agg)
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2, default=str)
+    return all_results
+
+
+def evaluate_treatment_modality(
+    sessions: list[SessionData],
+    X_text: np.ndarray,
+    X_au: np.ndarray,
+    ablation_name: str,
+    text_input: str,
+    au_input: str,
+) -> list[dict]:
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    valid_idx = [i for i, s in enumerate(sessions) if s.interview_type in INTERVIEW_PREFIX]
+    if len(valid_idx) < 10:
+        return []
+
+    class_labels = [c for c in ["bindung", "personal", "wunder"] if any(sessions[i].interview_type == c for i in valid_idx)]
+    if len(class_labels) < 2:
+        return []
+
+    class_to_idx = {c: i for i, c in enumerate(class_labels)}
+    X_all = np.concatenate([X_au[valid_idx], X_text[valid_idx]], axis=1)
+    y_all = np.array([class_to_idx[sessions[i].interview_type] for i in valid_idx], dtype=np.int64)
+    therapist_all = [sessions[i].therapist_id for i in valid_idx]
+
+    all_results: list[dict] = []
+    all_true: list[int] = []
+    all_pred: list[int] = []
+
+    therapist_ids = sorted(set(therapist_all))
+    for held in therapist_ids:
+        tr_idx = [i for i, tid in enumerate(therapist_all) if tid != held]
+        te_idx = [i for i, tid in enumerate(therapist_all) if tid == held]
+        if len(tr_idx) < 8 or len(te_idx) == 0:
+            continue
+        if len(set(y_all[tr_idx].tolist())) < 2:
+            continue
+
+        clf = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=4000, random_state=42))
+        clf.fit(X_all[tr_idx], y_all[tr_idx])
+        pred = clf.predict(X_all[te_idx])
+
+        m = compute_clf_metrics(y_all[te_idx], pred, class_labels)
+        m.update(
+            task="classification",
+            target="treatment_modality",
+            features="AU+Text",
+            ablation=ablation_name,
+            text_input=text_input,
+            au_input=au_input,
+            held_out_therapist=held,
+            n_train=len(tr_idx),
+            n_test=len(te_idx),
+        )
+        all_results.append(m)
+        all_true.extend(y_all[te_idx].tolist())
+        all_pred.extend(pred.tolist())
+
+    if len(all_true) > 2:
+        agg = compute_clf_metrics(np.array(all_true), np.array(all_pred), class_labels)
+        agg.update(
+            task="classification",
+            target="treatment_modality",
+            features="AU+Text",
+            ablation=ablation_name,
+            text_input=text_input,
+            au_input=au_input,
+            type="loto_aggregate",
+        )
+        all_results.append(agg)
 
     return all_results
 
@@ -742,7 +808,7 @@ def main() -> None:
                     therapist_id=s.therapist_id,
                     interview_type=s.interview_type,
                     labels=s.labels,
-                    baseline_labels=s.baseline_labels,
+                    baseline_labels={},
                     au_feat=X_au[i],
                     text_feat=X_text[i],
                 )
@@ -754,11 +820,24 @@ def main() -> None:
         per_ablation_path = out_dir / (re.sub(r"[^a-zA-Z0-9]+", "_", ablation_name.lower()).strip("_") + "_results.json")
         results = evaluate_records(
             patient_records,
-            per_ablation_path,
             ablation_name=ablation_name,
             text_input=text_name,
             au_input=au_name,
         )
+        results.extend(
+            evaluate_treatment_modality(
+                all_s,
+                X_text,
+                X_au,
+                ablation_name=ablation_name,
+                text_input=text_name,
+                au_input=au_name,
+            )
+        )
+
+        with open(per_ablation_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, default=str)
+
         log.info("[%s] Saved %d rows -> %s", ablation_name, len(results), per_ablation_path)
         merged_results.extend(results)
 
