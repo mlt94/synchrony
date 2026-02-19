@@ -65,7 +65,17 @@ class TurnEncoder(nn.Module):
         bert_model_name: str = "distilbert-base-uncased",
         fusion_dim: int = 256,
         dropout: float = 0.1,
+        n_au_numeric: int | None = None,
     ):
+        """
+        Parameters
+        ----------
+        n_au_numeric : int | None
+            When set, bypasses BERT for the AU stream and instead projects a
+            float vector of this dimensionality directly into ``fusion_dim``.
+            Use this for the AU-numbers ablation so numeric values are not
+            corrupted by subword tokenisation.
+        """
         super().__init__()
         self.bert = AutoModel.from_pretrained(bert_model_name)
         bert_dim = self.bert.config.hidden_size
@@ -76,12 +86,26 @@ class TurnEncoder(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
         )
-        self.au_proj = nn.Sequential(
-            nn.Linear(bert_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+
+        if n_au_numeric is not None:
+            # Numeric AU path: float vector → projection (no BERT needed for AU)
+            self.au_proj = nn.Sequential(
+                nn.Linear(n_au_numeric, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self._au_numeric = True
+        else:
+            # Text AU path: BERT CLS → projection
+            self.au_proj = nn.Sequential(
+                nn.Linear(bert_dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            self._au_numeric = False
+
         self.fusion = GatedFusion(fusion_dim)
 
     # -- helpers -------------------------------------------------------------
@@ -100,24 +124,33 @@ class TurnEncoder(nn.Module):
         self,
         speech_input_ids: torch.Tensor,
         speech_attention_mask: torch.Tensor,
-        au_input_ids: torch.Tensor,
-        au_attention_mask: torch.Tensor,
+        au_input_ids: torch.Tensor | None = None,
+        au_attention_mask: torch.Tensor | None = None,
+        au_numeric: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Parameters
         ----------
         speech_input_ids, speech_attention_mask : (total_turns, seq_len)
-        au_input_ids, au_attention_mask         : (total_turns, seq_len)
+        au_input_ids, au_attention_mask         : (total_turns, seq_len) – AU-text path
+        au_numeric                              : (total_turns, n_au_numeric) – AU-numbers path
 
         Returns
         -------
         fused : (total_turns, fusion_dim)
         """
         speech_cls = self._cls_embedding(speech_input_ids, speech_attention_mask)
-        au_cls = self._cls_embedding(au_input_ids, au_attention_mask)
-
         speech_h = self.speech_proj(speech_cls)
-        au_h = self.au_proj(au_cls)
+
+        if self._au_numeric:
+            if au_numeric is None:
+                raise ValueError("au_numeric must be provided when n_au_numeric was set at construction.")
+            au_h = self.au_proj(au_numeric)
+        else:
+            if au_input_ids is None or au_attention_mask is None:
+                raise ValueError("au_input_ids/au_attention_mask must be provided for AU-text path.")
+            au_cls = self._cls_embedding(au_input_ids, au_attention_mask)
+            au_h = self.au_proj(au_cls)
 
         return self.fusion(speech_h, au_h)
 
@@ -304,7 +337,7 @@ class HierarchicalMultimodalAttentionNetwork(nn.Module):
         """Encode all turns, optionally in sub-batches to save memory."""
         total = speech_ids.size(0)
         if self.bert_sub_batch <= 0 or total <= self.bert_sub_batch:
-            return self.turn_encoder(speech_ids, speech_mask, au_ids, au_mask)
+            return self.turn_encoder(speech_ids, speech_mask, au_input_ids=au_ids, au_attention_mask=au_mask)
 
         parts: list[torch.Tensor] = []
         for start in range(0, total, self.bert_sub_batch):
@@ -313,8 +346,8 @@ class HierarchicalMultimodalAttentionNetwork(nn.Module):
                 self.turn_encoder(
                     speech_ids[start:end],
                     speech_mask[start:end],
-                    au_ids[start:end],
-                    au_mask[start:end],
+                    au_input_ids=au_ids[start:end],
+                    au_attention_mask=au_mask[start:end],
                 )
             )
         return torch.cat(parts, dim=0)
@@ -384,3 +417,183 @@ class HierarchicalMultimodalAttentionNetwork(nn.Module):
         """Unfreeze the shared BERT backbone."""
         for p in self.turn_encoder.bert.parameters():
             p.requires_grad = True
+
+
+# ---------------------------------------------------------------------------
+# Single-task HMAN models (Regressor / Classifier)
+# ---------------------------------------------------------------------------
+
+class HMANBase(nn.Module):
+    """Shared encoder stack used by HMANRegressor and HMANClassifier.
+
+    Parameters
+    ----------
+    n_au_numeric : int | None
+        When set, the AU stream uses a numeric float projection instead of BERT.
+        Pass ``N_AUS * 2`` (patient + therapist concatenated) for AU-numbers ablation.
+    """
+
+    def __init__(
+        self,
+        bert_model_name: str,
+        fusion_dim: int,
+        gru_hidden_dim: int,
+        gru_layers: int,
+        dropout: float,
+        bert_sub_batch: int,
+        n_au_numeric: int | None = None,
+    ):
+        super().__init__()
+        self.fusion_dim = fusion_dim
+        self.bert_sub_batch = bert_sub_batch
+        self.n_au_numeric = n_au_numeric
+
+        self.turn_encoder = TurnEncoder(
+            bert_model_name, fusion_dim, dropout, n_au_numeric=n_au_numeric
+        )
+        self.session_encoder = SessionEncoder(
+            fusion_dim, gru_hidden_dim, num_layers=gru_layers, dropout=dropout
+        )
+
+        bigru_out = gru_hidden_dim * 2
+        self.attention = TurnAttention(bigru_out)
+        self.shared = nn.Sequential(
+            nn.LayerNorm(bigru_out),
+            nn.Linear(bigru_out, gru_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self._gru_hidden_dim = gru_hidden_dim
+
+    def _encode_turns_batched(
+        self,
+        speech_ids: torch.Tensor,
+        speech_mask: torch.Tensor,
+        au_input_ids: torch.Tensor | None,
+        au_attention_mask: torch.Tensor | None,
+        au_numeric: torch.Tensor | None,
+    ) -> torch.Tensor:
+        total = speech_ids.size(0)
+
+        def _encode_slice(sl: slice) -> torch.Tensor:
+            return self.turn_encoder(
+                speech_ids[sl],
+                speech_mask[sl],
+                au_input_ids=au_input_ids[sl] if au_input_ids is not None else None,
+                au_attention_mask=au_attention_mask[sl] if au_attention_mask is not None else None,
+                au_numeric=au_numeric[sl] if au_numeric is not None else None,
+            )
+
+        if self.bert_sub_batch <= 0 or total <= self.bert_sub_batch:
+            return _encode_slice(slice(None))
+
+        parts: list[torch.Tensor] = []
+        for start in range(0, total, self.bert_sub_batch):
+            parts.append(_encode_slice(slice(start, min(start + self.bert_sub_batch, total))))
+        return torch.cat(parts, dim=0)
+
+    def encode_context(
+        self,
+        speech_input_ids: torch.Tensor,
+        speech_attention_mask: torch.Tensor,
+        turn_counts: torch.Tensor,
+        turn_mask: torch.Tensor,
+        au_input_ids: torch.Tensor | None = None,
+        au_attention_mask: torch.Tensor | None = None,
+        au_numeric: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        turn_vecs = self._encode_turns_batched(
+            speech_input_ids, speech_attention_mask,
+            au_input_ids, au_attention_mask, au_numeric,
+        )  # (total_turns, fusion_dim)
+
+        batch_size = turn_counts.size(0)
+        max_turns = turn_mask.size(1)
+        turn_emb = turn_vecs.new_zeros(batch_size, max_turns, self.fusion_dim)
+
+        idx = 0
+        for i in range(batch_size):
+            n = int(turn_counts[i].item())
+            turn_emb[i, :n] = turn_vecs[idx: idx + n]
+            idx += n
+
+        session_repr = self.session_encoder(turn_emb, turn_counts)
+        context, _ = self.attention(session_repr, turn_mask)
+        return context
+
+    def freeze_bert(self) -> None:
+        for p in self.turn_encoder.bert.parameters():
+            p.requires_grad = False
+
+    def unfreeze_bert(self) -> None:
+        for p in self.turn_encoder.bert.parameters():
+            p.requires_grad = True
+
+
+class HMANRegressor(HMANBase):
+    """Single-task regression head on top of HMANBase."""
+
+    def __init__(
+        self,
+        bert_model_name: str,
+        fusion_dim: int,
+        gru_hidden_dim: int,
+        gru_layers: int,
+        dropout: float,
+        bert_sub_batch: int,
+        n_au_numeric: int | None = None,
+    ):
+        super().__init__(bert_model_name, fusion_dim, gru_hidden_dim, gru_layers,
+                         dropout, bert_sub_batch, n_au_numeric)
+        self.head = nn.Linear(gru_hidden_dim, 1)
+
+    def forward(
+        self,
+        speech_input_ids: torch.Tensor,
+        speech_attention_mask: torch.Tensor,
+        turn_counts: torch.Tensor,
+        turn_mask: torch.Tensor,
+        au_input_ids: torch.Tensor | None = None,
+        au_attention_mask: torch.Tensor | None = None,
+        au_numeric: torch.Tensor | None = None,
+    ) -> torch.Tensor:  # (batch,)
+        context = self.encode_context(
+            speech_input_ids, speech_attention_mask, turn_counts, turn_mask,
+            au_input_ids, au_attention_mask, au_numeric,
+        )
+        return self.head(self.shared(context)).squeeze(-1)
+
+
+class HMANClassifier(HMANBase):
+    """Single-task classification head on top of HMANBase."""
+
+    def __init__(
+        self,
+        bert_model_name: str,
+        fusion_dim: int,
+        gru_hidden_dim: int,
+        gru_layers: int,
+        dropout: float,
+        bert_sub_batch: int,
+        n_classes: int,
+        n_au_numeric: int | None = None,
+    ):
+        super().__init__(bert_model_name, fusion_dim, gru_hidden_dim, gru_layers,
+                         dropout, bert_sub_batch, n_au_numeric)
+        self.head = nn.Linear(gru_hidden_dim, n_classes)
+
+    def forward(
+        self,
+        speech_input_ids: torch.Tensor,
+        speech_attention_mask: torch.Tensor,
+        turn_counts: torch.Tensor,
+        turn_mask: torch.Tensor,
+        au_input_ids: torch.Tensor | None = None,
+        au_attention_mask: torch.Tensor | None = None,
+        au_numeric: torch.Tensor | None = None,
+    ) -> torch.Tensor:  # (batch, n_classes)
+        context = self.encode_context(
+            speech_input_ids, speech_attention_mask, turn_counts, turn_mask,
+            au_input_ids, au_attention_mask, au_numeric,
+        )
+        return self.head(self.shared(context))
