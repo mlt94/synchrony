@@ -221,8 +221,9 @@ def main():
     print(f"[translate] Found {len(result_files)} files to translate")
 
     for input_path in result_files:
-        # Use the subdirectory name (parent folder name) as the ID
-        file_id = input_path.parent.name
+        # Keep source identifier from results_<identifier>.json
+        stem = input_path.stem
+        file_id = stem[len("results_"):] if stem.startswith("results_") else stem
         
         # Output translate_<id>.json in the same directory as the source results_*.json
         if output_root:
