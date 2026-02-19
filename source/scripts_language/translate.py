@@ -122,6 +122,23 @@ def load_translation_pipeline(device: str = "auto"):
     return text_pipe, device_name
 
 
+def _translate_single_text(
+    text: str,
+    text_pipe,
+    max_new_tokens: int,
+    max_input_tokens: int,
+) -> str:
+    chunks = chunk_text_for_translation(text, text_pipe, max_input_tokens=max_input_tokens)
+    translated_chunks: list[str] = []
+    for chunk in chunks:
+        outputs = text_pipe(chunk, max_new_tokens=max_new_tokens, truncation=True)
+        if isinstance(outputs, list) and outputs:
+            translated_chunks.append(outputs[0].get("translation_text", chunk).strip())
+        else:
+            translated_chunks.append(chunk)
+    return " ".join(x for x in translated_chunks if x).strip()
+
+
 def _safe_model_max_length(text_pipe, default: int = 512) -> int:
     tokenizer = getattr(text_pipe, "tokenizer", None)
     if tokenizer is None:
@@ -167,6 +184,29 @@ def _split_oversized_sentence(sentence: str, max_tokens: int, text_pipe) -> list
     return chunks
 
 
+def _split_by_token_ids(text: str, text_pipe, max_tokens: int) -> list[str]:
+    tokenizer = getattr(text_pipe, "tokenizer", None)
+    if tokenizer is None:
+        return [text]
+
+    encoded = tokenizer(text, add_special_tokens=False, truncation=False)
+    token_ids = encoded.get("input_ids", [])
+    if not token_ids:
+        return [text]
+
+    if len(token_ids) <= max_tokens:
+        return [text]
+
+    chunks: list[str] = []
+    for i in range(0, len(token_ids), max_tokens):
+        sub_ids = token_ids[i:i + max_tokens]
+        sub_text = tokenizer.decode(sub_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
+        if sub_text:
+            chunks.append(sub_text)
+
+    return chunks if chunks else [text]
+
+
 def chunk_text_for_translation(text: str, text_pipe, max_input_tokens: int) -> list[str]:
     text = (text or "").strip()
     if not text:
@@ -199,7 +239,11 @@ def chunk_text_for_translation(text: str, text_pipe, max_input_tokens: int) -> l
     if current:
         chunks.append(current)
 
-    return chunks if chunks else [text]
+    strict_chunks: list[str] = []
+    for c in (chunks if chunks else [text]):
+        strict_chunks.extend(_split_by_token_ids(c, text_pipe, max_tokens=max_input_tokens))
+
+    return strict_chunks if strict_chunks else [text]
 
 
 def translate_file(
@@ -207,7 +251,8 @@ def translate_file(
     output_path: Path,
     text_pipe,
     max_new_tokens: int | None,
-):
+    max_input_tokens: int,
+) -> None:
     with open(input_path, "r", encoding="utf-8") as handle:
         records = json.load(handle)
 
@@ -221,8 +266,8 @@ def translate_file(
 
     translated_records = []
     model_max_len = _safe_model_max_length(text_pipe, default=512)
-    max_input_tokens = max(32, int(model_max_len * 0.9))
-    generation_max_len = max_new_tokens or model_max_len
+    safe_input_tokens = min(max_input_tokens, max(32, model_max_len - 32))
+    generation_new_tokens = min(max_new_tokens or 256, 256)
 
     for idx, entry in enumerate(grouped_records):
         text = (entry.get("text") or "").strip()
@@ -230,16 +275,12 @@ def translate_file(
             translated_text = ""
         else:
             try:
-                chunks = chunk_text_for_translation(text, text_pipe, max_input_tokens=max_input_tokens)
-                translated_chunks: list[str] = []
-                for chunk in chunks:
-                    outputs = text_pipe(chunk, max_length=generation_max_len, truncation=True)
-                    if isinstance(outputs, list) and outputs:
-                        translated_chunks.append(outputs[0].get("translation_text", chunk).strip())
-                    else:
-                        translated_chunks.append(chunk)
-
-                translated_text = " ".join(x for x in translated_chunks if x).strip()
+                translated_text = _translate_single_text(
+                    text,
+                    text_pipe,
+                    max_new_tokens=generation_new_tokens,
+                    max_input_tokens=safe_input_tokens,
+                )
             except Exception as exc:
                 print(f"[translate] Error translating segment {idx} in {input_path}: {exc}")
                 translated_text = text
@@ -288,6 +329,12 @@ def main():
         help="Optional cap for generated tokens per segment.",
     )
     parser.add_argument(
+        "--max_input_tokens",
+        type=int,
+        default=192,
+        help="Max source tokens per translation chunk (conservative GPU-safe cap).",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing translated files instead of skipping them.",
@@ -332,6 +379,7 @@ def main():
             output_path,
             text_pipe,
             max_new_tokens=args.max_new_tokens,
+            max_input_tokens=args.max_input_tokens,
         )
 
 
